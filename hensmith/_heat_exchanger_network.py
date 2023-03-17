@@ -9,8 +9,6 @@
 Created on Sat Aug 22 21:58:19 2020
 @author: sarangbhagwat and yoelcp
 """
-from .. import Facility
-from ....utils import piping
 import biosteam as bst
 import numpy as np
 from .hxn_synthesis import synthesize_network, StreamLifeCycle
@@ -19,7 +17,7 @@ from warnings import warn
 __all__ = ('HeatExchangerNetwork',)
 
 
-class HeatExchangerNetwork(Facility):
+class HeatExchangerNetwork(bst.Facility):
     """
     Create a HeatExchangerNetwork object that will perform a pinch analysis
     on the entire system's heating and cooling utility objects. The heat
@@ -122,7 +120,7 @@ class HeatExchangerNetwork(Facility):
     def __init__(self, ID='', T_min_app=5., units=None, ignored=None, Qmin=1e-3,
                  force_ideal_thermo=False, cache_network=False, avoid_recycle=False,
                  acceptable_energy_balance_error=None, replace_unit_heat_utilities=False):
-        Facility.__init__(self, ID, None, None)
+        bst.Facility.__init__(self, ID, None, None)
         self.T_min_app = T_min_app
         self.units = units
         self.ignored = ignored
@@ -166,7 +164,7 @@ class HeatExchangerNetwork(Facility):
             try: hxs = [hxs_dct[i.owner, i._ID] for i in hxs_cache]
             except: pass
             else: use_cached_network = len(hxs) == len(hx_utils)
-        with flowsheet.temporary(), piping.IgnoreDockingWarnings():
+        with flowsheet.temporary(), bst.IgnoreDockingWarnings():
             if use_cached_network:
                 hx_heat_utils_rearranged = [i.heat_utilities[0] for i in hxs]
                 stream_life_cycles = self.stream_life_cycles
