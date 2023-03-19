@@ -11,7 +11,6 @@ Created on Sat May  2 16:44:24 2020
 @author: sarangbhagwat
 """
 import numpy as np
-import copy
 import biosteam as bst
 from warnings import warn
 
@@ -119,7 +118,6 @@ class Working_Life_Cycle:
         reverse = not self.cold
         life_cycle['cold_side'].sort(key = lambda stage: stage.H, reverse = reverse)
         life_cycle['cold_side'].sort(key = lambda stage: stage.H, reverse = reverse)
-        hs_life_cycle = life_cycle['hot_side']
     
     def get_sorted_life_cycle(self):
         self.sort_stages()
@@ -323,11 +321,6 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
             ID = 'HX_%s_%s_cs' % match
             if ID in attempts or (avoid_recycle and match in success): continue
             attempts.add(ID)
-            Q_hstr = Q_cold_side[hot][1]
-            Q_cstr = Q_cold_side[cold][1]
-            Q_res = Q_cstr - Q_hstr
-            # if abs(get_T_transient_cold_side(cold) - pinch_T_arr[cold])<= 0.01:
-            #     continue
             hot_stream = streams_transient_cold_side[hot].copy()
             cold_stream = streams_transient_cold_side[cold].copy()
             
@@ -363,8 +356,6 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     unavailables.update([i for i in cold_indices if T_out_arr[i] <= pinch_T_arr[i]])
     
     for cold in cold_indices:
-        # streams_transient_hot_side[cold] = streams_transient_cold_side[cold].copy()
-        # T_transient_hot_side[cold] = min(T_transient_hot_side[cold], get_T_transient_cold_side(cold))
         potential_matches = []
         for hot in hot_indices:
             if ((cold in matches_cs and hot in matches_cs[cold])
@@ -387,11 +378,6 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
             ID = 'HX_%s_%s_hs' % (cold, hot)
             if ID in attempts or (avoid_recycle and match in success): continue
             attempts.add(ID)
-            Q_hstr = Q_hot_side[hot][1]
-            Q_cstr = Q_hot_side[cold][1]
-            Q_res = Q_cstr - Q_hstr
-            # if abs(get_T_transient_hot_side(hot) - pinch_T_arr[hot])< 1e-6:
-            #     continue
             hot_stream = streams_transient_hot_side[hot].copy()
             cold_stream = streams_transient_hot_side[cold].copy()
             cold_stream.ID = 's_%s__%s'%(cold,ID)
@@ -431,13 +417,8 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                 attempts.add(ID)
                 T_cold_in = get_T_transient_cold_side(cold)
                 T_hot_in = get_T_transient_cold_side(hot)
-                # if ((cold in matches_cs and hot in matches_cs[cold])
-                #     or (cold in matches_hs and hot in matches_hs[cold])):
-                #     continue
                 if (Q_cold_side[hot][0]=='cool' and Q_cold_side[hot][1]>0 and
                         T_hot_in - T_cold_in >= T_min_app):
-                    # if abs(T_cold_in - pinch_T_arr[cold])<= 0.01:
-                    #     continue
                     hot_stream = streams_transient_cold_side[hot].copy()
                     cold_stream = streams_transient_cold_side[cold].copy()
                     hot_stream.ID = 's_%s__%s'%(hot,ID)
@@ -470,16 +451,11 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                 ID = 'HX_%s_%s_hs' % (cold, hot)
                 if ID in attempts or (avoid_recycle and match in success): continue
                 attempts.add(ID)
-                # if ((hot in matches_cs and cold in matches_cs[hot])
-                #     or (hot in matches_hs and cold in matches_hs[hot])):
-                #     continue
                 original_cold_stream = get_stream_at_H_max(cold)
                 T_cold_in = original_cold_stream.T
                 T_hot_in = get_T_transient_hot_side(hot)
                 if (Q_hot_side[cold][0]=='heat' and Q_hot_side[cold][1]>0 and
-                        T_hot_in - T_cold_in>= T_min_app): 
-                    # if abs(T_hot_in - pinch_T_arr[hot])<= 0.01:
-                    #     continue                        
+                        T_hot_in - T_cold_in>= T_min_app):    
                     cold_stream = original_cold_stream
                     hot_stream = streams_transient_hot_side[hot].copy()
                     cold_stream.ID = 's_%s__%s'%(cold,ID)

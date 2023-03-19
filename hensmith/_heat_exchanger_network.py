@@ -9,8 +9,6 @@
 Created on Sat Aug 22 21:58:19 2020
 @author: sarangbhagwat and yoelcp
 """
-from .. import Facility
-from ....utils import piping
 import biosteam as bst
 import numpy as np
 from .hxn_synthesis import synthesize_network, StreamLifeCycle
@@ -19,7 +17,7 @@ from warnings import warn
 __all__ = ('HeatExchangerNetwork',)
 
 
-class HeatExchangerNetwork(Facility):
+class HeatExchangerNetwork(bst.Facility):
     """
     Create a HeatExchangerNetwork object that will perform a pinch analysis
     on the entire system's heating and cooling utility objects. The heat
@@ -51,29 +49,22 @@ class HeatExchangerNetwork(Facility):
     
     Examples
     --------
-    >>> from biosteam.units import ShortcutColumn, HXutility, Flash
-    >>> from biosteam import Flowsheet
-    >>> from biosteam.units.facilities import HeatExchangerNetwork
-    >>> from biosteam import Stream, settings
-    >>> from biosteam import main_flowsheet as f
-    >>> flowsheet = Flowsheet('trial')
-    >>> f.set_flowsheet(flowsheet)
-    >>> settings.set_thermo(['Water', 'Methanol', 'Glycerol'])
-    >>> feed1 = Stream('feed1', flow=(8000, 100, 25))
-    >>> feed2 = Stream('feed2', flow=(10000, 1000, 10))
-    >>> D1 = ShortcutColumn('D1', ins=feed1,
+    >>> import biosteam as bst
+    >>> bst.settings.set_thermo(['Water', 'Methanol', 'Glycerol'])
+    >>> feed1 = bst.Stream('feed1', flow=(8000, 100, 25))
+    >>> feed2 = bst.Stream('feed2', flow=(10000, 1000, 10))
+    >>> D1 = bst.ShortcutColumn('D1', ins=feed1,
     ...                     outs=('distillate', 'bottoms_product'),
     ...                     LHK=('Methanol', 'Water'),
     ...                     y_top=0.99, x_bot=0.01, k=2,
     ...                     is_divided=True)
-    >>> D1_H1 = HXutility('D1_H1', ins = D1.outs[1], T = 300)
-    >>> D1_H2 = HXutility('D1_H2', ins = D1.outs[0], T = 300)
-    >>> F1 = Flash('F1', ins=feed2,
-    ...                     outs=('vapor', 'liquid'), V = 0.9, P = 101325)
-    >>> HXN = HeatExchangerNetwork('trial_HXN', T_min_app = 5.)
-    >>> trial_sys = f.create_system('trial_sys')
-    >>> trial_sys.simulate()
-    >>> HXN.simulate()
+    >>> D1_H1 = bst.HXutility('D1_H1', ins = D1.outs[1], T = 300)
+    >>> D1_H2 = bst.HXutility('D1_H2', ins = D1.outs[0], T = 300)
+    >>> F1 = bst.Flash('F1', ins=feed2,
+    ...                outs=('vapor', 'liquid'), V = 0.9, P = 101325)
+    >>> HXN = bst.HeatExchangerNetwork('HXN', T_min_app = 5.)
+    >>> sys = bst.System.from_units('sys', units=[D1, D1_H1, D1_H2, F1, HXN])
+    >>> sys.simulate()
     >>> # See all results
     >>> round(HXN.actual_heat_util_load/HXN.original_heat_util_load, 2)
     0.82
@@ -122,7 +113,7 @@ class HeatExchangerNetwork(Facility):
     def __init__(self, ID='', T_min_app=5., units=None, ignored=None, Qmin=1e-3,
                  force_ideal_thermo=False, cache_network=False, avoid_recycle=False,
                  acceptable_energy_balance_error=None, replace_unit_heat_utilities=False):
-        Facility.__init__(self, ID, None, None)
+        bst.Facility.__init__(self, ID, None, None)
         self.T_min_app = T_min_app
         self.units = units
         self.ignored = ignored
@@ -166,7 +157,7 @@ class HeatExchangerNetwork(Facility):
             try: hxs = [hxs_dct[i.owner, i._ID] for i in hxs_cache]
             except: pass
             else: use_cached_network = len(hxs) == len(hx_utils)
-        with flowsheet.temporary(), piping.IgnoreDockingWarnings():
+        with flowsheet.temporary(), bst.IgnoreDockingWarnings():
             if use_cached_network:
                 hx_heat_utils_rearranged = [i.heat_utilities[0] for i in hxs]
                 stream_life_cycles = self.stream_life_cycles
