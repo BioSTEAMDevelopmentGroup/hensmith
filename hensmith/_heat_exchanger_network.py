@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-# This module will be moved to a new reporsitory called "HXN: The automated Heat Exchanger Network design package."
+# hensmith: Heat Exchanger Network Synthesis, Modeling, Integration,
+# Thermodynamics, and Heuristics
 # Copyright (C) 2020-, Sarang Bhagwat <sarangb2@illinois.edu>, Yoel Cortes-Pena <yoelcortes@gmail.com>
-# 
-# This module is under the UIUC open-source license. See 
-# github.com/BioSTEAMDevelopmentGroup/biosteam/blob/master/LICENSE.txt
+#
+# This module is under the UIUC open-source license. See
+# github.com/BioSTEAMDevelopmentGroup/hensmith/blob/master/LICENSE.txt
 # for license details.
 """
 Created on Sat Aug 22 21:58:19 2020
