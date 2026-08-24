@@ -12,7 +12,7 @@ setup(
     name='hensmith',
     packages=['hensmith'],
     license='MIT',
-    version='0.1.0',
+    version='0.1.1',
     description=('Heat Exchanger Network Synthesis, Modeling, Integration, '
                  'Thermodynamics, and Heuristics'),
     long_description=open('README.md', encoding='utf-8').read(),
@@ -21,7 +21,12 @@ setup(
     author_email='sarangbhagwat.developer@gmail.com',
     maintainer='Sarang Bhagwat',
     maintainer_email='sarangbhagwat.developer@gmail.com',
-    install_requires=['biosteam>=2.53.11'],
+    # biosteam 2.54.0 is the first release without the bundled
+    # biosteam.facilities.hxn copy of this package; older releases would
+    # coexist with hensmith as two distinct HeatExchangerNetwork classes
+    # (the bundled copy winning bst.HeatExchangerNetwork), silently breaking
+    # isinstance checks downstream.
+    install_requires=['biosteam>=2.54.0'],
     python_requires='>=3.12',
     platforms=['Windows', 'Mac', 'Linux'],
     url='https://github.com/BioSTEAMDevelopmentGroup/hensmith',

@@ -1,0 +1,46 @@
+# This workflow installs the BioSTEAM development stack from GitHub HEAD
+# (mirroring biosteam's own build.yml) and runs the hensmith test suite,
+# so that drift between hensmith master and biosteam master is caught on
+# every push instead of only when someone runs the tests locally.
+
+name: Build
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [3.12, 3.13]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -c "import platform; print(platform.platform()); print(platform.architecture())"
+        python -m pip install --upgrade pip
+        python -m pip install wheel pytest
+        pip install --no-cache-dir git+https://github.com/CalebBell/fluids.git
+        pip install --no-cache-dir git+https://github.com/CalebBell/chemicals.git
+        pip install --no-cache-dir git+https://github.com/CalebBell/thermo.git
+        pip install --no-cache-dir git+https://github.com/BioSTEAMDevelopmentGroup/thermosteam.git
+        pip install --no-cache-dir git+https://github.com/BioSTEAMDevelopmentGroup/biosteam.git
+        pip uninstall hensmith -y
+        # --no-deps: the only runtime dependency is biosteam, installed from
+        # git HEAD above; letting pip resolve the biosteam version pin here
+        # would fail whenever this repo's floor is ahead of the biosteam
+        # release on PyPI (the pins are circular by design).
+        pip install --no-deps -e .
+    - name: Test without numba
+      run: |
+        pytest . -v --disable-numba=1 -p no:cacheprovider
