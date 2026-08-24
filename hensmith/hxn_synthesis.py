@@ -230,7 +230,7 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
     utility is needed and the surplus leaves as cold utility.
 
     >>> import biosteam as bst
-    >>> from biosteam.facilities.hxn.hxn_synthesis import problem_table
+    >>> from hensmith.hxn_synthesis import problem_table
     >>> bst.settings.set_thermo(['Water'])
     >>> hot_in = bst.Stream(Water=1000., T=400., P=5e5, phase='l', units='kmol/hr')
     >>> hot_out = hot_in.copy(); hot_out.vle(T=300., P=5e5)

@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-# BioSTEAM: The Biorefinery Simulation and Techno-Economic Analysis Modules
+# hensmith: Heat Exchanger Network Synthesis, Modeling, Integration,
+# Thermodynamics, and Heuristics
 # Copyright (C) 2020-, Yoel Cortes-Pena <yoelcortes@gmail.com>
 # Copyright (C) 2026-, Sarang Bhagwat <sarangbhagwat.developer@gmail.com>
 #
 # This module is under the UIUC open-source license. See
-# github.com/BioSTEAMDevelopmentGroup/biosteam/blob/master/LICENSE.txt
+# github.com/BioSTEAMDevelopmentGroup/hensmith/blob/master/LICENSE.txt
 # for license details.
 """
 Regression tests for heat exchanger network synthesis on synthetic systems.
@@ -16,7 +17,7 @@ streams from case 3 on). For each, the synthesized network must
 (ii)  never beat the minimum-energy-requirement (MER) targets of the problem
       table computed on the same streams, and
 (iii) recover at least as much heat as documented in ``CASES`` below, so that
-      no future change to ``hxn`` silently makes the synthesizer perform worse.
+      no future change to ``hensmith`` silently makes the synthesizer perform worse.
 
 The documented utility loads were recorded by running this file directly
 (``python tests/test_hxn_regression.py`` prints them): cases 1-4 and 6-9
@@ -34,7 +35,8 @@ import warnings
 import pytest
 import biosteam as bst
 from numpy.testing import assert_allclose
-from biosteam.facilities.hxn.hxn_synthesis import problem_table
+from hensmith import HeatExchangerNetwork
+from hensmith.hxn_synthesis import problem_table
 
 EB_TOLERANCE = 1e-6  # percent; converged networks close to ~1e-10 %
 MER_RTOL = 1e-3      # network may not beat the MER target by more than this
@@ -174,7 +176,7 @@ CASES = {
 
 def synthesize(builder):
     units, T_min_app = builder()
-    HXN = bst.HeatExchangerNetwork('HXN', T_min_app=T_min_app)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app)
     sys = bst.System.from_units('sys', units=[*units, HXN])
     with warnings.catch_warnings():
         warnings.simplefilter('error', RuntimeWarning)

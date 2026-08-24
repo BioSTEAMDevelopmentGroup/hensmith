@@ -396,7 +396,7 @@ class HeatExchangerNetwork(bst.Facility):
     def plot_pinch_diagram(self, file=None, **kwargs):
         """
         Draw the pinch diagram of the synthesized network; see
-        :func:`~biosteam.facilities.hxn.hxn_synthesis.plot_pinch_diagram`
+        :func:`~hensmith.hxn_synthesis.plot_pinch_diagram`
         for the keyword arguments. Returns the matplotlib figure and axes.
         """
         if not hasattr(self, 'new_HXs_hot_side'):

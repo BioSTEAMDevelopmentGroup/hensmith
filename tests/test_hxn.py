@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-# BioSTEAM: The Biorefinery Simulation and Techno-Economic Analysis Modules
+# hensmith: Heat Exchanger Network Synthesis, Modeling, Integration,
+# Thermodynamics, and Heuristics
 # Copyright (C) 2020-, Yoel Cortes-Pena <yoelcortes@gmail.com>
 # Copyright (C) 2026-, Sarang Bhagwat <sarangbhagwat.developer@gmail.com>
 #
 # This module is under the UIUC open-source license. See
-# github.com/BioSTEAMDevelopmentGroup/biosteam/blob/master/LICENSE.txt
+# github.com/BioSTEAMDevelopmentGroup/hensmith/blob/master/LICENSE.txt
 # for license details.
 """
 Tests for the heat exchanger network facility.
@@ -14,6 +15,7 @@ import pytest
 import biosteam as bst
 import numpy as np
 from numpy.testing import assert_allclose
+from hensmith import HeatExchangerNetwork
 
 def build_system(N_columns=1):
     """Doctest system of HeatExchangerNetwork; `N_columns > 1` adds more
@@ -32,7 +34,7 @@ def build_system(N_columns=1):
         feeds.append(feed)
     feed2 = bst.Stream('feed_flash', flow=(10000, 1000, 10))
     F1 = bst.Flash('F1', ins=feed2, V=0.9, P=101325)
-    HXN = bst.HeatExchangerNetwork('HXN', T_min_app=5.)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
     sys = bst.System.from_units('sys', units=[*units, F1, HXN])
     return sys, HXN, feeds[0]
 
@@ -95,7 +97,7 @@ def test_energy_balance_error_contributions_ignored_none():
 # Problem-table (pinch) analysis
 # ---------------------------------------------------------------------------
 
-from biosteam.facilities.hxn.hxn_synthesis import (
+from hensmith.hxn_synthesis import (
     temperature_interval_pinch_analysis, problem_table, load_duties, pinch_state,
 )
 
@@ -311,7 +313,7 @@ def test_unordered_network_path_warns_with_context(monkeypatch):
         return network
     monkeypatch.setattr(tmo.Network, 'from_units', from_units_with_warning)
     units = synthetic_units()
-    HXN = bst.HeatExchangerNetwork('HXN', T_min_app=5.)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
     sys = bst.System.from_units('sys_unordered', units=[*units, HXN])
     with pytest.warns(RuntimeWarning, match='heat exchanger network path could not be fully ordered'):
         sys.simulate()
@@ -319,7 +321,7 @@ def test_unordered_network_path_warns_with_context(monkeypatch):
 
 def test_synthetic_network_reaches_MER():
     units = synthetic_units()
-    HXN = bst.HeatExchangerNetwork('HXN', T_min_app=5.)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
     sys = bst.System.from_units('sys_synthetic', units=[*units, HXN])
     sys.simulate()
     hus = heat_utilities(units)
@@ -345,7 +347,7 @@ class _FakeLifeCycle:
         self.life_cycle = [_FakeStage(u) for u in units]
 
 def test_pinch_diagram_column_order_follows_stream_direction():
-    from biosteam.facilities.hxn.hxn_synthesis import _order_exchanger_columns
+    from hensmith.hxn_synthesis import _order_exchanger_columns
     h1, h2, h3 = 'h1', 'h2', 'h3'
     # stream A visits h2 then h1; stream B visits h1 then h3 -> h2, h1, h3
     cycles = [_FakeLifeCycle([h2, h1]), _FakeLifeCycle([h1, h3])]
@@ -392,7 +394,7 @@ def test_pinch_diagram_stream_labels():
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from biosteam.facilities.hxn.hxn_synthesis import _auxiliary_name, _stream_label
+    from hensmith.hxn_synthesis import _auxiliary_name, _stream_label
     sys, HXN, feed = build_system()
     sys.simulate()
     D1 = bst.main_flowsheet.unit.D0
