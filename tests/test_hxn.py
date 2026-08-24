@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 # hensmith: Heat Exchanger Network Synthesis, Modeling, Integration,
 # Thermodynamics, and Heuristics
-# Copyright (C) 2020-, Yoel Cortes-Pena <yoelcortes@gmail.com>
 # Copyright (C) 2026-, Sarang Bhagwat <sarangbhagwat.developer@gmail.com>
 #
 # This module is under the UIUC open-source license. See
