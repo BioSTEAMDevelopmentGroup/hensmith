@@ -11,10 +11,10 @@
 Fills the image placeholders with paths relative to ``_static``, injects the
 terminal panes from the chapter-01 captures, generates the callouts from
 ``ch01_summary.txt`` and asserts that every callout number appears in the
-captures, that every code line shown is a line of the chapter-01 script (the
-one allowed difference is the omitted ``cache=True``), and that no non-ASCII
-character or placeholder survives. Fails loudly if the demo would drift from
-the tutorial.
+captures, that every code line shown is a whitespace-normalised substring of
+the chapter-01 script (the one allowed difference is the omitted
+``cache=True``), and that no non-ASCII character or placeholder survives.
+Fails loudly if the demo would drift from the tutorial.
 
     python docs/_demo_src/build_demo.py
     -> docs/source/_static/quickstart_demo.html

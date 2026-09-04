@@ -47,15 +47,15 @@ and the dark logo. `build_all.py` lists the scripts in a valid order.
 From the **repo root**, with the `IBO_2026` interpreter:
 
 ```powershell
-& "C:\Users\saran\anaconda3\envs\IBO_2026\python.exe" docs\_demo_src\build_all.py
+python docs\_demo_src\build_all.py
 ```
 
 `build_all.py` runs each script as a **sequential subprocess** and stops at the
 first failure. That sequencing is not incidental: importing biosteam writes
 numba's shared on-disk cache, and two Python processes writing it at once
 corrupt it — so never run two of these scripts (or the test suite alongside
-one) concurrently by hand either. A full run takes several minutes; the hero
-GIFs alone are one to two of them.
+one) concurrently by hand either. A full run takes a minute or two; the hero
+GIFs dominate it.
 
 Graphviz's `dot` must be on `PATH` — the flowsheet figures in chapters 01 and
 03 are rendered by biosteam's `system.diagram()`.
@@ -64,7 +64,7 @@ Every script is also runnable on its own, from the repo root, when you only
 need to refresh one asset:
 
 ```powershell
-& "C:\Users\saran\anaconda3\envs\IBO_2026\python.exe" docs\_demo_src\examples\ch02_pinch_analysis.py
+python docs\_demo_src\examples\ch02_pinch_analysis.py
 ```
 
 After regenerating, `git status` should be clean apart from assets you *meant*
@@ -109,7 +109,7 @@ Three mechanisms, all enforced at regeneration time:
   everything renders headless, and `savefig` never blocks.
 - Captures are written with `newline='\n'` and a single trailing newline, so
   the committed text is stable across platforms.
-- Figures go through `_common.save` (dpi 200, `bbox_inches='tight'`) and
+- Chapter figures go through `_common.save` (dpi 200, `bbox_inches='tight'`) and
   flowsheets through `_common.save_diagram`, which pipes graphviz's PNG bytes
   itself because biosteam's `save_digraph` rejects file paths containing a `.`
   when a format is given.

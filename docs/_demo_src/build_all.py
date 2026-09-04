@@ -31,7 +31,7 @@ SCRIPTS = [
     'examples/ch03_network_anatomy.py',
     'examples/ch04_configuring.py',
     'make_hero_gif.py',
-    'build_demo.py',      # consumes the chapter-01 captures and figures
+    'build_demo.py',      # consumes the chapter-01 captures and figures, and the logo
     'make_poster.py',     # consumes the chapter-01 pinch diagram and the logo
 ]
 
