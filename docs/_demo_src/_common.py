@@ -151,7 +151,7 @@ def min_vertical_gap(hot_T, hot_H, cold_T, cold_H):
     hH, hT = hot_H[i], hot_T[i]
     _, j = np.unique(cold_H[::-1], return_index=True)        # last = higher T
     j = cold_H.size - 1 - j
-    cH, cT = cold_H[j][::-1], cold_T[j][::-1]
+    cH, cT = cold_H[j], cold_T[j]
     lo, hi = max(hH[0], cH[0]), min(hH[-1], cH[-1])
     Hs = np.concatenate([hH, cH])
     Hs = Hs[(Hs >= lo) & (Hs <= hi)]

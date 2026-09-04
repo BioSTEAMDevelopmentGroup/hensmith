@@ -23,15 +23,21 @@ OUT = IMAGES / 'logo'
 
 
 def draw_mark(ax, theme, x0=0.0, y0=0.0, s=1.0):
-    """The exchanger glyph in a 2.4 x 1.8 box at (x0, y0), scaled by s."""
+    """The exchanger glyph at (x0, y0), scaled by s: the shafts span x0..x0+2.4
+    and each arrowhead overshoots its end by 0.2, so the glyph occupies a
+    2.8 x 1.8 box starting at x0 - 0.2. The tips are set 0.2 past the shaft
+    ends (and the head kept at mutation_scale=34) so the stroked head base
+    clears the circle instead of butting against it."""
     t = THEMES[theme]
     lw = 14 * s
-    ax.annotate('', xy=(x0 + 2.4 * s, y0 + 1.5 * s), xytext=(x0, y0 + 1.5 * s),
+    ax.annotate('', xy=(x0 + 2.6 * s, y0 + 1.5 * s), xytext=(x0, y0 + 1.5 * s),
                 arrowprops=dict(arrowstyle='-|>,head_length=0.9,head_width=0.45',
-                                color=t['cold'], lw=lw, shrinkA=0, shrinkB=0))
-    ax.annotate('', xy=(x0, y0 + 0.3 * s), xytext=(x0 + 2.4 * s, y0 + 0.3 * s),
+                                color=t['cold'], lw=lw, shrinkA=0, shrinkB=0,
+                                mutation_scale=34))
+    ax.annotate('', xy=(x0 - 0.2 * s, y0 + 0.3 * s), xytext=(x0 + 2.4 * s, y0 + 0.3 * s),
                 arrowprops=dict(arrowstyle='-|>,head_length=0.9,head_width=0.45',
-                                color=t['hot'], lw=lw, shrinkA=0, shrinkB=0))
+                                color=t['hot'], lw=lw, shrinkA=0, shrinkB=0,
+                                mutation_scale=34))
     ax.plot([x0 + 1.2 * s] * 2, [y0 + 0.3 * s, y0 + 1.5 * s], '-o', color=INK[theme],
             lw=lw * 0.8, mfc=t['bg'], mec=INK[theme], mew=lw * 0.55, ms=52 * s, zorder=5,
             solid_capstyle='round')
