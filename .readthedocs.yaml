@@ -1,0 +1,28 @@
+# Read the Docs configuration for hensmith.
+version: 2
+build:
+  os: ubuntu-24.04
+  tools:
+    python: "3.12"
+  jobs:
+    post_install:
+      # Mirror .github/workflows/build.yml. biosteam>=2.54.0 is not on PyPI yet
+      # and biosteam master pins hensmith>=0.1.2 (circular by design), so the
+      # stack comes from GitHub HEAD and hensmith is installed without deps.
+      # Deliberately NOT under python.install (`method: pip, path: .` would try
+      # to resolve biosteam>=2.54.0 from PyPI and fail before this step runs).
+      # RTD never runs the docs asset scripts: every figure and captured output
+      # is generated locally and committed (docs/_demo_src/README.md).
+      - pip install --no-cache-dir git+https://github.com/CalebBell/fluids.git
+      - pip install --no-cache-dir git+https://github.com/CalebBell/chemicals.git
+      - pip install --no-cache-dir git+https://github.com/CalebBell/thermo.git
+      - pip install --no-cache-dir git+https://github.com/BioSTEAMDevelopmentGroup/thermosteam.git
+      - pip install --no-cache-dir git+https://github.com/BioSTEAMDevelopmentGroup/biosteam.git
+      - pip uninstall -y hensmith
+      - pip install --no-deps -e .
+python:
+  install:
+    - requirements: docs/requirements.txt   # docs tooling only; the package is installed in post_install
+sphinx:
+  configuration: docs/source/conf.py
+  fail_on_warning: true
