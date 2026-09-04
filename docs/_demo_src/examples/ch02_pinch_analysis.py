@@ -131,7 +131,9 @@ def main():
     ax.plot(cold_H / GJ, cold_T - 273.15, color='#2e6db4', lw=2, label='cold composite')
     y_lo, y_hi = hot_T[0] - 273.15, cold_T[-1] - 273.15
     ax.margins(y=0.12)   # headroom so the utility labels sit inside the frame
-    ax.annotate('', xy=(0, y_lo), xytext=(cold_H[0] / GJ, y_lo), arrowprops=dict(arrowstyle='<->'))
+    # the cold-utility span is ~6 px wide on this axis, too narrow for an arrow:
+    # bound it with two ticks and label it with a leader
+    ax.vlines([0, cold_H[0] / GJ], y_lo - 1.5, y_lo + 1.5, color='k', lw=0.8, zorder=3)
     ax.annotate(f'cold utility {table.cold_util_load:.3g} kJ/hr', xy=(cold_H[0] / 2 / GJ, y_lo),
                 xytext=(30, -18), textcoords='offset points', fontsize=8,
                 arrowprops=dict(arrowstyle='-', lw=0.6, shrinkB=4))
