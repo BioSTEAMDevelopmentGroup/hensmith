@@ -11,7 +11,7 @@ from setuptools import setup
 setup(
     name='hensmith',
     packages=['hensmith'],
-    license='MIT',
+    license='NCSA',
     version='0.1.2',
     description=('Heat Exchanger Network Synthesis, Modeling, Integration, '
                  'Thermodynamics, and Heuristics'),
