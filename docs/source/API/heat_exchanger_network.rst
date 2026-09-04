@@ -55,7 +55,7 @@ shows what each of them changes.
      - Copy each synthesized utility exchanger's heat utility onto the corresponding original heat utility and reload that unit's utility cost, instead of reporting the net utilities on the facility itself. Applies only when at least one process exchanger was synthesized. Defaults to False.
    * - ``sort_hus_by_T``
      - bool
-     - Sort the heating utilities by inlet temperature descending and the cooling utilities ascending before the analysis. Defaults to False.
+     - Sort the heating utilities by inlet temperature descending and the cooling utilities ascending before the analysis, so that inlet temperature rather than signed duty (the default: smallest heating duty first, largest cooling duty first) sets the matching priority. Defaults to False.
 
 Class attributes
 ----------------

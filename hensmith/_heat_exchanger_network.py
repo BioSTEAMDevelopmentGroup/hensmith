@@ -192,6 +192,9 @@ class HeatExchangerNetwork(bst.Facility):
                         else:
                             s_out.mol[:] = s_in.mol
             else:
+                # Signed-duty order is the default matching priority of the
+                # synthesis passes: smallest heating duty first among the cold
+                # streams, largest cooling duty first among the hot streams.
                 hx_utils.sort(key = lambda x: x.duty)
                 self.HXN_flowsheet = HXN_F = flowsheet
                 for i in HXN_F.registries: i.clear()

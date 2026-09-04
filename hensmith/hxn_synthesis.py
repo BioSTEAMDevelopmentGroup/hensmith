@@ -572,7 +572,12 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         dropped. Heating utilities are placed before cooling utilities;
         within each group the given order is kept unless `sort_hus_by_T`.
         All returned per-stream arrays and lists are indexed in that
-        rearranged order (the stream index).
+        rearranged order (the stream index). That order is also the
+        matching priority: the outer loop of each design pass and both
+        loops of each offset pass walk the streams by index.
+        `HeatExchangerNetwork` passes the utilities sorted by signed duty,
+        so by default the cold stream with the smallest heating duty and
+        the hot stream with the largest cooling duty are tried first.
     T_min_app : float, optional
         Minimum approach temperature [K]: required between the streams of
         every candidate match, enforced on every synthesized exchanger
@@ -592,7 +597,9 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         False.
     sort_hus_by_T : bool, optional
         Sort the heating utilities by inlet temperature, descending, and the
-        cooling utilities ascending, before analysis. Defaults to False.
+        cooling utilities ascending, before analysis, so that inlet
+        temperature rather than the given order sets the matching priority.
+        Defaults to False.
 
     Returns
     -------

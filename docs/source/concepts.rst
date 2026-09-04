@@ -203,7 +203,12 @@ computed by ``pinch_state``, with enthalpy clipped to the stream's real range
 -- is the state in which it enters the design on the far side of the pinch.
 Each design works with its own **transient stream** per stream index, advanced
 every time a match is made, so a candidate is always evaluated at the state
-the stream has actually reached rather than at its original inlet.
+the stream has actually reached rather than at its original inlet. The passes
+walk the streams by index, so the stream order is the matching priority. The
+facility hands the utilities over sorted by signed duty, so by default the cold
+stream with the smallest heating duty and the hot stream with the largest
+cooling duty are tried first; ``sort_hus_by_T`` replaces that with inlet
+temperature.
 
 Matching then proceeds in four passes, each creating ``HXprocess`` units that
 exchange as much heat as the approach temperature (``dT``), the outlet

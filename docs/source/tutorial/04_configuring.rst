@@ -222,7 +222,9 @@ ones in the rearranged list regardless, and it is that list that fixes the
 stream indices used by every per-stream array, by the stream life cycles and by
 the pinch diagram. Because the matching passes walk the streams in index order,
 sorting them changes which matches are attempted first, and so can change the
-network that comes out.
+network that comes out. The default order is by signed duty, which is how the
+facility hands the utilities to the synthesis: cold streams from the smallest
+heating duty up, hot streams from the largest cooling duty down.
 
 ``acceptable_energy_balance_error`` overrides, for one instance, the class
 attribute of the same name. It is a *fraction*, not a percentage: the default
