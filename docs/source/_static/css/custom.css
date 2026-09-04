@@ -48,7 +48,7 @@ p.landing-lede {
 .demo-frame {
     height: 840px;
 }
-@media (max-width: 640px) {
+@media (max-width: 900px) {
     .demo-frame {
         height: 1460px;
     }
