@@ -26,8 +26,6 @@ import matplotlib.pyplot as plt
 def main():
     # [start:imports]
     import matplotlib.pyplot as plt
-    import biosteam as bst
-    from hensmith import HeatExchangerNetwork
     # [end:imports]
     # [start:system]
     import biosteam as bst
