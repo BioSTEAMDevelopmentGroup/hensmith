@@ -117,24 +117,25 @@ The quickstart system is the same computation on five streams:
 The five streams produce a grid of ten shifted temperatures, from 372.6 K down
 to 295 K. Ten boundaries out of five streams is itself a statement about the
 streams: a monotone stream contributes both of its end temperatures and a
-point load contributes only one, so every stream here is monotone. The grid
-keeps both entries where two streams meet at the same temperature rather than
-merging them, which is why 333 is listed twice. Four of those boundaries sit
-within about half a Kelvin of each other around 333 K -- 333.53, 333 twice,
-and 332.98. The column's condenser spans the upper two, 333.53 down to 333,
-which is 65.4 down to 64.9 °C on the real scale; the distillate cooler
-``D1_H2`` takes the stream from there, so its own upper boundary is that
-second 333, and the outlet the analysis works with lies only 0.02 K below it,
-at 332.98, because the cooler removes just 3.34e+04 kJ/hr. Neither is a point
-load: both are spread over intervals like any other stream, only very narrow
-ones, and the cooler's load is too small to see on the curves below. The
-targets are 2.828e+08 kJ/hr of hot utility and 1.936e+06 kJ/hr of cold
-utility, and the pinch is at 298.15 K on the shifted scale. Since hot streams
-were shifted down by the 5 K approach, that one shifted temperature stands for
-two real ones: 25 °C for the cold streams and 30 °C for the hot ones. It is
-the temperature that splits the synthesized network into its hot-side and
-cold-side designs, and the dashed line drawn on the pinch diagram of
-chapter 1.
+point load contributes only one, so every stream here is monotone. Exactly
+equal boundaries would be merged into one grid entry; the two entries that
+print as 333 are distinct values that differ by less than the 0.01 K shown --
+the condenser's shifted outlet and the distillate cooler's shifted inlet. Four
+of those boundaries sit within about half a Kelvin of each other around 333 K
+-- 333.53, 333 twice, and 332.98. The column's condenser spans the upper two,
+333.53 down to 333, which is 65.4 down to 64.9 °C on the real scale; the
+distillate cooler ``D1_H2`` takes the stream from there, so its own upper
+boundary is that second 333, and the outlet the analysis works with lies only
+0.02 K below it, at 332.98, because the cooler removes just 3.34e+04 kJ/hr.
+Neither is a point load: both are spread over intervals like any other stream,
+only very narrow ones, and the cooler's load is too small to see on the curves
+below. The targets are 2.828e+08 kJ/hr of hot utility and 1.936e+06 kJ/hr of
+cold utility, and the pinch is at 298.15 K on the shifted scale. Since hot
+streams were shifted down by the 5 K approach, that one shifted temperature
+stands for two real ones: 25 °C for the cold streams and 30 °C for the hot
+ones. It is the temperature that splits the synthesized network into its
+hot-side and cold-side designs, and the dashed line drawn on the pinch diagram
+of chapter 1.
 
 Composite curves
 ----------------
