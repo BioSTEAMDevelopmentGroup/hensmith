@@ -153,7 +153,7 @@ the cached network.
      - Outlet temperature of each stream, after quenching the outlet to equilibrium at its own enthalpy.
    * - ``streams_inlet``
      - list[Stream]
-     - The per-stream copies prepared for the analysis; synthesis reuses the same list for its cold-side working states, so on return the entries hold each stream's final cold-side state.
+     - One copy of each stream's inlet, in stream order, as prepared for the analysis; the synthesis works on further copies, so these keep their inlet state.
    * - ``stream_HXs_dict``
      - dict[int, list[Unit]]
      - Exchangers, the process ones then the utility one, that each stream index passes through, in synthesis order rather than flow order.

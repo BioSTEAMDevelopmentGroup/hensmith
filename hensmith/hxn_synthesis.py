@@ -628,13 +628,9 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     hx_utils_rearranged : list[HeatUtility]
         The heat utilities of `hus` in stream order.
     streams_inlet : list[Stream]
-        The list of inlet-stream copies (IDs ``s_<index>__Util_<index>``)
-        prepared for the analysis. The same list object is the cold-side
-        working list during synthesis, so on return its entries are the
-        streams' cold-side working states (pinch states or exchanger
-        outlets for matched streams, otherwise the inlet copies, some of
-        them re-IDed) rather than a clean list of inlets;
-        `HeatExchangerNetwork` uses only its length.
+        One copy of each stream's inlet, in stream order, as prepared for
+        the analysis (ideal-thermo copies if `force_ideal_thermo`). The
+        synthesis works on further copies, so these keep their inlet state.
     stream_HXs_dict : dict[int, list[Unit]]
         Exchangers (process, then utility) each stream index passes through,
         in synthesis order (not flow order; see `StreamLifeCycle`).

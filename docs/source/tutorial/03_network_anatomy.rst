@@ -173,9 +173,7 @@ process exchanger is constructed with its cold stream first. ``s_in`` and
 ``s_out`` are ``unit.ins[index]`` and ``unit.outs[index]``, and ``H_in`` and
 ``H_out`` are their enthalpies, so a life cycle always reflects the current
 state of the network rather than a snapshot taken at synthesis. This stage
-takes stream 1 from 0 to 3.338e+04 kJ/hr. (The enthalpies printed by ``show``
-carry a ``kJ`` label; they are enthalpy flows in kJ/hr, as the ``H_in`` and
-``H_out`` documentation states.)
+takes stream 1 from 0 to 3.338e+04 kJ/hr.
 
 Per-stream pinch temperatures
 -----------------------------
