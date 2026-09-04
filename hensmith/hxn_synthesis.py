@@ -190,30 +190,6 @@ class StreamLifeCycle:
     _ipython_display_ = show
 
 
-class Working_Life_Cycle:
-    
-    def __init__(self, index, cold):
-        self.index = index
-        self.name = 's_%s'%index
-        self.cold = cold
-        self.life_cycle = life_cycle = {}
-        life_cycle['cold_side'] = []
-        life_cycle['hot_side'] = []
-        
-    def add_stage(self, s_in, s_out, side):
-        self.life_cycle[side].append(LifeStage(s_in, s_out))
-    
-    def sort_stages(self):
-        life_cycle = self.life_cycle
-        reverse = not self.cold
-        life_cycle['cold_side'].sort(key = lambda stage: stage.H, reverse = reverse)
-        life_cycle['cold_side'].sort(key = lambda stage: stage.H, reverse = reverse)
-    
-    def get_sorted_life_cycle(self):
-        self.sort_stages()
-        return self.life_cycle
-    
-
 ProblemTable = namedtuple(
     'ProblemTable',
     ['Ts', 'interval_H', 'point_H', 'residual',
@@ -832,9 +808,6 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     for cold in cold_indices:
         potential_matches = []
         for hot in hot_indices:
-            if ((cold in matches_cs and hot in matches_cs[cold])
-                or (cold in matches_hs and hot in matches_hs[cold])):
-                break
             if (C_flow_vector[cold]>= C_flow_vector[hot] and
                     get_T_transient_hot_side(hot) > get_T_transient_hot_side(cold) + T_min_app and
                     (hot not in unavailables) and (cold not in unavailables) and
