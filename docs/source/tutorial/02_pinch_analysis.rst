@@ -119,23 +119,23 @@ to 295 K. Ten boundaries out of five streams is itself a statement about the
 streams: a monotone stream contributes both of its end temperatures and a
 point load contributes only one, so every stream here is monotone. Exactly
 equal boundaries would be merged into one grid entry; the two entries that
-print as 333 are distinct values that differ by less than the 0.01 K shown --
-the condenser's shifted outlet and the distillate cooler's shifted inlet. Four
-of those boundaries sit within about half a Kelvin of each other around 333 K
--- 333.53, 333 twice, and 332.98. The column's condenser spans the upper two,
-333.53 down to 333, which is 65.4 down to 64.9 °C on the real scale; the
-distillate cooler ``D1_H2`` takes the stream from there, so its own upper
-boundary is that second 333, and the outlet the analysis works with lies only
-0.02 K below it, at 332.98, because the cooler removes just 3.34e+04 kJ/hr.
-Neither is a point load: both are spread over intervals like any other stream,
-only very narrow ones, and the cooler's load is too small to see on the curves
-below. The targets are 2.828e+08 kJ/hr of hot utility and 1.936e+06 kJ/hr of
-cold utility, and the pinch is at 298.15 K on the shifted scale. Since hot
-streams were shifted down by the 5 K approach, that one shifted temperature
-stands for two real ones: 25 °C for the cold streams and 30 °C for the hot
-ones. It is the temperature that splits the synthesized network into its
-hot-side and cold-side designs, and the dashed line drawn on the pinch diagram
-of chapter 1.
+print as 333 are the same temperature -- the condenser's outlet is the
+cooler's inlet -- kept apart only by floating-point round-off of the
+equilibrium quench, far below any printed precision. Four of those boundaries
+sit within about half a Kelvin of each other around 333 K -- 333.53, 333 twice,
+and 332.98. The column's condenser spans the upper two, 333.53 down to 333,
+which is 65.4 down to 64.9 °C on the real scale; the distillate cooler
+``D1_H2`` takes the stream from there, so its own upper boundary is that second
+333, and the outlet the analysis works with lies only 0.02 K below it, at
+332.98, because the cooler removes just 3.34e+04 kJ/hr. Neither is a point
+load: both are spread over intervals like any other stream, only very narrow
+ones, and the cooler's load is too small to see on the curves below. The
+targets are 2.828e+08 kJ/hr of hot utility and 1.936e+06 kJ/hr of cold utility,
+and the pinch is at 298.15 K on the shifted scale. Since hot streams were
+shifted down by the 5 K approach, that one shifted temperature stands for two
+real ones: 25 °C for the cold streams and 30 °C for the hot ones. It is the
+temperature that splits the synthesized network into its hot-side and cold-side
+designs, and the dashed line drawn on the pinch diagram of chapter 1.
 
 Composite curves
 ----------------
@@ -255,11 +255,12 @@ The utility-side figure, 2.977e+08 kJ/hr, is that same target divided by the
 heat-transfer efficiency of biosteam's low-pressure steam agent, which is
 below one; it is the steam the plant must raise, not heat the network failed
 to recover. The cold utility needs no such correction, because the cooling
-water agent's efficiency is one and both lines therefore read 1.96e+06 kJ/hr
-against a target of 1.936e+06 kJ/hr. That small excess is a genuine shortfall
-of the network: the targets are a bound the synthesizer works towards, not a
-guarantee it attains, because a network has to be built from real exchangers
-between real streams, one side of the pinch at a time.
+agents used here (chilled and cooling water) have an efficiency of one and
+both lines therefore read 1.96e+06 kJ/hr against a target of 1.936e+06 kJ/hr.
+That small excess is a genuine shortfall of the network: the targets are a
+bound the synthesizer works towards, not a guarantee it attains, because a
+network has to be built from real exchangers between real streams, one side
+of the pinch at a time.
 
 Both directions of that statement are checked by the test suite, and checked on
 the process side: ``tests/test_hxn_regression.py`` compares with its
