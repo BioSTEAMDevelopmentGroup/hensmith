@@ -81,9 +81,19 @@ def check_callouts(cal, S):
 
 
 def check_code_lines(tpl):
+    """Assert every code line of the demo's scene 01 is real chapter-01 code.
+
+    The pane wraps statements differently from the script, so lines are not
+    compared one to one; instead the *whole* script is normalised to a single
+    space-separated string and each normalised demo line must be a substring
+    of it. That is strictly stronger than a per-line match: a re-wrapped
+    statement still matches (whitespace, including newlines, is collapsed),
+    but a line whose remainder drifts from the script no longer passes just
+    because it happens to contain one long script line.
+    """
     script = CH01.read_text(encoding='utf-8')
-    allowed = {re.sub(r'\s+', ' ', l.strip()) for l in script.splitlines()}
-    allowed |= {re.sub(r'\s+', ' ', l.strip().replace(', cache=True', '')) for l in script.splitlines()}
+    normalized = re.sub(r'\s+', ' ', script)
+    normalized_no_cache = normalized.replace(', cache=True', '')
     # the array ends at the "]," that precedes the caption (code strings contain "]" too)
     m = re.search(r'label:"Build the flowsheet".*?code:\[(.*?)\],\s*caption:', tpl, re.S)
     assert m, 'scene 01 code block not found'
@@ -91,9 +101,7 @@ def check_code_lines(tpl):
     for line in lines:
         key = re.sub(r'\s+', ' ', line.strip())
         if not key or key == 'sys.diagram()': continue
-        # a statement wrapped differently in the pane is accepted when a script
-        # line (of meaningful length) is a substring of it, or vice versa
-        assert any(key in a for a in allowed) or any(a in key for a in allowed if len(a) > 20), \
+        assert key in normalized or key in normalized_no_cache, \
             f'demo code line is not in ch01_quickstart.py: {line!r}'
     return lines
 
