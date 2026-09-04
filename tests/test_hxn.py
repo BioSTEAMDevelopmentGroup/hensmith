@@ -111,6 +111,31 @@ def test_HXN_flowsheet_is_the_network_flowsheet():
     assert all(unit in fs.unit for unit in network_units)
     assert not any(unit in bst.main_flowsheet.unit for unit in network_units)
 
+def test_HXN_sys_is_named_and_registered_in_the_network_flowsheet():
+    """HXN_sys carries the '<sys>_HXN' ID and is registered in the network
+    flowsheet's system registry, so it is addressable there like the network
+    units are, and print() shows the name rather than '-'."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    ID = sys.ID + '_HXN'
+    HXN_sys = HXN.HXN_sys
+    assert HXN_sys.ID == ID
+    assert str(HXN_sys) == ID
+    network_flowsheet = bst.main_flowsheet.flowsheet[sys.ID + '_HXN']
+    assert network_flowsheet.system[ID] is HXN_sys
+    assert bst.main_flowsheet.system.search(ID) is None
+    # A fresh synthesis builds a new network flowsheet with empty registries,
+    # so re-registering the same ID cannot collide; the cached path keeps the
+    # named object.
+    sys.simulate()
+    assert HXN.HXN_sys is not HXN_sys
+    assert HXN.HXN_sys.ID == ID
+    network_flowsheet = bst.main_flowsheet.flowsheet[sys.ID + '_HXN']
+    assert network_flowsheet.system[ID] is HXN.HXN_sys
+    HXN.cache_network = True
+    sys.simulate()
+    assert HXN.HXN_sys.ID == ID
+
 # ---------------------------------------------------------------------------
 # Problem-table (pinch) analysis
 # ---------------------------------------------------------------------------

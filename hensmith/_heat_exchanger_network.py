@@ -246,7 +246,7 @@ class HeatExchangerNetwork(bst.Facility):
                              'with stale inlets until convergence', RuntimeWarning)
                     else:
                         warn(w.message, w.category)
-                self.HXN_sys = sys = bst.System._from_network(None, network)
+                self.HXN_sys = sys = bst.System._from_network(HXN_F.ID, network)
                 sys.set_tolerance(method='fixedpoint', subsystems=True)
             
             original_purchase_costs = [hx.purchase_cost for hx in hxs]
