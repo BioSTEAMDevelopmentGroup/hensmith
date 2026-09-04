@@ -138,7 +138,7 @@ the cached network.
      - The original heat utilities rearranged into stream order, so that they align with ``stream_life_cycles``.
    * - ``HXN_sys``
      - System
-     - The system built from the synthesized exchangers, converged and summarized during costing.
+     - The system built from the synthesized exchangers, named ``<sys>_HXN`` and registered in ``HXN_flowsheet``; converged and summarized during costing.
    * - ``HXN_flowsheet``
      - Flowsheet
      - The flowsheet ``<sys>_HXN`` holding the network's stream copies and exchangers.

@@ -50,9 +50,11 @@ before synthesis, so the network's IDs neither collide with the original
 flowsheet's nor accumulate across repeated simulations.
 
 ``HXN.HXN_sys`` is the ``bst.System`` built from the synthesized units. It is
-constructed from a network of those units and given no ID at all, which is why
-``print`` shows it as ``-``; it is an ordinary ``System`` holding the nine
-units listed on the third line. They are listed in the order the system
+constructed from a network of those units and named after the flowsheet,
+``sys_HXN``, in whose system registry it is registered -- so
+``HXN.HXN_flowsheet.system.sys_HXN`` resolves to it, just as the exchangers
+resolve through ``HXN.HXN_flowsheet.unit``. It is an ordinary ``System``
+holding the nine units listed on the third line. They are listed in the order the system
 simulates them, which is derived from the rewired stream connections rather
 than from the order synthesis created them: a hot-side exchanger is synthesized
 before the cold-side exchangers that feed it, so synthesis order would leave it
