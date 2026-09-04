@@ -39,6 +39,7 @@ class HeatExchangerNetwork(bst.Facility):
     
     Notes
     -----
+    The network is synthesized with the pinch design method [1]_.
     Original system stream and heat exchanger objects are preserved. All stream 
     copies and new HX objects can be found in a newly created flowsheet 
     '<sys>_HXN' where <sys> is the name of the system associated to the 

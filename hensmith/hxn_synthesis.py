@@ -336,13 +336,13 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
     monotone streams the contribution to interval (Ts[k], Ts[k+1]) is
     sign * (H(Ts[k]) - H(Ts[k+1])) with H evaluated at the real temperature
     and clipped to [H_in, H_out], so every stream's contributions telescope
-    exactly to sign * |H_out - H_in|. Isothermal streams, and streams whose
-    outlet temperature moves against their duty (a heated stream that exits
-    colder than it entered, e.g. a reboiler outlet at VLE), are point loads
-    at their outlet temperature. The cascade starting from zero hot utility
-    is residual[k] = sum(point_H[:, :k+1]) + sum(interval_H[:, :k]), the
-    heat *leaving* boundary Ts[k]. Feasibility must also hold for the heat
-    *arriving* at Ts[k] before its point loads are applied,
+    exactly to ``sign * |H_out - H_in|``. Isothermal streams, and streams
+    whose outlet temperature moves against their duty (a heated stream that
+    exits colder than it entered, e.g. a reboiler outlet at VLE), are point
+    loads at their outlet temperature. The cascade starting from zero hot
+    utility is residual[k] = sum(point_H[:, :k+1]) + sum(interval_H[:, :k]),
+    the heat *leaving* boundary Ts[k]. Feasibility must also hold for the
+    heat *arriving* at Ts[k] before its point loads are applied,
     arriving[k] = residual[k] - sum(point_H[:, k]), because a source at
     Ts[k] cannot serve a sink above Ts[k]. The minimum over both flows,
     min(residual, arriving), fixes the hot utility target,
@@ -655,8 +655,10 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         The list of inlet-stream copies (IDs ``s_<index>__Util_<index>``)
         prepared for the analysis. The same list object is the cold-side
         working list during synthesis, so on return its entries are the
-        streams' final cold-side states (exchanger outlets or pinch states)
-        rather than the inlets; `HeatExchangerNetwork` uses only its length.
+        streams' cold-side working states (pinch states or exchanger
+        outlets for matched streams, otherwise the inlet copies, some of
+        them re-IDed) rather than a clean list of inlets;
+        `HeatExchangerNetwork` uses only its length.
     stream_HXs_dict : dict[int, list[Unit]]
         Exchangers (process, then utility) each stream index passes through,
         in synthesis order (not flow order; see `StreamLifeCycle`).
@@ -671,10 +673,10 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     hot-side design, in the state they have when they cross the pinch
     (`pinch_state`, with enthalpy clipped to the stream's real range); on
     the other side each stream enters at its inlet state. The synthesis
-    then proceeds in four passes, each creating `HXprocess` units that
-    exchange as much heat as the approach temperature (`dT`), the outlet
-    enthalpy of one stream (`H_lim0`) and a temperature limit on the other
-    (`T_lim1`) allow:
+    then proceeds in four passes, of which the first three create
+    `HXprocess` units that exchange as much heat as the approach
+    temperature (`dT`), the outlet enthalpy of one stream (`H_lim0`) and a
+    temperature limit on the other (`T_lim1`) allow:
 
     1. *Cold-side design.* For each hot stream, candidate cold streams with
        heat-capacity flow rate at most that of the hot stream and a current
@@ -690,8 +692,8 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
        outlet enthalpy. Streams lying entirely below the pinch, and
        isothermal or non-monotone streams, are excluded.
     3. *Offset passes.* Remaining cold-side heating demands, then remaining
-       hot-side cooling demands, are matched in index order with any stream
-       that still has the opposite demand on that side and is at least
+       hot-side cooling demands, are matched in index order with streams
+       that still have the opposite demand on that side and are at least
        `T_min_app` away, without the flow-rate inequality and with `T_lim1`
        the other stream's outlet temperature (in the hot-side pass a cold
        stream is taken at its furthest state across both sides).
