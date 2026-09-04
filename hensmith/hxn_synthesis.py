@@ -20,6 +20,31 @@ __all__ = ('StreamLifeCycle', 'ProblemTable', 'problem_table',
            'synthesize_network', 'plot_pinch_diagram')
 
 class LifeStage:
+    """
+    One stage of a stream's passage through the synthesized network: the
+    heat exchanger it passes through and which of that exchanger's
+    inlet/outlet pairs carries the stream.
+
+    Parameters
+    ----------
+    unit : HXprocess or HXutility
+        Heat exchanger of the synthesized network.
+    index : int
+        Position of the stream in `unit.ins` / `unit.outs` (0 or 1 for an
+        `HXprocess`; always 0 for an `HXutility`).
+
+    Attributes
+    ----------
+    s_in : Stream
+        `unit.ins[index]`, the stream entering this stage.
+    s_out : Stream
+        `unit.outs[index]`, the stream leaving this stage.
+    H_in : float
+        Enthalpy of `s_in` [kJ/hr], read from the stream when accessed.
+    H_out : float
+        Enthalpy of `s_out` [kJ/hr], read from the stream when accessed.
+
+    """
         
     def __init__(self, unit, index):
         self.unit = unit
@@ -52,6 +77,45 @@ class LifeStage:
         
         
 class StreamLifeCycle:
+    """
+    The ordered sequence of heat exchangers one process stream passes through
+    in a synthesized heat exchanger network, from its inlet state to its
+    final utility exchanger.
+
+    Streams are numbered by their position in the rearranged utility list
+    of `synthesize_network` (cold streams first, then hot streams); the
+    network's stream copies and exchanger IDs embed that index
+    (``s_<index>__<exchanger ID>`` for the inlet streams of the exchangers,
+    ``HX_<hot>_<cold>_cs`` / ``HX_<cold>_<hot>_hs`` for process exchangers,
+    ``Util_<index>_cs`` / ``Util_<index>_hs`` for utility exchangers), which
+    is how the life cycle is recovered from the exchangers.
+
+    Parameters
+    ----------
+    index : int
+        Stream index in the synthesized network.
+    cold : bool
+        True for a heated (cold) stream, False for a cooled (hot) stream.
+
+    Attributes
+    ----------
+    index : int
+        Stream index in the synthesized network.
+    cold : bool
+        Whether the stream is a heated (cold) stream.
+    name : str
+        ``'s_<index>'``, the prefix of the stream's copies in the network.
+    life_cycle : list[LifeStage] or None
+        Stages in flow order, set by `get_life_cycle`; None until then.
+
+    Notes
+    -----
+    `HeatExchangerNetwork` builds one life cycle per stream after synthesis
+    and stores them in `HeatExchangerNetwork.stream_life_cycles`, aligned
+    with `HeatExchangerNetwork.original_heat_exchangers`;
+    `plot_pinch_diagram` draws them.
+
+    """
     
     def __init__(self, index, cold):
         self.index = index
@@ -60,11 +124,33 @@ class StreamLifeCycle:
         self.life_cycle = None
         
     def get_relevant_units(self, index, new_HXs, new_HX_utils):
+        """Return the process and utility exchangers (two lists) whose ID contains ``_<index>_``."""
         new_HXs_relevant = [hx for hx in new_HXs if '_%s_'%index in hx.ID]
         new_HX_utils_relevant = [hx for hx in new_HX_utils if '_%s_'%index in hx.ID]
         return new_HXs_relevant, new_HX_utils_relevant
         
     def get_life_cycle(self, new_HXs, new_HX_utils):
+        """
+        Build and return the list of `LifeStage` objects for this stream.
+
+        Parameters
+        ----------
+        new_HXs : list[HXprocess]
+            Process exchangers of the synthesized network.
+        new_HX_utils : list[HXutility]
+            Utility exchangers of the synthesized network.
+
+        Returns
+        -------
+        list[LifeStage]
+            One stage per exchanger whose ID contains ``_<index>_`` and whose
+            inlet at the matching position (0 or 1 for a process exchanger,
+            0 for a utility exchanger) carries this stream, i.e. has an ID
+            containing ``'s_<index>_'``; sorted by inlet enthalpy, ascending
+            for a cold stream and descending for a hot one, i.e. in flow
+            direction. Also stored as `life_cycle`.
+
+        """
         index = self.index
         name = self.name
         cold = self.cold
@@ -97,6 +183,7 @@ class StreamLifeCycle:
             return rep
         
     def show(self):
+        """Print the life cycle, one stage per line."""
         info = repr(self).replace('[', '').replace(']', '').replace('life_cycle =', 'life_cycle:')
         print(info[1:-1])
         
@@ -132,6 +219,46 @@ ProblemTable = namedtuple(
     ['Ts', 'interval_H', 'point_H', 'residual',
      'hot_util_load', 'cold_util_load', 'pinch_T']
 )
+
+ProblemTable.__doc__ = """
+Result of `problem_table`: the temperature-interval heat cascade of a set of
+process streams on the *shifted* temperature scale (hot streams shifted down
+by the minimum approach temperature, cold streams unshifted).
+
+Attributes
+----------
+Ts : numpy.ndarray
+    Shifted grid temperatures [K], descending: the shifted end temperatures
+    of every monotone stream and the shifted outlet temperature of every
+    point-load stream (see `point_H`).
+interval_H : numpy.ndarray
+    (N streams x n-1 intervals) heat contributed by each stream to each
+    interval (Ts[k], Ts[k+1]) [kJ/hr]: positive for hot streams (heat
+    released), negative for cold streams (heat required); zero outside the
+    stream's own temperature range.
+point_H : numpy.ndarray
+    (N x n) heat contributed *at* each grid temperature [kJ/hr], with the
+    same sign convention, by the streams treated as point loads at their
+    shifted outlet temperature: isothermal streams and streams whose outlet
+    temperature moves against their duty (non-monotone streams).
+residual : numpy.ndarray
+    (n,) heat cascaded *leaving* each grid temperature, after its point
+    loads, when no hot utility is supplied [kJ/hr]; negative where that
+    cascade is infeasible.
+hot_util_load : float
+    Minimum hot utility target [kJ/hr] (zero for a threshold problem).
+cold_util_load : float
+    Minimum cold utility target [kJ/hr].
+pinch_T : float
+    Shifted grid temperature of the pinch [K] (``Ts[0]`` for a threshold
+    problem); the hot-stream pinch temperature is `pinch_T + T_min_app`,
+    the cold-stream one is `pinch_T`.
+
+See Also
+--------
+problem_table : builds the table and documents the cascade.
+
+"""
 
 def _stream_H_at_boundaries(stream_in, H_in, H_out, T_lo, T_hi, Ts, shift,
                             stream_label):
@@ -453,6 +580,144 @@ def get_T_transient(pinch_T_arr, indices, T_in_arr):
 
 def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                        avoid_recycle=False, sort_hus_by_T=False):  
+    """
+    Synthesize a heat exchanger network for the process streams behind a
+    set of utility heat exchangers, with pinch analysis followed by a
+    sequential, heuristic matching of hot and cold streams on each side of
+    the pinch.
+
+    Parameters
+    ----------
+    hus : list[HeatUtility]
+        One heat utility per process stream; `hu.unit` is the original heat
+        exchanger (its `ins[0]`/`outs[0]` are the stream's end states) and
+        the sign of `hu.duty` marks the stream: positive = heated (cold
+        stream), negative = cooled (hot stream); zero-duty utilities are
+        dropped. Heating utilities are placed before cooling utilities;
+        within each group the given order is kept unless `sort_hus_by_T`.
+        All returned per-stream arrays and lists are indexed in that
+        rearranged order (the stream index).
+    T_min_app : float, optional
+        Minimum approach temperature [K]: required between the streams of
+        every candidate match, enforced on every synthesized exchanger
+        (``HXprocess(dT=T_min_app)``) and used to shift hot streams in the
+        problem table. Defaults to 5.
+    Qmin : float, optional
+        Candidate exchangers with a duty below this [kJ/hr] are discarded.
+        Defaults to 1e-3.
+    force_ideal_thermo : bool, optional
+        Analyze copies of the streams with ideal thermodynamics
+        (``thermo.ideal()``); the synthesized exchangers inherit that
+        thermo. Defaults to False.
+    avoid_recycle : bool, optional
+        Never match the same (hot, cold) pair twice across the passes, so no
+        two exchangers connect the same pair of streams (a second exchanger
+        between them can form a recycle loop in the network). Defaults to
+        False.
+    sort_hus_by_T : bool, optional
+        Sort the heating utilities by inlet temperature, descending, and the
+        cooling utilities ascending, before analysis. Defaults to False.
+
+    Returns
+    -------
+    HXs_hot_side : list[HXprocess]
+        Process exchangers of the hot-side (above-pinch) design, IDs
+        ``HX_<cold>_<hot>_hs``; ``ins``/``outs`` [0] is the cold stream and
+        [1] the hot stream.
+    HXs_cold_side : list[HXprocess]
+        Process exchangers of the cold-side (below-pinch) design, IDs
+        ``HX_<hot>_<cold>_cs``; ``ins``/``outs`` [0] is the hot stream and
+        [1] the cold stream.
+    new_HX_utils : list[HXutility]
+        One rigorous utility exchanger per stream bringing it to its outlet
+        enthalpy, IDs ``Util_<index>_cs`` (hot streams) / ``Util_<index>_hs``
+        (cold streams); listed hot streams first.
+    hxs : list[Unit]
+        The original heat exchangers, in stream order.
+    T_in_arr, T_out_arr : numpy.ndarray
+        Inlet and (quenched) outlet temperatures of each stream [K].
+    pinch_T_arr : numpy.ndarray
+        Per-stream pinch temperature [K] at which the stream is split
+        between the hot-side and cold-side designs: the process pinch on
+        the stream's own scale when the stream crosses it
+        (`ProblemTable.pinch_T` for a cold stream, that plus `T_min_app` for
+        a hot one); the inlet temperature of a stream whose inlet already
+        lies past the pinch in its direction of flow, or that is isothermal
+        or non-monotone (its whole duty then falls on one side); the outlet
+        temperature of a stream that ends before reaching the pinch.
+    C_flow_vector : numpy.ndarray
+        Heat capacity flow rate of each stream, ``|Q| / |T_in - T_out|``
+        [kJ/hr/K] (the temperature difference is replaced by 1e-12 for an
+        isothermal stream, which therefore ranks as a very large flow rate).
+    hx_utils_rearranged : list[HeatUtility]
+        The heat utilities of `hus` in stream order.
+    streams_inlet : list[Stream]
+        The list of inlet-stream copies (IDs ``s_<index>__Util_<index>``)
+        prepared for the analysis. The same list object is the cold-side
+        working list during synthesis, so on return its entries are the
+        streams' final cold-side states (exchanger outlets or pinch states)
+        rather than the inlets; `HeatExchangerNetwork` uses only its length.
+    stream_HXs_dict : dict[int, list[Unit]]
+        Exchangers (process, then utility) each stream index passes through,
+        in synthesis order (not flow order; see `StreamLifeCycle`).
+    hot_indices, cold_indices : list[int]
+        Stream indices of the hot and cold streams.
+
+    Notes
+    -----
+    The outlet of every stream is first quenched to equilibrium at its own
+    enthalpy (``s.vle(H=s.H, P=s.P)``) and `problem_table` locates the
+    pinch. Hot streams enter the cold-side design, and cold streams the
+    hot-side design, in the state they have when they cross the pinch
+    (`pinch_state`, with enthalpy clipped to the stream's real range); on
+    the other side each stream enters at its inlet state. The synthesis
+    then proceeds in four passes, each creating `HXprocess` units that
+    exchange as much heat as the approach temperature (`dT`), the outlet
+    enthalpy of one stream (`H_lim0`) and a temperature limit on the other
+    (`T_lim1`) allow:
+
+    1. *Cold-side design.* For each hot stream, candidate cold streams with
+       heat-capacity flow rate at most that of the hot stream and a current
+       temperature more than `T_min_app` below the hot stream's, ranked by
+       ``min(C_hot, C_cold) * (T_hot - T_cold - T_min_app)``, are matched
+       in that order (`T_lim1` is the cold stream's pinch temperature) until
+       the hot stream reaches its outlet enthalpy. Streams lying entirely
+       above the pinch, and isothermal or non-monotone streams, are
+       excluded.
+    2. *Hot-side design.* The mirror image for each cold stream, with the
+       heat-capacity flow rate inequality reversed (`T_lim1` is the hot
+       stream's pinch temperature), until the cold stream reaches its
+       outlet enthalpy. Streams lying entirely below the pinch, and
+       isothermal or non-monotone streams, are excluded.
+    3. *Offset passes.* Remaining cold-side heating demands, then remaining
+       hot-side cooling demands, are matched in index order with any stream
+       that still has the opposite demand on that side and is at least
+       `T_min_app` away, without the flow-rate inequality and with `T_lim1`
+       the other stream's outlet temperature (in the hot-side pass a cold
+       stream is taken at its furthest state across both sides).
+    4. *Utility exchangers* (rigorous `HXutility`) finish every stream from
+       its furthest state to its outlet enthalpy; an `AssertionError` is
+       raised if the result does not reproduce the stream's quenched outlet
+       within tolerance.
+
+    The heat-capacity flow rate inequalities of passes 1 and 2 are the
+    feasibility criteria of the pinch design method [LH83]_ (see also
+    [Seider17]_, Chapter 9). A match is attempted at most once per exchanger
+    ID and dropped when the exchanger cannot be simulated or its duty is
+    below `Qmin`; each successful match advances the working states of both
+    streams. `HeatExchangerNetwork` calls this function and turns the result
+    into a `System` that it converges and costs.
+
+    References
+    ----------
+    .. [LH83] Linnhoff, B., & Hindmarsh, E. (1983). The pinch design method
+        for heat exchanger networks. Chemical Engineering Science, 38(5),
+        745-763.
+    .. [Seider17] Seider, W. D., Lewin, D. R., Seader, J. D., Widagdo, S.,
+        Gani, R., & Ng, M. K. (2017). Product and Process Design Principles.
+        Wiley. Heat Exchanger Networks (Chapter 9).
+
+    """
     pinch_T_arr, hot_util_load, cold_util_load, T_in_arr, T_out_arr,\
         hxs, hot_indices, cold_indices, indices, streams_inlet, hx_utils_rearranged, \
         streams_quenched = temperature_interval_pinch_analysis(hus, T_min_app, force_ideal_thermo,
