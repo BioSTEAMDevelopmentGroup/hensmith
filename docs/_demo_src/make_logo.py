@@ -20,6 +20,15 @@ from PIL import Image
 
 INK = {'light': '#1f2a2e', 'dark': '#e8eef0'}
 OUT = IMAGES / 'logo'
+PT_PER_UNIT = 72   # render() maps 12 data units onto a 12-inch figure: 1 unit = 1 in = 72 pt
+
+
+def ring_radius(ms):
+    """Radius of a hollow 'o' marker's stroke centreline, in data units (as
+    in make_icons.py): a butt-capped stroke narrower than ``ms`` that ends
+    here lies entirely under the ring's edge stroke, so it meets the ring
+    with no gap and never shows inside the hollow."""
+    return ms / 2 / PT_PER_UNIT
 
 
 def draw_mark(ax, theme, x0=0.0, y0=0.0, s=1.0):
@@ -27,20 +36,40 @@ def draw_mark(ax, theme, x0=0.0, y0=0.0, s=1.0):
     and each arrowhead overshoots its end by 0.2, so the glyph occupies a
     2.8 x 1.8 box starting at x0 - 0.2. The tips are set 0.2 past the shaft
     ends (and the head kept at mutation_scale=34) so the stroked head base
-    clears the circle instead of butting against it."""
+    clears the circle instead of butting against it.
+
+    The node rings are hollow and every stroke stops at the ring it meets
+    (the construction of make_icons.exchanger), so the mark is the same
+    open-circle glyph on any ground. The PNGs are transparent and sit on the
+    navbar, the demo chrome and the poster, none of which is the page
+    background the rings used to be filled with: filled with THEMES['dark']
+    ['bg'] the dark variant showed dark discs where the light one showed
+    open rings."""
     t = THEMES[theme]
+    ink = INK[theme]
     lw = 14 * s
-    ax.annotate('', xy=(x0 + 2.6 * s, y0 + 1.5 * s), xytext=(x0, y0 + 1.5 * s),
-                arrowprops=dict(arrowstyle='-|>,head_length=0.9,head_width=0.45',
-                                color=t['cold'], lw=lw, shrinkA=0, shrinkB=0,
-                                mutation_scale=34))
-    ax.annotate('', xy=(x0 - 0.2 * s, y0 + 0.3 * s), xytext=(x0 + 2.4 * s, y0 + 0.3 * s),
-                arrowprops=dict(arrowstyle='-|>,head_length=0.9,head_width=0.45',
-                                color=t['hot'], lw=lw, shrinkA=0, shrinkB=0,
-                                mutation_scale=34))
-    ax.plot([x0 + 1.2 * s] * 2, [y0 + 0.3 * s, y0 + 1.5 * s], '-o', color=INK[theme],
-            lw=lw * 0.8, mfc=t['bg'], mec=INK[theme], mew=lw * 0.55, ms=52 * s, zorder=5,
-            solid_capstyle='round')
+    ms, mew = 52 * s, lw * 0.55
+    r = ring_radius(ms)
+    cx, y_cold, y_hot = x0 + 1.2 * s, y0 + 1.5 * s, y0 + 0.3 * s
+    head = 'head_length=0.9,head_width=0.45'
+
+    def arrow(x_from, x_to, y, color):
+        # butt-capped: FancyArrowPatch's default round cap would poke lw/2 into the hollow
+        ax.annotate('', xy=(x_to, y), xytext=(x_from, y),
+                    arrowprops=dict(arrowstyle='-|>,' + head, color=color, lw=lw,
+                                    shrinkA=0, shrinkB=0, mutation_scale=34, capstyle='butt'))
+
+    def tail(x_end, x_ring, y, color):
+        # butt-capped so it stops at the ring; a dot restores the round outer tip
+        ax.plot([x_end, x_ring], [y, y], '-', color=color, lw=lw, solid_capstyle='butt')
+        ax.plot([x_end], [y], 'o', mfc=color, mec='none', ms=lw)
+
+    tail(x0, cx - r, y_cold, t['cold'])
+    arrow(cx + r, x0 + 2.6 * s, y_cold, t['cold'])
+    tail(x0 + 2.4 * s, cx + r, y_hot, t['hot'])
+    arrow(cx - r, x0 - 0.2 * s, y_hot, t['hot'])
+    ax.plot([cx, cx], [y_hot + r, y_cold - r], '-', color=ink, lw=lw * 0.8, solid_capstyle='butt')
+    ax.plot([cx, cx], [y_hot, y_cold], 'o', mfc='none', mec=ink, mew=mew, ms=ms, zorder=5)
 
 
 def render(theme, with_text):
