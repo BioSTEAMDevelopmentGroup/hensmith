@@ -130,10 +130,14 @@ def main():
     ax.plot(hot_H / GJ, hot_T - 273.15, color='#d62728', lw=2, label='hot composite')
     ax.plot(cold_H / GJ, cold_T - 273.15, color='#2e6db4', lw=2, label='cold composite')
     y_lo, y_hi = hot_T[0] - 273.15, cold_T[-1] - 273.15
+    ax.margins(y=0.12)   # headroom so the utility labels sit inside the frame
     ax.annotate('', xy=(0, y_lo), xytext=(cold_H[0] / GJ, y_lo), arrowprops=dict(arrowstyle='<->'))
-    ax.text(cold_H[0] / GJ, y_lo - 3, f'cold utility {table.cold_util_load:.3g} kJ/hr', ha='left', va='top', fontsize=8)
+    ax.annotate(f'cold utility {table.cold_util_load:.3g} kJ/hr', xy=(cold_H[0] / 2 / GJ, y_lo),
+                xytext=(30, -18), textcoords='offset points', fontsize=8,
+                arrowprops=dict(arrowstyle='-', lw=0.6, shrinkB=4))
     ax.annotate('', xy=(hot_H[-1] / GJ, y_hi), xytext=(cold_H[-1] / GJ, y_hi), arrowprops=dict(arrowstyle='<->'))
-    ax.text(hot_H[-1] / GJ, y_hi + 2, f'hot utility {table.hot_util_load:.3g} kJ/hr', ha='left', va='bottom', fontsize=8)
+    ax.text((hot_H[-1] + cold_H[-1]) / 2 / GJ, y_hi + 2, f'hot utility {table.hot_util_load:.3g} kJ/hr',
+            ha='center', va='bottom', fontsize=8)
     ax.set_xlabel('H [GJ/hr]'); ax.set_ylabel('T [°C]')
     ax.legend(loc='lower right', fontsize=8); ax.grid(alpha=0.3)
     # [end:curves]
