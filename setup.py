@@ -12,7 +12,7 @@ setup(
     name='hensmith',
     packages=['hensmith'],
     license='MIT',
-    version='0.1.1',
+    version='0.1.2',
     description=('Heat Exchanger Network Synthesis, Modeling, Integration, '
                  'Thermodynamics, and Heuristics'),
     long_description=open('README.md', encoding='utf-8').read(),
