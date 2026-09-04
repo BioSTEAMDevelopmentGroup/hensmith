@@ -1,0 +1,5 @@
+stream 0 (cold): in  33.2 °C, pinch  33.2 °C, out  99.5 °C
+stream 1 (cold): in  25.0 °C, pinch  25.0 °C, out  95.9 °C
+stream 2 (hot ): in  98.2 °C, pinch  30.0 °C, out  26.8 °C
+stream 3 (hot ): in  65.4 °C, pinch  64.9 °C, out  64.9 °C
+stream 4 (hot ): in  64.9 °C, pinch  64.8 °C, out  64.8 °C

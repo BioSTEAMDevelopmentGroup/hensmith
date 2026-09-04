@@ -1,0 +1,10 @@
+energy balance error: -1.8e-11 % (warns above 2 %)
+original exchangers, purchase cost: 3.365e+05 USD
+new process exchangers, purchase:   4.73e+05 USD
+new utility exchangers, purchase:   2.096e+05 USD
+facility purchase cost (added):     3.461e+05 USD
+facility installed cost (added):    1.114e+06 USD
+facility heat utilities (new minus original):
+  low_pressure_steam   duty  -6.321e+07 kJ/hr   cost   -388.6 USD/hr
+  chilled_water        duty   4.212e+07 kJ/hr   cost   -210.6 USD/hr
+  cooling_water        duty   1.794e+07 kJ/hr   cost   -5.976 USD/hr
