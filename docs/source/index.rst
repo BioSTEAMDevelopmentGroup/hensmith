@@ -61,7 +61,8 @@ inspect the synthesized exchangers and the pinch diagram.
      <iframe src="_static/quickstart_demo.html"
              title="hensmith quickstart — interactive demo"
              loading="lazy"
-             style="width:100%;height:840px;border:1px solid rgba(128,128,128,0.25);border-radius:14px;display:block;"></iframe>
+             class="demo-frame"
+             style="width:100%;border:1px solid rgba(128,128,128,0.25);border-radius:14px;display:block;"></iframe>
      <p style="text-align:center;font-size:0.85rem;margin-top:0.4rem;opacity:0.8;">
        Interactive quickstart demo &mdash;
        <a href="_static/quickstart_demo.html" target="_blank" rel="noopener">open in a new tab</a>.

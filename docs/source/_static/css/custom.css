@@ -41,3 +41,15 @@ p.landing-lede {
 #heat-exchanger-network-synthesis > h1 {
     text-align: center;
 }
+
+/* The quickstart demo iframe. At phone widths the player stacks its two
+   panes and grows to about 1.4k px on its tallest scene, so let the frame
+   grow with it instead of scrolling inside the frame. */
+.demo-frame {
+    height: 840px;
+}
+@media (max-width: 640px) {
+    .demo-frame {
+        height: 1460px;
+    }
+}
