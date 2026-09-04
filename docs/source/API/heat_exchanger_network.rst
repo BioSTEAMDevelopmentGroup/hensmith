@@ -13,8 +13,10 @@ separate flowsheet named ``<sys>_HXN``. See :doc:`../tutorial/index` for a
 worked example.
 
 .. autoclass:: HeatExchangerNetwork
-   :members: plot_pinch_diagram
+   :no-members:
    :show-inheritance:
+
+.. automethod:: HeatExchangerNetwork.plot_pinch_diagram
 
 Constructor options
 -------------------
