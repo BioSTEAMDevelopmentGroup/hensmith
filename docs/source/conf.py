@@ -22,7 +22,7 @@ print(f'[conf.py] documenting hensmith {hensmith.__version__} from {hensmith.__f
 
 project = 'hensmith'
 author = 'Sarang S. Bhagwat'
-copyright = '2020-2026, BioSTEAM Development Group'
+copyright = '2020-2026, Sarang S. Bhagwat'
 version = release = hensmith.__version__
 
 extensions = [
@@ -56,7 +56,6 @@ intersphinx_mapping = {
     'numpy': ('https://numpy.org/doc/stable/', None),
     'matplotlib': ('https://matplotlib.org/stable/', None),
     'biosteam': ('https://biosteam.readthedocs.io/en/latest/', None),
-    'thermosteam': ('https://thermosteam.readthedocs.io/en/latest/', None),
 }
 intersphinx_disabled_domains = ['std']
 intersphinx_timeout = 30
