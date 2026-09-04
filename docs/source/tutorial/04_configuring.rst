@@ -70,17 +70,17 @@ Both utility loads rise monotonically with the approach temperature and the
 added capital falls monotonically: heating goes from 2.957e+08 kJ/hr at 2 K to
 3.289e+08 kJ/hr at 30 K, cooling from 1.167e+05 to 3.158e+07 kJ/hr, and the
 added installed cost from 2.396e+06 USD down to 2.454e+05 USD. That is the
-classic pinch trade-off. ``T_min_app`` enters the calculation twice, and both
-appearances push the same way. In the problem table it is the amount by which
-hot streams are shifted down before the cascade, so a larger value moves the
-hot streams further from the cold ones and raises both utility targets. In the
-synthesis it is the approach observed on every match: each synthesized process
-exchanger is an ``HXprocess(dT=T_min_app)``, and a candidate match is only
-considered when the two streams are at least ``T_min_app`` apart. A smaller
-approach therefore admits more matches and lets each one transfer more heat,
-but the exchangers that do so work across a smaller temperature difference and
-need more area for the same duty -- which is what the right-hand panel below
-prices.
+classic pinch trade-off. ``T_min_app`` enters the calculation in three places,
+and all of them push the same way. In the problem table it is the amount by
+which hot streams are shifted down before the cascade, so a larger value moves
+the hot streams further from the cold ones and raises both utility targets. In
+the synthesis it decides the eligibility of a match -- a candidate is only
+considered when the two streams are at least ``T_min_app`` apart -- and it is
+the approach each synthesized process exchanger observes, since every one of
+them is an ``HXprocess(dT=T_min_app)``. A smaller approach therefore admits
+more matches and lets each one transfer more heat, but the exchangers that do
+so work across a smaller temperature difference and need more area for the
+same duty -- which is what the right-hand panel below prices.
 
 .. literalinclude:: /../_demo_src/examples/ch04_configuring.py
    :language: python
@@ -264,12 +264,12 @@ targets are process-side enthalpy differences. Summing the ``unit_duty`` of the
 new utility exchangers instead, as ``tests/test_hxn_regression.py`` does, gives
 the process-side loads that are comparable with the targets. On the hot side
 the two differ: 1.481e+07 kJ/hr utility-side against 1.407e+07 kJ/hr
-process-side, for a target of 1.394e+07 kJ/hr. On the cold side cooling water
-needs no such correction and both read 8.065e+06 kJ/hr, against a target of
-7.928e+06 kJ/hr. Those process-side numbers, 1.407e+07 and 8.065e+06 kJ/hr, are
-the values the regression suite records for this case. The network is above
-both targets, as a synthesized network must be, and its energy balance error is
-1e-11 %.
+process-side, for a target of 1.394e+07 kJ/hr. On the cold side the cooling
+agents used here need no such correction and both read 8.065e+06 kJ/hr, against
+a target of 7.928e+06 kJ/hr. Those process-side numbers, 1.407e+07 and
+8.065e+06 kJ/hr, are the values the regression suite records for this case. The
+network is above both targets, as a synthesized network must be, and its
+energy balance error is 1e-11 %.
 
 .. figure:: /_static/images/examples/tutorial_04_ten_streams_pinch_diagram.png
    :class: white-bg
