@@ -916,9 +916,8 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                     streams_transient_cold_side[cold] = new_HX.outs[1]
                     matches_cs[hot].append(cold)
                  
-    # Offset cooling requirement on hot side  
+    # Offset cooling requirement on hot side
     for hot in hot_indices:
-        stream_quenched = False
         if Q_hot_side[hot][0]=='cool' and Q_hot_side[hot][1]>0:
             for cold in cold_indices:
                 match = (hot, cold)
@@ -954,11 +953,8 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                     streams_transient_hot_side[hot] = new_HX.outs[1]
                     H_out = new_HX.outs[0].H
                     assert H_out - new_HX.ins[0].H >= 0.
-                    stream_quenched = H_out > H_lim or np.allclose(H_out, H_lim)                   
-                    matches_hs[cold].append(hot)                    
-                    if stream_quenched:
-                        break
-    
+                    matches_hs[cold].append(hot)
+
     # Add final utility HXs
     new_HX_utils = []    
     for hot in hot_indices:
