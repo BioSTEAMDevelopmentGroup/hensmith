@@ -714,7 +714,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     matches_cs = {i: [] for i in hot_indices}
     HXs_hot_side = []
     HXs_cold_side = []
-    streams_transient_cold_side = streams_inlet
+    streams_transient_cold_side = [i.copy() for i in streams_inlet]
     streams_transient_hot_side = [i.copy() for i in streams_inlet]
     # Hot streams enter the cold-side design at their pinch state and cold
     # streams enter the hot-side design at theirs; the enthalpy of that
