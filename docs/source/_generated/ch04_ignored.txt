@@ -1,0 +1,3 @@
+streams in the network: 4
+heating utility: 3.609e+08 -> 3.42e+08 kJ/hr
+cooling utility: 1.797e+07 -> 5.336e-07 kJ/hr
