@@ -1,0 +1,4 @@
+shifted grid Ts [K]: [395. 390. 300. 295.]
+hot utility target [kJ/hr]:  0.0
+cold utility target [kJ/hr]: 1445550.0
+pinch (shifted) [K]: 395.0
