@@ -92,6 +92,22 @@ def test_energy_balance_error_contributions_ignored_none():
     assert len(errors) == N
     assert HXN.ignored is None
 
+def test_streams_inlet_holds_the_inlet_states():
+    """`streams_inlet` is a clean list of inlet copies, one per exchanger in
+    `original_heat_exchangers` order, not the cold-side working list whose
+    entries end up as pinch states or exchanger outlets."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    assert len(HXN.streams_inlet) == len(HXN.original_heat_exchangers)
+    network_streams = {id(s) for hx in HXN.new_HXs + HXN.new_HX_utils
+                       for s in (*hx.ins, *hx.outs)}
+    for s, hx in zip(HXN.streams_inlet, HXN.original_heat_exchangers):
+        inlet = hx.ins[0]
+        assert_allclose(s.T, inlet.T)
+        assert_allclose(s.H, inlet.H)
+        assert_allclose(s.mol, inlet.mol)
+        assert id(s) not in network_streams
+
 # ---------------------------------------------------------------------------
 # Problem-table (pinch) analysis
 # ---------------------------------------------------------------------------
