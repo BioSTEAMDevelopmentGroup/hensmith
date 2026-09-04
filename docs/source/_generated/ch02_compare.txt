@@ -1,2 +1,4 @@
 hot utility:  target 2.828e+08, network 2.977e+08 kJ/hr
 cold utility: target 1.936e+06, network 1.96e+06 kJ/hr
+hot utility,  process side: target 2.828e+08, network 2.828e+08 kJ/hr
+cold utility, process side: target 1.936e+06, network 1.96e+06 kJ/hr

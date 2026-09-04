@@ -128,6 +128,14 @@ def main():
         print(f'process exchangers: {len(HXN10.new_HXs)}')
         print(f'hot utility:  target {table.hot_util_load:.4g}, network {HXN10.actual_heat_util_load:.4g} kJ/hr')
         print(f'cold utility: target {table.cold_util_load:.4g}, network {HXN10.actual_cool_util_load:.4g} kJ/hr')
+        # Those loads are utility-side (duty = unit_duty / heat transfer
+        # efficiency); the targets are process-side enthalpy differences, so
+        # sum the process-side duties of the network's utility exchangers too.
+        new_hus = [hu for hx in HXN10.new_HX_utils for hu in hx.heat_utilities]
+        heat = sum(hu.unit_duty for hu in new_hus if hu.unit_duty > 0)
+        cool = -sum(hu.unit_duty for hu in new_hus if hu.unit_duty < 0)
+        print(f'hot utility,  process side: target {table.hot_util_load:.4g}, network {heat:.4g} kJ/hr')
+        print(f'cold utility, process side: target {table.cold_util_load:.4g}, network {cool:.4g} kJ/hr')
         print(f'energy balance error: {HXN10.energy_balance_percent_error:.2g} %')
         fig, ax = HXN10.plot_pinch_diagram()
         # [end:ten_streams]
