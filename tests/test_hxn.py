@@ -92,6 +92,25 @@ def test_energy_balance_error_contributions_ignored_none():
     assert len(errors) == N
     assert HXN.ignored is None
 
+def test_HXN_flowsheet_is_the_network_flowsheet():
+    """HXN_flowsheet must be the '<sys>_HXN' Flowsheet that holds the network,
+    not the main-flowsheet proxy (which reads back as whatever is active)."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    fs = HXN.HXN_flowsheet
+    assert isinstance(fs, bst.Flowsheet)
+    assert fs is not bst.main_flowsheet
+    assert fs.ID == sys.ID + '_HXN'
+    assert fs.ID != bst.main_flowsheet.ID
+    assert fs is bst.main_flowsheet.flowsheet[sys.ID + '_HXN']
+    # Every unit of the synthesized network is registered in that flowsheet
+    # (Registry iterates over its registered objects), and none of them leaked
+    # into the user's main flowsheet.
+    network_units = HXN.HXN_sys.units
+    assert network_units
+    assert all(unit in fs.unit for unit in network_units)
+    assert not any(unit in bst.main_flowsheet.unit for unit in network_units)
+
 # ---------------------------------------------------------------------------
 # Problem-table (pinch) analysis
 # ---------------------------------------------------------------------------

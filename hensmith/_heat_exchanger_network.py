@@ -192,7 +192,7 @@ class HeatExchangerNetwork(bst.Facility):
                             s_out.mol[:] = s_in.mol
             else:
                 hx_utils.sort(key = lambda x: x.duty)
-                self.HXN_flowsheet = HXN_F = bst.main_flowsheet
+                self.HXN_flowsheet = HXN_F = flowsheet
                 for i in HXN_F.registries: i.clear()
                 HXs_hot_side, HXs_cold_side, new_HX_utils, hxs, T_in_arr,\
                 T_out_arr, pinch_T_arr, C_flow_vector, hx_heat_utils_rearranged, streams_inlet, stream_HXs_dict,\
