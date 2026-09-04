@@ -1,0 +1,55 @@
+/* Theme-specific raster pairs use pydata's only-light/only-dark classes.
+   Single-variant figures (pinch diagrams, composite curves) are white-background
+   PNGs: keep them un-inverted and give them a white backing in dark mode. */
+html[data-theme="dark"] img {
+    filter: none;
+}
+html[data-theme="dark"] .bd-content img:not(.only-dark) {
+    background: unset;
+}
+html[data-theme="dark"] .bd-content figure img.white-bg,
+html[data-theme="dark"] .bd-content img.white-bg {
+    background: #ffffff;
+    border-radius: 4px;
+}
+
+html[data-theme="light"] {
+    --pst-color-title: rgb(46, 109, 180);
+}
+html[data-theme="dark"] {
+    --pst-color-title: rgb(229, 229, 229);
+}
+
+h1 { margin-top: 0; font-size: var(--pst-font-size-h1); color: var(--pst-color-title); }
+h2 { font-size: var(--pst-font-size-h2); color: var(--pst-color-title); }
+h3 { font-size: var(--pst-font-size-h3); color: var(--pst-color-title); }
+
+.sd-card-title {
+    margin-bottom: 0.5rem;
+    font-weight: 600 !important;
+    color: var(--pst-color-text);
+}
+
+p.landing-lede {
+    max-width: 46rem;
+    margin: 0 auto 1.5rem;
+    text-align: center;
+}
+
+/* Centre the landing-page title over the hero. The id is derived from the
+   title "Heat Exchanger Network Synthesis"; keep in sync if it changes. */
+#heat-exchanger-network-synthesis > h1 {
+    text-align: center;
+}
+
+/* The quickstart demo iframe. At phone widths the player stacks its two
+   panes and grows to about 1.4k px on its tallest scene, so let the frame
+   grow with it instead of scrolling inside the frame. */
+.demo-frame {
+    height: 840px;
+}
+@media (max-width: 900px) {
+    .demo-frame {
+        height: 1460px;
+    }
+}

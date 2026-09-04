@@ -26,7 +26,10 @@ clipped to the stream's enthalpy range; network path ordered by its
 connections; H_lim honored at the bubble point); case 5 lowered after the
 pinch state at an end temperature became the equilibrium state at that
 end enthalpy (its 420 K, 5 bar vapor feed is below water's boiling point
-there, a non-equilibrium inlet). Improvements leave slack; a
+there, a non-equilibrium inlet); case 6 lowered to its MER targets after
+the hot-side offset pass stopped abandoning a hot stream once the first
+cold stream it matched was fully heated (branch
+``fix-hxn-hot-side-offset-break``). Improvements leave slack; a
 maintainer lowers the numbers deliberately when a better network is
 intended. Never raise them to make a failing test pass.
 """
@@ -162,7 +165,7 @@ CASES = {
     'case_03_condenser_two_colds': (case_03_condenser_two_colds, 0, 9.49905e+06),
     'case_04_report_case':         (case_04_report_case,         2.37319e+06, 3.56871e+06),
     'case_05_boiling_cold':        (case_05_boiling_cold,        3.2224e+06, 7.81466e+06),
-    'case_06_mixed_pressures':     (case_06_mixed_pressures,     7.05541e+06, 4.93079e+06),
+    'case_06_mixed_pressures':     (case_06_mixed_pressures,     2.12463e+06, 0),
     'case_07_threshold':           (case_07_threshold,           1.85977e+07, 0),
     'case_08_two_condensers':      (case_08_two_condensers,      3.02237e+06, 7.36431e+06),
     'case_09_near_degenerate':     (case_09_near_degenerate,     1.40965e+07, 9.66427e+06),

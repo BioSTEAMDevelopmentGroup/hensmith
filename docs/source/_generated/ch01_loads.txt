@@ -1,0 +1,5 @@
+heating utility: 3.609e+08 -> 2.977e+08 kJ/hr
+cooling utility: 6.201e+07 -> 1.96e+06 kJ/hr
+energy balance error: -1.8e-11 %
+added installed cost: 1.11e+06 USD
+process exchangers: ['HX_0_2_hs', 'HX_1_4_hs', 'HX_1_2_hs', 'HX_1_3_hs']

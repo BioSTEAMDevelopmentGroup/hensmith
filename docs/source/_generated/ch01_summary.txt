@@ -1,0 +1,15 @@
+n_streams = 5
+n_auxiliary = 3
+n_process_hxs = 4
+heating_before = 3.609e+08
+heating_after = 2.977e+08
+heating_reduction_percent = 17.5
+cooling_before = 6.201e+07
+cooling_after = 1.96e+06
+cooling_reduction_percent = 96.8
+heat_ratio = 0.82
+utility_cost_usd_per_hr = -605
+installed_cost_usd = 1.11e+06
+stream_1_process_hxs = 3
+energy_balance_percent_error = -1.8e-11
+energy_balance_percent_error_abs = 2e-11

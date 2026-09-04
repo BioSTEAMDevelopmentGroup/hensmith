@@ -92,6 +92,77 @@ def test_energy_balance_error_contributions_ignored_none():
     assert len(errors) == N
     assert HXN.ignored is None
 
+def test_HXN_flowsheet_is_the_network_flowsheet():
+    """HXN_flowsheet must be the '<sys>_HXN' Flowsheet that holds the network,
+    not the main-flowsheet proxy (which reads back as whatever is active)."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    fs = HXN.HXN_flowsheet
+    assert isinstance(fs, bst.Flowsheet)
+    assert fs is not bst.main_flowsheet
+    assert fs.ID == sys.ID + '_HXN'
+    assert fs.ID != bst.main_flowsheet.ID
+    assert fs is bst.main_flowsheet.flowsheet[sys.ID + '_HXN']
+    # Every unit of the synthesized network is registered in that flowsheet
+    # (Registry iterates over its registered objects), and none of them leaked
+    # into the user's main flowsheet.
+    network_units = HXN.HXN_sys.units
+    assert network_units
+    assert all(unit in fs.unit for unit in network_units)
+    assert not any(unit in bst.main_flowsheet.unit for unit in network_units)
+
+def test_HXN_sys_is_named_and_registered_in_the_network_flowsheet():
+    """HXN_sys carries the '<sys>_HXN' ID and is registered in the network
+    flowsheet's system registry, so it is addressable there like the network
+    units are, and print() shows the name rather than '-'."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    ID = sys.ID + '_HXN'
+    HXN_sys = HXN.HXN_sys
+    assert HXN_sys.ID == ID
+    assert str(HXN_sys) == ID
+    network_flowsheet = bst.main_flowsheet.flowsheet[sys.ID + '_HXN']
+    assert network_flowsheet.system[ID] is HXN_sys
+    assert bst.main_flowsheet.system.search(ID) is None
+    # A fresh synthesis builds a new network flowsheet with empty registries,
+    # so re-registering the same ID cannot collide; the cached path keeps the
+    # named object.
+    sys.simulate()
+    assert HXN.HXN_sys is not HXN_sys
+    assert HXN.HXN_sys.ID == ID
+    network_flowsheet = bst.main_flowsheet.flowsheet[sys.ID + '_HXN']
+    assert network_flowsheet.system[ID] is HXN.HXN_sys
+    HXN.cache_network = True
+    sys.simulate()
+    assert HXN.HXN_sys.ID == ID
+
+def test_streams_inlet_holds_the_inlet_states():
+    """`streams_inlet` is a clean list of inlet copies, one per exchanger in
+    `original_heat_exchangers` order, not the cold-side working list whose
+    entries end up as pinch states or exchanger outlets."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    assert len(HXN.streams_inlet) == len(HXN.original_heat_exchangers)
+    network_streams = {id(s) for hx in HXN.new_HXs + HXN.new_HX_utils
+                       for s in (*hx.ins, *hx.outs)}
+    for s, hx in zip(HXN.streams_inlet, HXN.original_heat_exchangers):
+        inlet = hx.ins[0]
+        assert_allclose(s.T, inlet.T)
+        assert_allclose(s.H, inlet.H)
+        assert_allclose(s.mol, inlet.mol)
+        assert id(s) not in network_streams
+
+def test_life_stage_reports_enthalpy_flow_units():
+    """LifeStage enthalpies are Stream.H values, i.e. flows in kJ/hr, and its
+    repr and show() label them as such."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    stage = HXN.stream_life_cycles[0].life_cycle[0]
+    assert stage.H_in == stage.s_in.H
+    assert ' kJ/hr,' in repr(stage) and repr(stage).endswith(' kJ/hr>')
+    assert stage._info().count(' kJ/hr') == 2
+    assert repr(HXN.stream_life_cycles[0]).count(' kJ/hr') == 2 * len(HXN.stream_life_cycles[0].life_cycle)
+
 # ---------------------------------------------------------------------------
 # Problem-table (pinch) analysis
 # ---------------------------------------------------------------------------

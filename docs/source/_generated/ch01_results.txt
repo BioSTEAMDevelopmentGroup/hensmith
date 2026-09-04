@@ -1,0 +1,14 @@
+Heat exchanger network                      Units       HXN
+Low pressure steam       Duty               kJ/hr -6.32e+07
+                         Flow             kmol/hr -1.63e+03
+                         Cost              USD/hr      -389
+Chilled water            Duty               kJ/hr  4.21e+07
+                         Flow             kmol/hr -2.78e+04
+                         Cost              USD/hr      -211
+Cooling water            Duty               kJ/hr  1.79e+07
+                         Flow             kmol/hr -1.22e+04
+                         Cost              USD/hr     -5.98
+Purchase cost            Heat exchangers      USD  3.46e+05
+Total purchase cost                           USD  3.46e+05
+Installed equipment cost                      USD  1.11e+06
+Utility cost                               USD/hr      -605

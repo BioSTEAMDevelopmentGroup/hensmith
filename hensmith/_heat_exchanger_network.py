@@ -39,6 +39,7 @@ class HeatExchangerNetwork(bst.Facility):
     
     Notes
     -----
+    The network is synthesized with the pinch design method [1]_.
     Original system stream and heat exchanger objects are preserved. All stream 
     copies and new HX objects can be found in a newly created flowsheet 
     '<sys>_HXN' where <sys> is the name of the system associated to the 
@@ -76,27 +77,27 @@ class HeatExchangerNetwork(bst.Facility):
     >>> HXN.stream_life_cycles
     [<StreamLifeCycle: Stream_0, cold
     	life_cycle = [
-    		<LifeStage: <HXprocess: HX_0_2_hs>, H_in = 5.38e+06 kJ, H_out = 4.24e+07 kJ>
-    		<LifeStage: <HXutility: Util_0_hs>, H_in = 4.24e+07 kJ, H_out = 6.92e+07 kJ>
+    		<LifeStage: <HXprocess: HX_0_2_hs>, H_in = 5.38e+06 kJ/hr, H_out = 4.24e+07 kJ/hr>
+    		<LifeStage: <HXutility: Util_0_hs>, H_in = 4.24e+07 kJ/hr, H_out = 6.92e+07 kJ/hr>
     	]>, <StreamLifeCycle: Stream_1, cold
     	life_cycle = [
-    		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 0 kJ, H_out = 3.34e+04 kJ>
-    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 3.34e+04 kJ, H_out = 5.06e+06 kJ>
-    		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 5.06e+06 kJ, H_out = 2.3e+07 kJ>
-    		<LifeStage: <HXutility: Util_1_hs>, H_in = 2.3e+07 kJ, H_out = 2.79e+08 kJ>
+    		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 0 kJ/hr, H_out = 3.34e+04 kJ/hr>
+    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 3.34e+04 kJ/hr, H_out = 5.06e+06 kJ/hr>
+    		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 5.06e+06 kJ/hr, H_out = 2.3e+07 kJ/hr>
+    		<LifeStage: <HXutility: Util_1_hs>, H_in = 2.3e+07 kJ/hr, H_out = 2.79e+08 kJ/hr>
     	]>, <StreamLifeCycle: Stream_2, hot
     	life_cycle = [
-    		<LifeStage: <HXprocess: HX_0_2_hs>, H_in = 4.52e+07 kJ, H_out = 8.12e+06 kJ>
-    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 8.12e+06 kJ, H_out = 3.1e+06 kJ>
-    		<LifeStage: <HXutility: Util_2_cs>, H_in = 3.1e+06 kJ, H_out = 1.14e+06 kJ>
+    		<LifeStage: <HXprocess: HX_0_2_hs>, H_in = 4.52e+07 kJ/hr, H_out = 8.12e+06 kJ/hr>
+    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 8.12e+06 kJ/hr, H_out = 3.1e+06 kJ/hr>
+    		<LifeStage: <HXutility: Util_2_cs>, H_in = 3.1e+06 kJ/hr, H_out = 1.14e+06 kJ/hr>
     	]>, <StreamLifeCycle: Stream_3, hot
     	life_cycle = [
-    		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 2.04e+07 kJ, H_out = 2.47e+06 kJ>
-    		<LifeStage: <HXutility: Util_3_cs>, H_in = 2.47e+06 kJ, H_out = 2.47e+06 kJ>
+    		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 2.04e+07 kJ/hr, H_out = 2.47e+06 kJ/hr>
+    		<LifeStage: <HXutility: Util_3_cs>, H_in = 2.47e+06 kJ/hr, H_out = 2.47e+06 kJ/hr>
     	]>, <StreamLifeCycle: Stream_4, hot
     	life_cycle = [
-    		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 7.51e+05 kJ, H_out = 7.18e+05 kJ>
-    		<LifeStage: <HXutility: Util_4_cs>, H_in = 7.18e+05 kJ, H_out = 7.18e+05 kJ>
+    		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 7.51e+05 kJ/hr, H_out = 7.18e+05 kJ/hr>
+    		<LifeStage: <HXutility: Util_4_cs>, H_in = 7.18e+05 kJ/hr, H_out = 7.18e+05 kJ/hr>
     	]>]
     
     """
@@ -191,8 +192,11 @@ class HeatExchangerNetwork(bst.Facility):
                         else:
                             s_out.mol[:] = s_in.mol
             else:
+                # Signed-duty order is the default matching priority of the
+                # synthesis passes: smallest heating duty first among the cold
+                # streams, largest cooling duty first among the hot streams.
                 hx_utils.sort(key = lambda x: x.duty)
-                self.HXN_flowsheet = HXN_F = bst.main_flowsheet
+                self.HXN_flowsheet = HXN_F = flowsheet
                 for i in HXN_F.registries: i.clear()
                 HXs_hot_side, HXs_cold_side, new_HX_utils, hxs, T_in_arr,\
                 T_out_arr, pinch_T_arr, C_flow_vector, hx_heat_utils_rearranged, streams_inlet, stream_HXs_dict,\
@@ -245,7 +249,7 @@ class HeatExchangerNetwork(bst.Facility):
                              'with stale inlets until convergence', RuntimeWarning)
                     else:
                         warn(w.message, w.category)
-                self.HXN_sys = sys = bst.System._from_network(None, network)
+                self.HXN_sys = sys = bst.System._from_network(HXN_F.ID, network)
                 sys.set_tolerance(method='fixedpoint', subsystems=True)
             
             original_purchase_costs = [hx.purchase_cost for hx in hxs]
@@ -454,8 +458,8 @@ class HeatExchangerNetwork(bst.Facility):
                                                 dateTimeObj.month, dateTimeObj.day,
                                                 dateTimeObj.hour, dateTimeObj.minute)
         csvWriter = csv.writer(open(filename, 'w'), delimiter=',')
-        csvWriter.writerow(['Stream', 'Type', 'Original unit', 'HXN unit', 'H_in (kJ)',
-                            'H_out (kJ)', 'T_in (C)', 'T_out (C)'])
+        csvWriter.writerow(['Stream', 'Type', 'Original unit', 'HXN unit', 'H_in (kJ/hr)',
+                            'H_out (kJ/hr)', 'T_in (C)', 'T_out (C)'])
         stream, streamtype, original_unit, hxn_unit, H_in, H_out, T_in, T_out =\
             0, 0, 0, 0, 0, 0, 0, 0
             

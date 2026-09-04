@@ -1,4 +1,5 @@
 # hensmith
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](https://hensmith.readthedocs.io/en/latest/)
 
 **H**eat **E**xchanger **N**etwork **S**ynthesis, **M**odeling, **I**ntegration, **T**hermodynamics, and **H**euristics.
 
@@ -13,7 +14,14 @@ import biosteam as bst  # hensmith units plug into BioSTEAM systems
 from hensmith import HeatExchangerNetwork
 ```
 
-Full documentation and README are in progress.
+## Documentation
+
+Full documentation is at [hensmith.readthedocs.io](https://hensmith.readthedocs.io/en/latest/):
+the [quickstart](https://hensmith.readthedocs.io/en/latest/tutorial/01_quickstart.html),
+the [tutorial](https://hensmith.readthedocs.io/en/latest/tutorial/index.html), and the
+[API reference](https://hensmith.readthedocs.io/en/latest/API/api.html).
+
+[![Watch the quickstart demo](https://raw.githubusercontent.com/BioSTEAMDevelopmentGroup/hensmith/master/docs/source/_static/images/examples/quickstart_demo_poster.png)](https://hensmith.readthedocs.io/en/latest/_static/quickstart_demo.html)
 
 ## License
 
