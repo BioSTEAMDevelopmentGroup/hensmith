@@ -92,6 +92,17 @@ def test_energy_balance_error_contributions_ignored_none():
     assert len(errors) == N
     assert HXN.ignored is None
 
+def test_life_stage_reports_enthalpy_flow_units():
+    """LifeStage enthalpies are Stream.H values, i.e. flows in kJ/hr, and its
+    repr and show() label them as such."""
+    sys, HXN, _ = build_system()
+    sys.simulate()
+    stage = HXN.stream_life_cycles[0].life_cycle[0]
+    assert stage.H_in == stage.s_in.H
+    assert ' kJ/hr,' in repr(stage) and repr(stage).endswith(' kJ/hr>')
+    assert stage._info().count(' kJ/hr') == 2
+    assert repr(HXN.stream_life_cycles[0]).count(' kJ/hr') == 2 * len(HXN.stream_life_cycles[0].life_cycle)
+
 # ---------------------------------------------------------------------------
 # Problem-table (pinch) analysis
 # ---------------------------------------------------------------------------
