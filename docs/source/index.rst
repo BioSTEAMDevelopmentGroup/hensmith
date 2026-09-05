@@ -199,13 +199,12 @@ Importing hensmith binds the facility into biosteam as
 Citation
 --------
 
-hensmith builds on BioSTEAM. If you use it in your work, please cite the
-BioSTEAM paper:
+If you use hensmith in your work, please cite it as:
 
-    Cortes-Peña, Y., Kumar, D., Singh, V., & Guest, J. S. (2020). BioSTEAM: A
-    Fast and Flexible Platform for the Design, Simulation, and Techno-Economic
-    Analysis of Biorefineries under Uncertainty. *ACS Sustainable Chemistry &
-    Engineering*, 8(8), 3302–3310. https://doi.org/10.1021/acssuschemeng.9b07040
+    Bhagwat, S. S., & Cortés-Peña, Y. R. (2026). HENSMITH: Heat Exchanger
+    Network Synthesis, Modeling, Integration, Thermodynamics, and Heuristics
+    (Version v0.1.2) [Computer software]. Zenodo.
+    https://doi.org/10.5281/zenodo.22416033
 
 The pinch-analysis and network-synthesis methodology that hensmith implements
 follows chapter 9 of:

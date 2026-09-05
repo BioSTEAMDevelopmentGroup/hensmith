@@ -23,6 +23,12 @@ the [tutorial](https://hensmith.readthedocs.io/en/latest/tutorial/index.html), a
 
 [![Watch the quickstart demo](https://raw.githubusercontent.com/BioSTEAMDevelopmentGroup/hensmith/master/docs/source/_static/images/examples/quickstart_demo_poster.png)](https://hensmith.readthedocs.io/en/latest/_static/quickstart_demo.html)
 
+## Citation
+
+If you use hensmith in your work, please cite it as:
+
+> Bhagwat, S. S., & Cortés-Peña, Y. R. (2026). HENSMITH: Heat Exchanger Network Synthesis, Modeling, Integration, Thermodynamics, and Heuristics (Version v0.1.2) [Computer software]. Zenodo. https://doi.org/10.5281/zenodo.22416033
+
 ## License
 
 UIUC/NCSA open-source license — see `LICENSE.txt`.
