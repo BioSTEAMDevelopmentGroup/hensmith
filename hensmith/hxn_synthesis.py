@@ -19,9 +19,9 @@ import re
 import numpy as np
 import biosteam as bst
 from warnings import warn
-from ._curves import (StreamCurve, stream_curves, _end_state, _min_approach,
-                      _T_EQ)
-from ._planner import plan_network, _MER_TOL
+from ._curves import (StreamCurve, stream_curves, _end_state, _T_EQ, _T_SIDE,
+                      _copy, _point_load_inlet)
+from ._planner import plan_network
 
 __all__ = ('StreamLifeCycle', 'ProblemTable', 'problem_table',
            'synthesize_network', 'plot_pinch_diagram')
@@ -496,7 +496,9 @@ def _pinch_cut(table):
     every stream with ``side = 'right' if cut == 'below' else 'left'``
     (see `pinch_state`) to agree with the table: the heat above the split
     is then exactly the hot utility target and the heat below it the cold
-    one.
+    one. (`synthesize_network` does not split streams: the planner finds
+    the same cut in its own cascade, ``plan.cut``, which reproduces the
+    table's.)
     """
     if table.hot_util_load == 0.: return 'below'
     k = int(np.flatnonzero(table.Ts == table.pinch_T)[0])
@@ -507,9 +509,12 @@ def _pinch_cut(table):
 def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
                     sort_hus_by_T=False):
     """
-    `temperature_interval_pinch_analysis` followed by the problem table's
-    curves and grid: returns its 12 values and then ``table, curves, grid``
-    (see `_problem_table`), so that the curves are built only once.
+    The first step of `synthesize_network`: prepare the process streams
+    behind `hus` and run the problem table on them. Returns the 12 values
+    of `temperature_interval_pinch_analysis` (which wraps this function)
+    and then the table's ``table, curves, grid`` (see `_problem_table`),
+    on which the network is planned, so that the curves are built only
+    once.
     """
     hx_utils = hus
     hus_heating = [hu for hu in hx_utils if hu.duty > 0]
@@ -519,14 +524,14 @@ def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
         hus_cooling.sort(key=lambda i: i.unit.ins[0].T)
     hx_utils_rearranged = hus_heating + hus_cooling
     hxs = [hu.unit for hu in hx_utils_rearranged]
+    # unregistered copies (see `hensmith._curves._copy`); the inlets are
+    # registered under their own IDs below
     if force_ideal_thermo:
-        streams_inlet = [hx.ins[0] for hx in hxs]
-        streams_quenched = [i.outs[0] for i in hxs]
-        streams_inlet = [i.copy(thermo=i.thermo.ideal()) for i in streams_inlet]
-        streams_quenched = [i.copy(thermo=i.thermo.ideal()) for i in streams_quenched]
+        streams_inlet = [_copy(hx.ins[0], hx.ins[0].thermo.ideal()) for hx in hxs]
+        streams_quenched = [_copy(hx.outs[0], hx.outs[0].thermo.ideal()) for hx in hxs]
     else:
-        streams_inlet = [hx.ins[0].copy() for hx in hxs]
-        streams_quenched = [i.outs[0].copy() for i in hxs]
+        streams_inlet = [_copy(hx.ins[0]) for hx in hxs]
+        streams_quenched = [_copy(hx.outs[0]) for hx in hxs]
     for i in streams_quenched: i.vle(H=i.H, P=i.P)
     for i in range(len(streams_inlet)):
         stream = streams_inlet[i]
@@ -546,17 +551,17 @@ def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
     cold_util_load = table.cold_util_load
     pinch_cold_stream_T = table.pinch_T
     pinch_hot_stream_T = pinch_cold_stream_T + T_min_app
-    # Per-stream pinch temperature: where each stream is split between the
-    # hot-side and cold-side network designs. A stream already entirely on
-    # one side of the process pinch (T_in past pinch_cold_stream_T for a
-    # cold stream, or past pinch_hot_stream_T for a hot stream) is not
-    # split; its pinch_T is its own T_in. This clause also catches
-    # non-monotone streams (T_out on the wrong side of T_in for their duty,
-    # e.g. a cold stream whose VLE outlet ends up cooler than it entered):
-    # rather than split their problem_table point-load duty across the
-    # cascade, they get pinch_T = T_in too, so load_duties assigns their
-    # whole duty to a single side (Q_hot_side for a cold stream,
-    # Q_cold_side for a hot one).
+    # Per-stream pinch temperature, for information only (returned as
+    # `HeatExchangerNetwork.pinch_Ts`; `load_duties` splits a stream there):
+    # the network is planned on the curves (see `synthesize_network`), not
+    # on these temperatures. A stream already entirely on one side of the
+    # process pinch (T_in past pinch_cold_stream_T for a cold stream, or
+    # past pinch_hot_stream_T for a hot stream) is not split; its pinch_T is
+    # its own T_in. So is a non-monotone stream (T_out on the wrong side of
+    # T_in for its duty, e.g. a cold stream whose VLE outlet ends up cooler
+    # than it entered: a point load at T_out), whose whole duty
+    # `load_duties` then puts on a single side (hot side for a cold stream,
+    # cold side for a hot one).
     pinch_T_arr = []
     for i in cold_indices:
         if T_in_arr[i] > pinch_cold_stream_T or T_in_arr[i] > T_out_arr[i]:
@@ -583,7 +588,9 @@ def temperature_interval_pinch_analysis(hus,
                                         sort_hus_by_T=False):
     """
     Prepare the process streams behind `hus` and run the problem table on
-    them (the first step of `synthesize_network`).
+    them, as `synthesize_network` does first; a standalone pinch analysis
+    (the network itself is planned on the table's stream curves, which this
+    function does not return).
 
     Heating utilities (``hu.duty > 0``, cold streams) come first, then
     cooling utilities; zero-duty utilities are dropped. Each stream is a
@@ -658,8 +665,12 @@ def pinch_state(stream_in, stream_out, T_pinch, side=None, curve=None):
     equilibrium model says it is available, not at a fictitious one.
 
     Either way the hot-side and cold-side loads split `|H_in - H_out|`
-    exactly and the transient stream used for matching never carries heat
-    the real stream does not have.
+    exactly, and the state never carries heat the real stream does not
+    have.
+
+    A standalone analysis helper (see also `load_duties`): the network
+    synthesis does not split streams at a pinch temperature, it plans on
+    the curves themselves (see `synthesize_network`).
     """
     if side is None:
         T_lo, T_hi = sorted((stream_in.T, stream_out.T))
@@ -670,21 +681,20 @@ def pinch_state(stream_in, stream_out, T_pinch, side=None, curve=None):
     return curve.state_at_T(T_pinch, side)
 
 def load_duties(streams, streams_quenched, pinch_T_arr, T_out_arr, indices,
-                is_cold, Q_hot_side, Q_cold_side, curves=None):
+                is_cold, Q_hot_side, Q_cold_side):
     """
     Fill `Q_hot_side` and `Q_cold_side` with each stream's duty above and
     below its pinch temperature, ``[kind, duty]`` with kind 'heat' (cold
     streams) or 'cool' (hot streams) and duties below 0.01 kJ/hr set to 0,
-    from the stream's `pinch_state` at ``pinch_T_arr[index]``. `curves`
-    (optional, indexed like `streams`) are prebuilt stream curves, so that
-    none is rebuilt.
+    from the stream's `pinch_state` at ``pinch_T_arr[index]`` (e.g. from
+    `temperature_interval_pinch_analysis`). A standalone analysis helper,
+    like `pinch_state`: `synthesize_network` does not use it.
     """
     for index in indices:
         H_in = streams[index].H
         H_out = streams_quenched[index].H
-        curve = None if curves is None else curves[index]
         H_pinch = pinch_state(streams[index], streams_quenched[index],
-                              pinch_T_arr[index], curve=curve).H
+                              pinch_T_arr[index]).H
         if not is_cold(index):
             dH1 = H_in - H_pinch
             dH2 = H_pinch - H_out
@@ -713,15 +723,10 @@ _DUTY_TOL = 1e-6
 #: Status 'mer' needs the utilities of the realized network (from the
 #: simulated duties) within this times the total stream duty of the targets:
 #: the accuracy of the enthalpy flashes that realize the plan (the plan
-#: itself reaches the targets within `_MER_TOL`).
+#: itself reaches the targets within `hensmith._planner._MER_TOL`).
 _ACHIEVED_TOL = 1e-6
 #: Rounds of exact-state verification and local knot refinement.
 _MAX_REFINE = 3
-#: An enthalpy limit is given to a point-load stream only if its equilibrium
-#: state there is past (or within this of) the exchanger inlet temperature
-#: [K] (flash noise of an isothermal stream is ~1e-10 K; `HXprocess`
-#: rejects 0.01 K on the wrong side).
-_T_SIDE = 1e-6
 
 def _grid_knots(curves, grid):
     """
@@ -817,7 +822,12 @@ def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
 
     Returns the smallest approach found [K] (exact where evaluated) and the
     exact states ``(T_hot, H_hot, T_cold, H_cold)`` wherever the exact
-    approach is below ``T_min_app - _APPROACH_TOL``.
+    approach is below ``T_min_app - _APPROACH_TOL``. With ``T_min_app =
+    inf`` every interval is checked, so the approach returned is the exact
+    minimum over the exchanger and the states are all those evaluated.
+    This is the only exact internal-approach check of the synthesis (the
+    exchangers themselves, `HXprocess`, check their two terminals only,
+    which misses an internal pinch at a phase change).
     """
     hot, cold = curves[h], curves[c]
     H_hot_out, H_cold_out = H_hot_in - Q, H_cold_in + Q
@@ -971,13 +981,13 @@ def _enthalpy_limit(curve, s_in, H, hot):
     colder than its inlet). On a monotone curve that happens only strictly
     inside a non-equilibrium end jump (see `StreamCurve.jumps`). A
     point-load stream's (non-monotone curve's) equilibrium states are not
-    ordered with its inlet temperature: an isothermal one's lie at its
-    inlet temperature (a limit works anywhere), but e.g. a liquid fed above
-    its bubble point and boiled to its dew point, colder than its feed, has
-    every state past its real inlet on the wrong side, its outlet included
-    (its first exchanger gets its equilibrium inlet instead, see
-    `_first_inlet`, unless that lies outside the stream's range). So the
-    equilibrium state at `H` is compared with the inlet directly.
+    ordered with its real inlet temperature: e.g. a liquid fed above its
+    bubble point and boiled to its dew point, colder than its feed, has
+    every state past its real inlet on the wrong side, its outlet included.
+    It enters its first exchanger at equilibrium at its inlet enthalpy
+    instead (see `_first_inlet`), from which its states are ordered, unless
+    that flash failed. So the equilibrium state at `H` is compared with the
+    inlet directly.
     """
     if curve.monotone:
         tol = curve.tol_H
@@ -990,23 +1000,29 @@ def _enthalpy_limit(curve, s_in, H, hot):
     past = T <= s_in.T + _T_SIDE if hot else T >= s_in.T - _T_SIDE
     return H if past else None
 
-def _first_inlet(stream, point_load, T_lo, T_hi):
+def _first_inlet(stream, point_load, T_point, hot):
     """
     Bring `stream`, a copy of a process stream's real inlet, in place to
     the state in which the stream enters its first process exchanger: the
     real inlet, except that a point-load stream (non-monotone
-    `StreamCurve`, whose whole duty is planned at its outlet temperature)
-    enters at equilibrium at its inlet enthalpy and pressure (see
-    `_end_state`; kept as given if that state lies outside [T_lo, T_hi]).
-    The enthalpy is the same either way, so no balance changes. E.g. a
-    reboiler fed as a liquid above its boiling point enters as the
-    vapor-liquid mixture it flashes to: `HXprocess` judges a match by the
-    inlet temperatures (the hotter inlet is the hot stream, and no heat
-    moves unless they are more than `dT` apart), and the superheated
-    liquid's temperature would make it refuse a match that the plan keeps
-    `T_min_app` for at the equilibrium temperature.
+    `StreamCurve`, whose whole duty is planned at its outlet temperature
+    `T_point`; `hot` if it is cooled) enters at equilibrium at its inlet
+    enthalpy and pressure, which lies on the plan's side of `T_point`
+    (see `hensmith._curves._point_load_inlet`; kept as given if that flash
+    fails). The enthalpy is the same either way, so no balance changes.
+
+    `HXprocess` judges a match by the inlet temperatures (the hotter inlet
+    is the hot stream, no heat moves unless they are more than `dT` apart,
+    and the partner's outlet is capped at the inlet temperature -/+ `dT`),
+    so a point-load stream's real inlet, on the wrong side of `T_point` by
+    definition, would make it refuse or cut short a match that the plan
+    keeps `T_min_app` for at `T_point`. E.g. a reboiler fed as a liquid
+    above its boiling point enters as the vapor-liquid mixture it flashes
+    to, and a vapor fed below its dew point (e.g. the ideal-thermo copy of
+    a saturated vapor whose ideal dew point is higher) as the mixture it
+    partially condenses to, hotter than its feed.
     """
-    if point_load: stream.copy_like(_end_state(stream, T_lo, T_hi))
+    if point_load: stream.copy_like(_point_load_inlet(stream, T_point, hot))
 
 class _RealizationError(Exception):
     """An exchanger of the plan could not be simulated."""
@@ -1083,8 +1099,8 @@ def _realize(plan, duties, curves, knots, streams_inlet, is_hot, T_min_app):
             curve = curves[j]
             H_in, H_out = ends[n, j]
             if first[j] == n:
-                s = streams_inlet[j].copy() # the real inlet state
-                _first_inlet(s, not curve.monotone, curve.T_lo, curve.T_hi)
+                s = _copy(streams_inlet[j]) # the real inlet state
+                _first_inlet(s, not curve.monotone, curve.T_out, is_hot[j])
             else:
                 s = curve.state_at_H(curve.H_lo + H_in)
             s.ID = f's_{j}__{ID}'
@@ -1272,12 +1288,15 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     can take a limit runs to its `dT` guard (a deviation if its duty
     differs). A stream's first exchanger gets its real inlet, except a
     point-load stream (whose outlet temperature does not move with its
-    duty, so the plan places its whole duty there): it enters at
-    equilibrium at its inlet enthalpy, as the plan sees it (a reboiler fed
-    as a liquid above its boiling point enters as the mixture it flashes
-    to), because `HXprocess` compares the inlet temperatures with `dT`
-    and would refuse a match planned on the equilibrium states. Later
-    exchangers get the stream's exact state at the planned enthalpy.
+    duty, so the plan places its whole duty there, a temperature its real
+    inlet lies beyond): it enters at equilibrium at its inlet enthalpy,
+    which lies on the plan's side of its outlet temperature (a reboiler
+    fed as a liquid above its boiling point enters as the mixture it
+    flashes to; a vapor fed below its dew point, e.g. under
+    `force_ideal_thermo`, as the mixture it partially condenses to),
+    because `HXprocess` compares the inlet temperatures with `dT` and
+    would refuse or cut short a match planned there. Later exchangers get
+    the stream's exact state at the planned enthalpy.
     Every exchanger is simulated once; one whose duty differs from the
     plan is reported in `info`. Each stream ends in one rigorous
     `HXutility` to its outlet enthalpy; an `AssertionError` is raised if
@@ -1454,7 +1473,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         curve = curves[i]
         ID = 'Util_%s_cs'%i if hot else 'Util_%s_hs'%i
         if first[i] is None:
-            s = streams_inlet[i].copy()
+            s = _copy(streams_inlet[i])
         else:
             s = curve.state_at_H(curve.H_lo + last[i])
         s.ID = 's_%s__%s'%(i, ID)

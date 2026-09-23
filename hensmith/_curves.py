@@ -45,6 +45,7 @@ Nothing here imports biosteam or thermosteam: the curves only call methods of
 the streams they are given.
 """
 import heapq
+from functools import partial
 from warnings import warn
 import numpy as np
 
@@ -70,6 +71,65 @@ _T_JUMP = 1e-5
 #: than this fraction of the stream's duty is rejected: flash-resolution
 #: jumps next to a phase boundary are ~1e-8, spurious flashes ~1e-3 or more.
 _ROOT_RTOL = 1e-7
+#: An equilibrium state within this of a temperature [K] is not on the wrong
+#: side of it: the inlet of a point-load stream (`_point_load_inlet`), or an
+#: enthalpy limit (`hensmith.hxn_synthesis._enthalpy_limit`). Flash noise of
+#: an isothermal stream is ~1e-10 K; `HXprocess` rejects 0.01 K on the wrong
+#: side.
+_T_SIDE = 1e-6
+
+
+def _copy(stream, thermo=None):
+    """
+    Copy of `stream`, with its ID, that is not registered in the flowsheet
+    (a leading '.' names a stream without registering it). A plain
+    ``stream.copy()`` takes its ID from the source line of the call
+    (thermosteam's ID magic): unless that line assigns the copy to a plain
+    variable, a multi-phase copy registers as '-' and replaces the previous
+    one with a RuntimeWarning, and a single-phase one takes a registry
+    ticket, which keeps it alive. The curves copy streams hundreds of times
+    per synthesis, so every internal copy goes through here.
+    """
+    return stream.copy('.' + stream.ID, thermo)
+
+
+def _point_load_inlet(stream_in, T_point, is_hot):
+    """
+    State in which a point-load stream (a non-monotone `StreamCurve`, whose
+    whole duty is at its outlet temperature `T_point`) enters its first
+    exchanger: a copy of `stream_in` at equilibrium at its own enthalpy and
+    pressure, or of the stream as given if that flash fails or lands on the
+    wrong side of `T_point` (colder than it for a cooled stream, hotter for
+    a heated one; more than `_T_SIDE`).
+
+    A stream is a point load because its real inlet temperature lies on the
+    wrong side of its outlet: a cooled stream fed colder than its outlet
+    (e.g. a vapor fed below its dew point, or the copy of a saturated vapor
+    under ideal thermodynamics, whose ideal dew point is higher), or a
+    heated one fed hotter (a liquid above its bubble point). The plan puts
+    the whole duty at the outlet temperature, where the real inlet state
+    offers no heat as such: `HXprocess` compares the inlet temperatures and
+    caps the partner at the real inlet temperature -/+ its `dT`. But the
+    inlet relaxes, adiabatically and at constant pressure, to its
+    equilibrium state at the same enthalpy (as every flash in the network
+    takes it), and at fixed pressure the equilibrium temperature does not
+    decrease with the enthalpy: a cooled stream's equilibrium temperature
+    at its inlet enthalpy is at least the one at its lower outlet
+    enthalpy, `T_point` (the outlet is quenched to equilibrium), and a
+    heated stream's at most. From that state the stream delivers (takes)
+    its heat no colder (hotter) than `T_point`, where the plan and the
+    problem table put it, so the terminal checks of `HXprocess` agree with
+    the plan. The enthalpy is the same, so no balance changes.
+    """
+    stream = _copy(stream_in)
+    try:
+        stream.vle(H=stream_in.H, P=stream.P)
+    except Exception:
+        return _copy(stream_in)
+    T = stream.T
+    if T >= T_point - _T_SIDE if is_hot else T <= T_point + _T_SIDE:
+        return stream
+    return _copy(stream_in)
 
 
 # %% Evaluators of single-phase (sensible) segments
@@ -85,7 +145,7 @@ class _FixedPhase:
     __slots__ = ('stream',)
 
     def __init__(self, stream):
-        self.stream = stream.copy()
+        self.stream = _copy(stream)
 
     def H(self, T):
         s = self.stream
@@ -93,12 +153,12 @@ class _FixedPhase:
         return s.H
 
     def state_at_T(self, T):
-        s = self.stream.copy()
+        s = _copy(self.stream)
         s.T = T
         return s
 
     def state_at_H(self, H):
-        s = self.stream.copy()
+        s = _copy(self.stream)
         s.H = H  # solves T with the phase distribution fixed
         return s
 
@@ -113,8 +173,8 @@ class _TPFlash:
     __slots__ = ('stream0', 'stream', 'label')
 
     def __init__(self, stream, label):
-        self.stream0 = stream.copy()
-        self.stream = stream.copy()
+        self.stream0 = _copy(stream)
+        self.stream = _copy(stream)
         self.label = label
 
     def H(self, T):
@@ -123,19 +183,19 @@ class _TPFlash:
             s.vle(T=T, P=s.P)
             return s.H
         except Exception as error:
-            self.stream = self.stream0.copy()
+            self.stream = _copy(self.stream0)
             warn(f"could not solve VLE for stream {self.label!r} at "
                  f"{T:.2f} K ({error!r}); interpolating enthalpy linearly "
                  "in temperature for the problem table", RuntimeWarning)
             return None
 
     def state_at_T(self, T):
-        s = self.stream0.copy()
+        s = _copy(self.stream0)
         s.vle(T=T, P=s.P)
         return s
 
     def state_at_H(self, H):
-        s = self.stream0.copy()
+        s = _copy(self.stream0)
         s.vle(H=H, P=s.P)
         return s
 
@@ -166,7 +226,7 @@ class _BinaryGlide:
         self.P = P
         self.u0 = self.z0
         self.u1 = float(x_dew[0])
-        self.work = sat_liquid.copy()
+        self.work = _copy(sat_liquid)
         self.n = 0
 
     def _set(self, s, t):
@@ -193,7 +253,7 @@ class _BinaryGlide:
         return T, s.H
 
     def state(self, t):
-        s = self.work.copy()
+        s = _copy(self.work)
         self._set(s, t)
         return s
 
@@ -216,7 +276,7 @@ class _TPGlide:
 
     def __init__(self, template, Ta, Tb, P, IDs, strict):
         self.template = template
-        self.work = template.copy()
+        self.work = _copy(template)
         self.Ta = Ta
         self.Tb = Tb
         self.P = P
@@ -235,7 +295,7 @@ class _TPGlide:
             s.vle(T=T, P=self.P)
         except Exception:
             self.failed += 1
-            self.work = self.template.copy()
+            self.work = _copy(self.template)
             return None
         v = float(np.sum(s.imol['g', self.IDs]))
         l = float(np.sum(s.imol['l', self.IDs]))
@@ -243,7 +303,7 @@ class _TPGlide:
         phase = 'l' if v <= tiny else 'g' if l <= tiny else 'lg'
         if not strict: return T, s.H  # a root solve: nothing to record
         self.phase[t] = phase
-        self.states[t] = s.copy()
+        self.states[t] = _copy(s)
         if self.strict and 0. < t < 1. and phase != 'lg':
             self.failed += 1
             return None
@@ -277,7 +337,7 @@ class _TPGlide:
         return out
 
     def state(self, t):
-        s = self.template.copy()
+        s = _copy(self.template)
         s.vle(T=self.Ta + (self.Tb - self.Ta) * t, P=self.P)
         return s
 
@@ -289,7 +349,7 @@ class _TPGlide:
         its starting point (see `StreamCurve._glide_root`).
         """
         s = self.states.get(t)
-        return self.state(t) if s is None else s.copy()
+        return self.state(t) if s is None else _copy(s)
 
 
 def _illinois(f, a, b, fa, fb, xtol=1e-12, maxiter=100):
@@ -527,15 +587,15 @@ def _lever(A, B, H, T):
     where the curve puts that heat, whereas a PH flash would move it to the
     equilibrium temperature, outside the stream's own range.
     """
-    a = A.copy(); a.T = T
-    b = B.copy(); b.T = T
+    a = _copy(A); a.T = T
+    b = _copy(B); b.T = T
     Ha, Hb = a.H, b.H
     if Hb == Ha: return a
     w = (H - Ha) / (Hb - Ha)
     w = 0. if w < 0. else 1. if w > 1. else w
     IDs = a.chemicals.IDs
     phases = tuple(sorted(set(a.phases) | set(b.phases)))
-    s = a.copy()
+    s = _copy(a)
     if len(phases) > 1 and set(s.phases) != set(phases): s.phases = phases
     for p in phases:
         mol = (1. - w) * _phase_mol(a, p, IDs) + w * _phase_mol(b, p, IDs)
@@ -553,13 +613,13 @@ def _end_state(stream_end, T_lo, T_hi):
     liquid, whose equilibrium state at the same enthalpy is a gas at an
     absurd temperature). Either way the enthalpy is exactly `stream_end.H`.
     """
-    stream = stream_end.copy()
+    stream = _copy(stream_end)
     try:
         stream.vle(H=stream_end.H, P=stream.P)
     except Exception:
-        return stream_end.copy()
+        return _copy(stream_end)
     if T_lo <= stream.T <= T_hi: return stream
-    return stream_end.copy()
+    return _copy(stream_end)
 
 
 # %% The curve
@@ -661,8 +721,8 @@ class StreamCurve:
         self.max_samples = max_samples
         # private copies: later changes to the caller's streams cannot
         # change the curve's end states
-        self.stream_in = stream_in = stream_in.copy()
-        self.stream_out = stream_out = stream_out.copy()
+        self.stream_in = stream_in = _copy(stream_in)
+        self.stream_out = stream_out = _copy(stream_out)
         self.T_in = T_in = stream_in.T
         self.T_out = T_out = stream_out.T
         self.H_in = H_in = stream_in.H
@@ -728,7 +788,7 @@ class StreamCurve:
             T_b = -np.inf
             satL = None
         else:
-            satL = s.copy()
+            satL = _copy(s)
             satL.vle(V=0, P=P)
             T_b = satL.T
             self.n_evals += 1
@@ -741,7 +801,7 @@ class StreamCurve:
             T_d = np.inf
             satV = None
         else:
-            satV = s.copy()
+            satV = _copy(s)
             satV.vle(V=1, P=P)
             T_d = satV.T
             self.n_evals += 1
@@ -780,7 +840,7 @@ class StreamCurve:
             self.method = 'mixture, TP-flash glide'
             template = satL if satL is not None else satV
             if template is None:  # light AND heavy solutes: all glide
-                template = s.copy()
+                template = _copy(s)
                 template.vle(T=T_lo, P=P)
             strict = not (light or heavy)  # [Ta, Tb] inside the true glide
             sampler = _TPGlide(template, Ta, Tb, P, IDs, strict)
@@ -790,8 +850,8 @@ class StreamCurve:
             if sa is None or sb is None:
                 raise RuntimeError('TP flash failed at a glide end')
             # the saturated end states are the glide's end samples
-            if Ta == T_b: sampler.states[0.] = satL.copy()
-            if Tb == T_d: sampler.states[1.] = satV.copy()
+            if Ta == T_b: sampler.states[0.] = _copy(satL)
+            if Tb == T_d: sampler.states[1.] = _copy(satV)
         t, T, H, err = _sample_glide(sampler, ta, sa, tb, sb, tol_T, max_samples)
         if not binary and not strict:
             # always-gas or dissolved-solute chemicals: thermosteam's bubble
@@ -847,9 +907,9 @@ class StreamCurve:
         if Pc is not None and P >= Pc:
             self.method = 'pure, supercritical (TP flashes)'
             return [(SENSIBLE, T_lo, T_hi, _TPFlash(s, self.label))]
-        satL = s.copy()
+        satL = _copy(s)
         satL.vle(V=0, P=P)
-        satV = s.copy()
+        satV = _copy(s)
         satV.vle(V=1, P=P)
         self.n_evals += 2
         T_sat = satL.T
@@ -939,8 +999,8 @@ class StreamCurve:
                 add(Tb, Hb, SENSIBLE, ev, state=at_T(ev, Tb))
             elif kind == FLAT:
                 H_l, H_v, sL, sV = data
-                add(Ta, H_l, FLAT, state=sL.copy)
-                add(Ta, H_v, FLAT, state=sV.copy)
+                add(Ta, H_l, FLAT, state=partial(_copy, sL))
+                add(Ta, H_v, FLAT, state=partial(_copy, sV))
             else:  # GLIDE
                 t, T, H, sampler = data
                 t, T, H, err = _glide_crossings(sampler, t, T, H, H_lo, H_hi,
@@ -984,7 +1044,7 @@ class StreamCurve:
             if T_lo < T < T_hi: continue
             Ha, Hb = float(self.H[j]), float(self.H[j + 1])
             if Hb <= Ha: continue
-            s = self.stream_in.copy()
+            s = _copy(self.stream_in)
             try:
                 s.vle(H=0.5 * (Ha + Hb), P=self.P)
                 T_eq = s.T
@@ -1066,7 +1126,7 @@ class StreamCurve:
         r = last[tt]
         if abs(r[1] - H) > _ROOT_RTOL * (self.H_hi - self.H_lo) + self.tol_H:
             return None
-        return tt, r, sampler.work.copy() if state else None
+        return tt, r, _copy(sampler.work) if state else None
 
     def _glide_state(self, H):
         """
@@ -1096,7 +1156,7 @@ class StreamCurve:
             if abs(s.H - H) <= 10. * tol_H: return s
         t, Tg, Hg, sampler = g
         i = min(max(int(np.searchsorted(Hg, H, 'right')) - 1, 0), Hg.size - 2)
-        s = self.stream_in.copy()
+        s = _copy(self.stream_in)
         try:
             s.vle(H=H, P=self.P)
             if (Tg[i] - _T_EQ <= s.T <= Tg[i + 1] + _T_EQ
@@ -1163,16 +1223,6 @@ class StreamCurve:
                     H[j] + (H[j + 1] - H[j]) * (x - T[j]) / (T[j + 1] - T[j])
         return Hl, Hr
 
-    def H_breaks(self, H_a, H_b):
-        """
-        Breakpoint enthalpies strictly between `H_a` and `H_b` (any order):
-        the only places, besides the ends, where the curve bends or has a
-        flat, so where an exchanger's internal approach can be smallest.
-        """
-        lo, hi = (H_a, H_b) if H_a <= H_b else (H_b, H_a)
-        H = self.H
-        return H[(H > lo) & (H < hi)]
-
     def T_at(self, H, side='low'):
         """
         Real temperature [K] at enthalpy `H`: exact in single-phase segments,
@@ -1229,7 +1279,8 @@ class StreamCurve:
         """
         Stream state with enthalpy `H` (clipped to the range): the
         equilibrium end state at either end (the stream as given if that
-        equilibrium lies outside the range); single phase: the phase-fixed
+        equilibrium lies outside the range; at the inlet of a point-load
+        stream, `_point_load_inlet`); single phase: the phase-fixed
         reference at the temperature that gives H (exact); flat (a pure
         component's T_sat or an end jump): the lever-rule mix of the flat's
         two end states at its temperature; binary glide: the bubble-curve
@@ -1238,11 +1289,14 @@ class StreamCurve:
         fallbacks where thermosteam's flashes fail (see `_glide_state`).
         """
         H_lo, H_hi = self.H_lo, self.H_hi
+        end = None
         if H <= H_lo + self.tol_H:
             end = self.stream_in if self.H_in <= self.H_out else self.stream_out
-            return _end_state(end, self.T_lo, self.T_hi)
-        if H >= H_hi - self.tol_H:
+        elif H >= H_hi - self.tol_H:
             end = self.stream_in if self.H_in > self.H_out else self.stream_out
+        if end is not None:
+            if end is self.stream_in and not self.monotone:
+                return _point_load_inlet(end, self.T_out, self.is_hot)
             return _end_state(end, self.T_lo, self.T_hi)
         Hbp = self.H
         j = int(np.searchsorted(Hbp, H, 'right')) - 1
@@ -1265,7 +1319,7 @@ class StreamCurve:
                 return s
         # non-monotone stream (a point load), clipped stretch, or a glide
         # none of whose states could be found: PH flash
-        s = self.stream_in.copy()
+        s = _copy(self.stream_in)
         s.vle(H=H, P=self.P)
         return s
 
@@ -1305,54 +1359,3 @@ def stream_curves(streams_inlet, streams_quenched, is_hot, **kwargs):
     """One `StreamCurve` per stream (see `StreamCurve` for keywords)."""
     return [StreamCurve(si, so, hot, **kwargs)
             for si, so, hot in zip(streams_inlet, streams_quenched, is_hot)]
-
-
-def _glide_tolerance(curve):
-    """Largest difference [K] between `T_at` and `T_exact` on `curve`."""
-    if not curve.glides: return 0.
-    return max(curve.tol_T, curve.glide_error)
-
-
-def _min_approach(hot, H_hot_in, cold, H_cold_out, Q, exact=True):
-    """
-    Minimum temperature difference [K] inside a counter-current exchanger
-    of duty `Q` [kJ/hr] in which the stream of curve `hot` enters at
-    enthalpy `H_hot_in` and the stream of curve `cold` leaves at
-    `H_cold_out`, and the duty position q (0 at the hot inlet / cold outlet
-    end) where it occurs.
-
-    At duty position q the hot stream is at T_hot(H_hot_in - q) and the
-    cold one at T_cold(H_cold_out - q). Both curves are linear between
-    their breakpoints (glides, flats) or smooth (single phase), so the
-    difference is checked at both ends, at every breakpoint of either
-    stream inside the exchanger and, to catch single-phase curvature, at
-    the midpoint of every interval between those positions. Where a curve
-    is constant in enthalpy over a temperature range (a clipped
-    non-equilibrium stretch) the conservative temperature is used (lowest
-    for the hot stream, highest for the cold one). HXprocess only checks the
-    two terminal differences, which misses internal pinches at phase
-    changes (e.g. a condensing pure vapor against a boiling mixture).
-
-    With `exact` (default), temperatures inside glides are the exact glide
-    states' (`StreamCurve.T_exact`) rather than the linearized ones: the
-    positions are screened with the cheap `T_at`, and every position whose
-    linearized difference is within the two curves' glide tolerances of
-    the smallest one is re-evaluated exactly, so the minimum over the
-    positions is exact. Curves without glides need no re-evaluation.
-    """
-    qs = [0., Q]
-    qs.extend(H_hot_in - hot.H_breaks(H_hot_in - Q, H_hot_in))
-    qs.extend(H_cold_out - cold.H_breaks(H_cold_out - Q, H_cold_out))
-    qs = np.unique(np.clip(qs, 0., Q))
-    if qs.size > 1: qs = np.union1d(qs, 0.5 * (qs[:-1] + qs[1:]))
-    dTs = np.array([hot.T_at(H_hot_in - q, 'low') - cold.T_at(H_cold_out - q, 'high')
-                    for q in qs])
-    if exact:
-        margin = 2. * (_glide_tolerance(hot) + _glide_tolerance(cold))
-        if margin > 0.:
-            for k in np.flatnonzero(dTs <= dTs.min() + margin + 1e-9):
-                q = qs[k]
-                dTs[k] = (hot.T_exact(H_hot_in - q, 'low')
-                          - cold.T_exact(H_cold_out - q, 'high'))
-    k = int(np.argmin(dTs))
-    return float(dTs[k]), float(qs[k])

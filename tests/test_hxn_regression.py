@@ -211,9 +211,11 @@ def synthesize(builder):
     sys = bst.System.from_units('sys', units=[*units, HXN])
     with warnings.catch_warnings():
         warnings.simplefilter('error', RuntimeWarning)
-        # thermosteam registry bookkeeping on temporary stream copies; not numerical
-        warnings.filterwarnings('ignore', message='.*has been replaced in registry',
-                                category=RuntimeWarning)
+        # biosteam's HeatUtility.load_agent names a new 'oxygen_rich_inlet'
+        # stream for every fuel (furnace) utility; the network itself replaces
+        # nothing in the registry (test_synthesis_registers_no_intermediate_streams)
+        warnings.filterwarnings('ignore', category=RuntimeWarning,
+                                message='.*<Stream: oxygen_rich_inlet> has been replaced in registry')
         sys.simulate()
     return units, HXN, T_min_app
 

@@ -53,6 +53,14 @@ def _pass_through_served_streams(stream_life_cycles, original_units):
         if abs(product.H - feed.H) <= _SERVED_RTOL * duty:
             product.copy_like(feed)
 
+def _load_utility_costs(unit):
+    """Recompute the utility cost of `unit` and of its owner (the unit whose
+    heat utilities include those of `unit`, e.g. a column for its
+    condenser) from their heat utilities."""
+    unit._load_operation_costs()
+    owner = unit.owner
+    if owner is not unit: owner._load_operation_costs()
+
 def _network_path(units, stream_life_cycles):
     """
     Return the simulation path of a synthesized network and its recycle
@@ -160,6 +168,15 @@ class HeatExchangerNetwork(bst.Facility):
     exchanger in the state it enters it, so that exchanger has exactly no
     duty and no cost instead of a spurious duty from re-flashing the
     stream.
+
+    The facility's heat utilities are the new utilities less the original
+    ones, summed by agent (a negative utility cost is a saving). With
+    `replace_unit_heat_utilities`, each original heat utility takes the heat
+    utility of its own stream's utility exchanger instead, the utility costs
+    of its unit and of that unit's owner are reloaded, and the facility
+    carries no heat utilities. The original data are given back before the
+    network is costed again, so that the network is synthesized from the
+    units' own utilities whether or not the units were simulated again.
 
     References
     ----------
@@ -273,16 +290,59 @@ class HeatExchangerNetwork(bst.Facility):
         a point-load stream (see `hensmith.hxn_synthesis._first_inlet`)."""
         if not isinstance(stage.unit, bst.HXprocess): return
         point_load = index in self.synthesis_info.get('point_loads', ())
-        T_lo, T_hi = sorted((self.inlet_Ts[index], self.outlet_Ts[index]))
-        _first_inlet(stream, point_load, T_lo, T_hi)
+        _first_inlet(stream, point_load, self.outlet_Ts[index],
+                     index not in self.cold_indices)
+
+    def _replace_unit_heat_utilities(self, heat_utilities, stream_life_cycles):
+        """
+        Overwrite each original heat utility with the heat utility of its own
+        stream's utility exchanger, the last stage of the stream's life
+        cycle (`heat_utilities` and `stream_life_cycles` are both in stream
+        order; `new_HX_utils` is not: it lists the hot streams first), and
+        reload the utility costs of its unit and of the unit's owner. The
+        original data are kept for `_restore_unit_heat_utilities`.
+        """
+        replaced = []
+        for hu, life_cycle in zip(heat_utilities, stream_life_cycles):
+            new = life_cycle.life_cycle[-1].unit.heat_utilities[0]
+            replaced.append((hu, hu.copy()))
+            if new.agent: hu.copy_like(new)
+            else: hu.empty() # a stream the process exchangers serve
+            _load_utility_costs(hu.unit)
+        self._replaced_heat_utilities = replaced
+
+    def _restore_unit_heat_utilities(self):
+        """
+        Copy their original data back into the heat utilities that
+        `_replace_unit_heat_utilities` last overwrote, and reload their
+        units' utility costs, wherever the unit still holds that heat
+        utility. A unit that
+        is simulated again replaces its heat utilities with new ones (as
+        every unit is before the facility in a system simulation), but one
+        that is not (e.g. when the network alone is simulated again, or
+        once per ignored utility in `_energy_balance_error_contributions`)
+        would otherwise hand the network its own utilities as the process
+        duties, and a stream that it serves completely, with no utility
+        left, would drop out of the next network.
+        """
+        replaced = getattr(self, '_replaced_heat_utilities', None)
+        if not replaced: return
+        self._replaced_heat_utilities = None
+        for hu, original in replaced:
+            unit = hu.unit
+            if any(i is hu for i in unit.heat_utilities):
+                hu.copy_like(original)
+                _load_utility_costs(unit)
 
     def _design(self): pass
     def _load_capital_costs(self): pass # Do not replace installed costs
 
     def _cost(self):
         sys = self.system
-        hx_utils = self._get_original_heat_utilties()
         flowsheet = bst.Flowsheet(sys.ID + '_HXN')
+        with flowsheet.temporary():
+            self._restore_unit_heat_utilities()
+        hx_utils = self._get_original_heat_utilties()
         use_cached_network = False
         if (self.cache_network and hasattr(self, 'original_heat_utils')
                 and hasattr(self, '_stage_fractions')):
@@ -491,13 +551,11 @@ class HeatExchangerNetwork(bst.Facility):
                     + sum(new_purchase_costs_HXu)
                     - sum(original_purchase_costs)
                 ))
-                if self.replace_unit_heat_utilities:
-                    self.heat_utilities = []
-                    for hx_heat_util, new_hx_util in zip(hx_heat_utils_rearranged, new_HX_utils):
-                        hx_heat_util.copy_like(new_hx_util.heat_utilities[0])
-                        hx_heat_util.unit.owner._load_utility_cost() # Update new utility cost
-                else:
-                    self.heat_utilities = hus_final
+                # with replace_unit_heat_utilities, the units carry the new
+                # utilities (replaced below, once the network is final)
+                self.heat_utilities = (
+                    [] if self.replace_unit_heat_utilities else hus_final
+                )
             else: # if no matches were made, retain all original HXutilities (i.e., don't add the -- relatively minor -- differences between new and original HXutilities)
                 self.installed_costs['Heat exchangers'] = 0.
                 self.baseline_purchase_costs['Heat exchangers'] = self.purchase_costs['Heat exchangers'] = 0.
@@ -527,7 +585,12 @@ class HeatExchangerNetwork(bst.Facility):
                     raise RuntimeError(msg)
                 else:
                     warn(msg, RuntimeWarning, stacklevel=2)
-    
+            # Last, so that nothing above (the loads, a re-synthesis) reads
+            # the original heat utilities after they are overwritten
+            if new_HXs and self.replace_unit_heat_utilities:
+                self._replace_unit_heat_utilities(hx_heat_utils_rearranged,
+                                                  stream_life_cycles)
+
     def _energy_balance_error_contributions(self):
         original_ignored = ignored = self.ignored
         if ignored and callable(ignored): ignored = ignored()

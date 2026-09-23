@@ -10,7 +10,7 @@
 Tests of the minimum-energy-requirement (MER) targets: the per-stream
 temperature-enthalpy curves (`hensmith._curves.StreamCurve`), the problem
 table built on them, the pinch cut and split, `pinch_state`, and the exact
-internal-approach check `_min_approach`.
+internal-approach check of the synthesis, `_exchanger_approach`.
 
 Reference targets come from an INDEPENDENT dense-grid calculator that does
 not use hensmith: every stream's enthalpy is sampled every 0.25 K with TP
@@ -34,9 +34,10 @@ import thermosteam as tmo
 from numpy.testing import assert_allclose
 from hensmith.hxn_synthesis import (
     problem_table, _problem_table, _pinch_cut, pinch_state,
+    _exchanger_approach, _knot_T, _curve_tol_T,
 )
 from hensmith._curves import (
-    StreamCurve, GLIDE_TOL_T, FLAT, SENSIBLE, GLIDE, _min_approach,
+    StreamCurve, GLIDE_TOL_T, FLAT, SENSIBLE, GLIDE,
 )
 
 ATM = 101325.
@@ -596,7 +597,8 @@ def test_glide_state_falls_back_to_the_curve(monkeypatch):
     duty = c.H_hi - c.H_lo
 
     class NoFlash:
-        def copy(self): return self
+        ID = 'no_flash'
+        def copy(self, ID=None, thermo=None): return self
         def vle(self, **kwargs): raise RuntimeError('flash failed')
 
     monkeypatch.setattr(StreamCurve, '_glide_root', lambda self, H, state=False: None)
@@ -643,13 +645,42 @@ def test_pinch_state_deterministic_at_T_sat():
     assert_allclose(pinch_state(si, so, so.T).H, so.H, rtol=1e-12)
 
 # ---------------------------------------------------------------------------
-# _min_approach
+# Exact internal approach (the synthesizer's check, `_exchanger_approach`)
 # ---------------------------------------------------------------------------
 
-def test_min_approach_finds_internal_pinch_of_condenser():
+def exact_min_approach(ch, cc, Q):
+    """
+    Minimum approach [K] inside a counter-current exchanger of duty `Q` that
+    takes curve `ch` down from its top and `cc` up to its top, its duty
+    position q (0 at the hot inlet / cold outlet end), and the minimum
+    approach dT_lin of the linear knot curves at the curves' breakpoints
+    (which lies at a knot), from the synthesizer's exact-state check
+    `_exchanger_approach` on those knots. The knot curves are within
+    ``tol = _curve_tol_T(ch) + _curve_tol_T(cc)`` of the exact approach, so
+    the exact minimum is at most ``dT_lin + tol``, and an interval that the
+    check skips at ``T_min_app = dT_lin + tol`` (+ 1e-5) has an exact
+    approach above that: the smallest approach it returns is the exact
+    minimum (as with ``T_min_app = inf``, which checks every interval).
+    """
+    curves = [ch, cc]
+    knots = [(c.T, c.H - c.H_lo) for c in curves]
+    H_hot_in, H_cold_out = ch.H_hi - ch.H_lo, cc.H_hi - cc.H_lo
+    qs = np.concatenate(([0., Q], H_hot_in - knots[0][1],
+                         H_cold_out - knots[1][1]))
+    qs = np.unique(qs[(qs >= 0.) & (qs <= Q)])
+    dT_lin = float(np.min(_knot_T(knots[0], H_hot_in - qs, True)
+                          - _knot_T(knots[1], H_cold_out - qs, False)))
+    T_min_app = dT_lin + _curve_tol_T(ch) + _curve_tol_T(cc) + 1e-5
+    dT, states = _exchanger_approach(curves, knots, 0, 1, H_hot_in,
+                                     H_cold_out - Q, Q, T_min_app)
+    T_hot, H_hot, T_cold, H_cold = min(states, key=lambda s: s[0] - s[2])
+    assert T_hot - T_cold == dT
+    return dT, H_hot_in - H_hot, dT_lin
+
+def test_exact_approach_finds_internal_pinch_of_condenser():
     """Ethanol vapor desuperheated and condensed against water: 10 K and
     ~18 K at the terminals, but only ~1.8 K where condensation starts."""
-    setup('min_approach')
+    setup('exact_approach')
     hot = utility_hx('H', 360., ATM, 'g', 340., Ethanol=100.)
     cold = utility_hx('C', 320., ATM, 'l', 350., Water=2000.)
     h_in, h_out = hot.ins[0].copy(), hot.outs[0].copy()
@@ -658,7 +689,7 @@ def test_min_approach_finds_internal_pinch_of_condenser():
     cc = StreamCurve(c_in, c_out, False)
     Q = ch.H_hi - ch.H_lo
     assert Q < cc.H_hi - cc.H_lo
-    dT_min, q = _min_approach(ch, ch.H_hi, cc, cc.H_hi, Q)
+    dT_min, q, dT_lin = exact_min_approach(ch, cc, Q)
     # independent: condensation starts at the saturated-vapor enthalpy
     satV = h_in.copy(); satV.vle(V=1, P=ATM)
     q_sat = h_in.H - satV.H
@@ -669,17 +700,19 @@ def test_min_approach_finds_internal_pinch_of_condenser():
     # the terminals alone look comfortable
     water.H = c_out.H - Q
     assert h_in.T - c_out.T == 10. and h_out.T - water.T > 15.
-    assert _min_approach(ch, ch.H_hi, cc, cc.H_hi, Q, exact=False) == (dT_min, q)
+    # the knot curves are within their tolerances of the exact states
+    assert abs(dT_lin - dT_min) <= _curve_tol_T(ch) + _curve_tol_T(cc)
 
-def test_min_approach_curved_heat_capacity():
+def test_exact_approach_curved_heat_capacity():
     """Water against ethanol liquid over their full ranges: both terminal
     approaches are ~5 K but the curves come within ~1 K inside; checked
-    against a dense scan of independent phase-fixed temperature solves."""
+    against a dense scan of independent phase-fixed temperature solves,
+    none of which is closer (the dip between breakpoints is searched)."""
     names, ins, outs, is_hot, dT, table, curves, grid = analyzed('curvature')
     jh, jc = names.index('H1'), names.index('C1')
     ch, cc = curves[jh], curves[jc]
     Q = min(ch.H_hi - ch.H_lo, cc.H_hi - cc.H_lo)
-    dT_min, q = _min_approach(ch, ch.H_hi, cc, cc.H_hi, Q)
+    dT_min, q, dT_lin = exact_min_approach(ch, cc, Q)
     hs, cs = ins[jh].copy(), outs[jc].copy()
     dTs = []
     for x in np.linspace(0., Q, 401):
@@ -688,16 +721,16 @@ def test_min_approach_curved_heat_capacity():
         dTs.append(hs.T - cs.T)
     assert min(dTs[0], dTs[-1]) > 4.99
     assert dT_min < 1.5
-    assert abs(dT_min - min(dTs)) < 2e-3
+    assert min(dTs) - 2e-3 < dT_min <= min(dTs) + 1e-9
     assert 0. < q < Q
 
-def test_min_approach_exact_inside_glides():
+def test_exact_approach_inside_glides():
     """Two water/ethanol glides (ethanol mole fraction 0.1, whose flashes are
     reliable) at 2.5 bar and 1 atm: at the minimum, each stream sits at a
     breakpoint of one curve and inside a glide segment of the other, where
     the linearized temperature is off by up to the sampling tolerance. The
     exact minimum equals independent PH flashes at its position."""
-    setup('min_approach_glides')
+    setup('exact_approach_glides')
     P = 2.5e5
     hot = utility_hx('H1', 400., P, 'g', 340., rigorous=True, **xE(180., 0.1))
     cold = boiling_hx('C1', 330., ATM, 380., **xE(200., 0.1))
@@ -708,8 +741,7 @@ def test_min_approach_exact_inside_glides():
     cc = StreamCurve(c_in, c_out, False)
     assert GLIDE in ch.kinds and GLIDE in cc.kinds
     Q = min(ch.H_hi - ch.H_lo, cc.H_hi - cc.H_lo)
-    dT, q = _min_approach(ch, ch.H_hi, cc, cc.H_hi, Q)
-    dT_lin, q_lin = _min_approach(ch, ch.H_hi, cc, cc.H_hi, Q, exact=False)
+    dT, q, dT_lin = exact_min_approach(ch, cc, Q)
     h, c = h_in.copy(), c_in.copy()
 
     def flashed(x):
@@ -718,8 +750,8 @@ def test_min_approach_exact_inside_glides():
         return h.T - c.T
 
     assert abs(dT - flashed(q)) < 1e-6
-    assert abs(dT_lin - dT) > 1e-5  # the exact re-evaluation mattered
-    assert abs(dT_lin - dT) <= 2. * (ch.tol_T + cc.tol_T)
+    assert abs(dT_lin - dT) > 1e-5  # the exact evaluation mattered
+    assert abs(dT_lin - dT) <= _curve_tol_T(ch) + _curve_tol_T(cc)
     # no position nearby is closer (dense independent scan around q)
     xs = np.linspace(max(0., q - 0.01 * Q), min(Q, q + 0.01 * Q), 41)
     dense = [flashed(x) for x in xs]
@@ -746,18 +778,10 @@ def test_pinch_analysis_builds_curves_once():
     pinch_T_arr, T_out_arr, indices = full[0], full[4], full[8]
     streams_inlet, streams_quenched = full[9], full[11]
     cold = set(full[7])
-    duties = []
-    for kw in ({}, dict(curves=curves)):
-        Q_hot_side, Q_cold_side = {}, {}
-        load_duties(streams_inlet, streams_quenched, pinch_T_arr, T_out_arr,
-                    indices, lambda i: i in cold, Q_hot_side, Q_cold_side, **kw)
-        duties.append((Q_hot_side, Q_cold_side))
-    for without, with_curves in zip(duties[0], duties[1]):
-        assert without.keys() == with_curves.keys()
-        for i, (kind, Q) in without.items():
-            assert with_curves[i][0] == kind
-            assert_allclose(with_curves[i][1], Q, rtol=1e-10, atol=1e-6)
+    Q_hot_side, Q_cold_side = {}, {}
+    load_duties(streams_inlet, streams_quenched, pinch_T_arr, T_out_arr,
+                indices, lambda i: i in cold, Q_hot_side, Q_cold_side)
     for i in indices:
-        total = duties[0][0][i][1] + duties[0][1][i][1]
+        total = Q_hot_side[i][1] + Q_cold_side[i][1]
         assert_allclose(total, abs(streams_quenched[i].H - streams_inlet[i].H),
                         rtol=0, atol=0.02)

@@ -144,6 +144,81 @@ def test_energy_balance_error_contributions_ignored_none():
     assert len(errors) == N
     assert HXN.ignored is None
 
+def strict_simulate(item):
+    """Simulate a system or unit; a RuntimeWarning is an error (except
+    biosteam's furnace-air registry bookkeeping, see `simulate_HXN`)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        warnings.filterwarnings('ignore', category=RuntimeWarning,
+                                message='.*<Stream: oxygen_rich_inlet> has been replaced in registry')
+        item.simulate()
+
+def network_loads(HXN):
+    return [HXN.original_heat_util_load, HXN.original_cool_util_load,
+            HXN.actual_heat_util_load, HXN.actual_cool_util_load]
+
+def assert_units_carry_the_network_utilities(HXN, units):
+    """Each original heat utility equals the heat utility of its OWN
+    stream's utility exchanger, every unit's utility cost is that of its
+    heat utilities, and the facility carries none."""
+    for i, hu in enumerate(HXN.original_heat_utils):
+        assert hu.unit is HXN.original_heat_exchangers[i]
+        util = HXN.stream_life_cycles[i].life_cycle[-1].unit
+        assert _stream_ports(util) == (i,)
+        new = util.heat_utilities[0]
+        assert hu.agent is new.agent, hu.unit.ID
+        assert (hu.duty, hu.flow, hu.cost) == (new.duty, new.flow, new.cost)
+    for unit in units:
+        costs = sum(hu.cost for hu in unit.heat_utilities) + unit.power_utility.cost
+        assert_allclose(unit.utility_cost, costs, rtol=1e-12, atol=0.)
+    assert HXN.heat_utilities == [] and HXN.utility_cost == 0.
+
+@pytest.mark.parametrize('case', ['kemp', 'doctest'])
+def test_replace_unit_heat_utilities(case):
+    # replace_unit_heat_utilities raised an AttributeError (biosteam's
+    # Unit._load_utility_cost no longer exists) and zipped the original
+    # heat utilities, in stream order (cold streams first), with
+    # new_HX_utils, listed hot streams first (Kemp: C1's heater would take
+    # H2's cooler duty). Each original heat utility now takes its own
+    # stream's utility, so the units report the total utility cost that
+    # the facility's net utilities report without the option.
+    if case == 'kemp':
+        units = cp_units('replace_kemp', KEMP, 273.15)
+        HXN = HeatExchangerNetwork('HXN', T_min_app=10.)
+        sys = bst.System.from_units('sys_replace', units=[*units, HXN])
+    else: # auxiliary exchangers: a column's condenser and boiler, a flash's
+        sys, HXN, _ = build_system()
+        units = [u for u in sys.units if u is not HXN]
+    strict_simulate(sys)
+    N = len(HXN.original_heat_utils)
+    loads = network_loads(HXN)
+    unit_costs = [u.utility_cost for u in units]
+    total = sum(unit_costs) + HXN.utility_cost
+    assert HXN.utility_cost < 0.
+    served = [i for i, lc in enumerate(HXN.stream_life_cycles)
+              if not lc.life_cycle[-1].unit.heat_utilities[0].duty]
+    assert served
+    HXN.replace_unit_heat_utilities = True
+    strict_simulate(sys) # the units, then the network
+    assert_units_carry_the_network_utilities(HXN, units)
+    assert_allclose(network_loads(HXN), loads, rtol=1e-9)
+    assert_allclose(sum(u.utility_cost for u in units), total, rtol=1e-9)
+    assert HXN.synthesis_info['status'] == 'mer'
+    # the network alone again: the units still hold the replaced utilities,
+    # in which the served streams have none; the network restores the
+    # original ones first, so no stream drops out and nothing changes
+    strict_simulate(HXN)
+    assert len(HXN.original_heat_utils) == N
+    assert_units_carry_the_network_utilities(HXN, units)
+    assert_allclose(network_loads(HXN), loads, rtol=1e-9)
+    assert_allclose(sum(u.utility_cost for u in units), total, rtol=1e-9)
+    # without the option, the units get their own utilities back
+    HXN.replace_unit_heat_utilities = False
+    strict_simulate(HXN)
+    assert_allclose([u.utility_cost for u in units], unit_costs, rtol=1e-12)
+    assert_allclose(sum(unit_costs) + HXN.utility_cost, total, rtol=1e-9)
+    assert_allclose(network_loads(HXN), loads, rtol=1e-9)
+
 def test_HXN_flowsheet_is_the_network_flowsheet():
     """HXN_flowsheet must be the '<sys>_HXN' Flowsheet that holds the network,
     not the main-flowsheet proxy (which reads back as whatever is active)."""
@@ -508,13 +583,17 @@ def cp_units(name, rows, offset=0.):
 
 def simulate_HXN(units, T_min_app, name='sys', **kwargs):
     """Simulate the units with a HeatExchangerNetwork; a RuntimeWarning
-    (other than thermosteam's registry bookkeeping) is an error."""
+    (including a stream replaced in the registry, except biosteam's own
+    furnace-air stream) is an error."""
     HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app, **kwargs)
     sys = bst.System.from_units(name, units=[*units, HXN])
     with warnings.catch_warnings():
         warnings.simplefilter('error', RuntimeWarning)
-        warnings.filterwarnings('ignore', message='.*has been replaced in registry',
-                                category=RuntimeWarning)
+        # biosteam's HeatUtility.load_agent names a new 'oxygen_rich_inlet'
+        # stream for every fuel (furnace) utility; the network itself replaces
+        # nothing in the registry (test_synthesis_registers_no_intermediate_streams)
+        warnings.filterwarnings('ignore', category=RuntimeWarning,
+                                message='.*<Stream: oxygen_rich_inlet> has been replaced in registry')
         sys.simulate()
     return sys, HXN
 
@@ -713,8 +792,11 @@ def test_cached_network_caps_the_partner_at_its_outlet(index, factor):
     units[index].ins[0].F_mol *= factor
     with warnings.catch_warnings():
         warnings.simplefilter('error', RuntimeWarning)
-        warnings.filterwarnings('ignore', message='.*has been replaced in registry',
-                                category=RuntimeWarning)
+        # biosteam's HeatUtility.load_agent names a new 'oxygen_rich_inlet'
+        # stream for every fuel (furnace) utility; the network itself replaces
+        # nothing in the registry (test_synthesis_registers_no_intermediate_streams)
+        warnings.filterwarnings('ignore', category=RuntimeWarning,
+                                message='.*<Stream: oxygen_rich_inlet> has been replaced in registry')
         sys.simulate()
     assert HXN.HXN_sys is HXN_sys, 'cached network was not used'
     assert abs(HXN.energy_balance_percent_error) < 1e-6
@@ -823,8 +905,10 @@ def test_point_loads_at_the_pinch_follow_the_cut():
 def test_non_monotone_stream_is_a_point_load():
     # a superheated water/ethanol liquid (365 K) taken to its dew point
     # (357.4 K) exits colder than it entered: a point load at its outlet
-    # temperature; its match is realized without an enthalpy limit on it
-    # (a flash to one would cool a heated stream) and stays feasible
+    # temperature; its match takes it at equilibrium at its feed enthalpy
+    # (353.07 K, colder than its outlet), from which its planned outlet is
+    # a valid enthalpy limit (a flash to it from the 365 K feed would cool
+    # a heated stream), and stays feasible
     bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
     bst.main_flowsheet.set_flowsheet('non_monotone')
     s = bst.Stream('nm_in', Water=150., Ethanol=150., T=365., P=101325.,
@@ -835,7 +919,8 @@ def test_non_monotone_stream_is_a_point_load():
     units = [reboiler, utility_hx('H1', 420., 5e5, 'l', 330., Water=1000.)]
     sys, HXN = simulate_HXN(units, 5.)
     hx, = HXN.new_HXs
-    assert hx.H_lim0 is None and hx.H_lim1 is not None
+    assert hx.ins[0].T < reboiler.outs[0].T
+    assert hx.H_lim0 is not None and hx.H_lim1 is not None
     assert not HXN.synthesis_info['dropped']
     heat, cool = actual_loads(HXN)
     assert heat >= mer_targets(units, 5.)[0]
@@ -866,26 +951,25 @@ def point_load_units(kind):
 
 @pytest.mark.parametrize('kind', ['cold', 'hot'])
 def test_point_load_whole_duty_is_matched(kind):
-    # the match takes the point load's whole duty (port 1), with the
-    # partner's limit. 'cold': the equilibrium state at its feed enthalpy
-    # lies below its range (colder than its outlet), so it enters as fed,
-    # and its planned outlet, on the wrong side of its feed temperature,
-    # cannot be an HXprocess limit (the flash to it failed and the match
-    # was dropped, losing MER). 'hot': it enters at equilibrium at its feed
-    # enthalpy, at its outlet temperature (424.98 K, not 420 K), where its
-    # planned outlet is a valid limit too.
+    # the match takes the point load's whole duty (port 1), with both
+    # limits: the point load enters at equilibrium at its feed enthalpy, on
+    # the plan's side of its outlet temperature, where its planned outlet is
+    # a valid HXprocess limit ('cold': 353.07 K, colder than its outlet,
+    # not the 365 K feed, from which the flash to its outlet failed and the
+    # match was dropped, losing MER; 'hot': at its outlet temperature,
+    # 424.98 K, not 420 K)
     units = point_load_units(kind)
     sys, HXN = simulate_HXN(units, 5.)
     info = HXN.synthesis_info
     hx, = HXN.new_HXs
     point = units[0]
     duty = abs(point.outs[0].H - point.ins[0].H)
-    assert hx.H_lim0 is not None
+    assert hx.H_lim0 is not None and hx.H_lim1 is not None
     assert info['point_loads'] == [HXN.original_heat_exchangers.index(point)]
     if kind == 'cold':
-        assert hx.H_lim1 is None and hx.ins[1].T == point.ins[0].T
+        assert hx.ins[1].T < point.outs[0].T < point.ins[0].T
     else:
-        assert hx.H_lim1 is not None and hx.ins[1].T > point.ins[0].T + 4.
+        assert hx.ins[1].T > point.ins[0].T + 4.
     assert abs(hx.ins[1].H - point.ins[0].H) <= 1e-9 * duty
     assert_allclose(hx.Q, abs(point.outs[0].H - point.ins[0].H), rtol=1e-9)
     assert not info['dropped'] and not info['deviations']
@@ -893,6 +977,98 @@ def test_point_load_whole_duty_is_matched(kind):
     total = total_duty(units)
     assert_allclose(actual_loads(HXN), mer_targets(units, 5.), atol=1e-6 * total)
     assert_feasible(HXN, 5.)
+
+def capped_point_load_units(kind):
+    """A mixture point-load stream (index 0 of the returned units) whose
+    real feed temperature, on the wrong side of its outlet temperature,
+    would cap its partner in HXprocess short of the plan (by feed -/+ dT),
+    and whose equilibrium state at its feed enthalpy is not at its outlet
+    temperature, plus that partner. 'ideal': 91 wt% ethanol vapor at its
+    dew point (364.02 K, 1.62 bar; the condenser of the oilcane
+    biorefinery's D302), 10 % condensed; under `force_ideal_thermo` its
+    ideal dew point is higher, so it is fed as a vapor below its dew point
+    and its quenched outlet (369.84 K) and equilibrium feed (370.26 K) are
+    hotter than its feed. 'superheated': the water/ethanol liquid at 365 K
+    of test_non_monotone_stream_is_a_point_load boiled to its dew point
+    (357.44 K; equilibrium feed 353.07 K)."""
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    bst.main_flowsheet.set_flowsheet('capped_point_load_' + kind)
+    if kind == 'ideal':
+        P = 162120.
+        s = bst.Stream('D_in', Ethanol=19.69, Water=5.16, P=P, units='kmol/hr')
+        s.vle(V=1, P=P)
+        point = bst.HXutility('D', ins=s, V=0.9, rigorous=True)
+        point.simulate()
+        T = s.T
+        partner = utility_hx('C1', T - 8., 101325., 'l', T - 1.5, Water=100.)
+    else:
+        s = bst.Stream('nm_in', Water=150., Ethanol=150., T=365., P=101325.,
+                       phase='l', units='kmol/hr')
+        point = bst.HXutility('NM', ins=s, V=1, rigorous=True)
+        point.simulate()
+        partner = utility_hx('H1', 380., 5e5, 'l', 363., Water=300.)
+    return [point, partner]
+
+@pytest.mark.parametrize('kind', ['ideal', 'superheated'])
+def test_point_load_enters_at_equilibrium_on_the_plan_side(kind):
+    # the plan puts a point load's whole duty at its outlet temperature,
+    # beyond its real feed temperature; the match kept the real feed unless
+    # its equilibrium state at the feed enthalpy lay exactly at the outlet
+    # temperature (a pure component), so HXprocess capped the partner at
+    # the feed temperature -/+ dT: 'ideal' delivered 22.7 of 49.2 MJ/hr
+    # (the oilcane O1 HX_8_5_cs under force_ideal_thermo: 1.38 of 3.38
+    # MW), 'superheated' 228.0 of 387.2 MJ/hr. The point load now enters at
+    # equilibrium at its feed enthalpy, on the plan's side of its outlet
+    # temperature, and the network reaches MER as planned.
+    units = capped_point_load_units(kind)
+    ideal = kind == 'ideal'
+    sys, HXN = simulate_HXN(units, 5., force_ideal_thermo=ideal)
+    info = HXN.synthesis_info
+    point = units[0]
+    index = HXN.original_heat_exchangers.index(point)
+    assert info['point_loads'] == [index]
+    hx, = HXN.new_HXs
+    s_in = hx.ins[_stream_ports(hx).index(index)]
+    T_out = HXN.outlet_Ts[index]  # the (ideal) quenched outlet
+    if ideal:  # cooled, fed colder than its outlet: enters hotter than it
+        assert point.ins[0].T < T_out - 5. and s_in.T > T_out
+    else:  # heated, fed hotter than its outlet: enters colder than it
+        assert point.ins[0].T > T_out + 7. and s_in.T < T_out
+    feed = point.ins[0].copy(thermo=s_in.thermo)
+    assert_allclose(s_in.H, feed.H, rtol=1e-12)
+    assert hx.H_lim0 is not None and hx.H_lim1 is not None
+    assert not info['deviations'] and not info['dropped'] and not info['repaired']
+    assert info['status'] == 'mer'
+    targets = [info['Q_hot_target'], info['Q_cold_target']]
+    total = total_duty(units)
+    assert_allclose([info['Q_hot'], info['Q_cold']], targets, atol=1e-6 * total)
+    assert_allclose(actual_loads(HXN), targets, atol=1e-6 * total)
+    assert_feasible(HXN, 5.)
+
+def test_synthesis_registers_no_intermediate_streams():
+    # the curves and the synthesis copy streams hundreds of times; a plain
+    # ``stream.copy()`` takes its ID from the source line (thermosteam's ID
+    # magic), so a multi-phase copy on a line that assigns no plain
+    # variable registered as '-', replacing the previous one with a
+    # RuntimeWarning (128 per synthesis of this system, 282 on the oilcane
+    # biorefinery O1, against 2 before the curves), and a single-phase copy
+    # took a registry ticket. Every internal copy is now unregistered.
+    sys, HXN, feed = build_system()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        sys.simulate()
+    replaced = [str(w.message) for w in caught if 'replaced in registry' in str(w.message)]
+    assert not replaced, replaced[:3]
+    assert HXN.synthesis_info['status'] == 'mer'
+    # the problem table (curves, flashes) registers nothing at all
+    streams = pinch_streams(HXN.original_heat_utils)
+    registered = lambda: {ID: id(s) for ID, s in bst.main_flowsheet.stream.data.items()}
+    before = registered()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        problem_table(*streams, 5.)
+    assert not [w for w in caught if 'registry' in str(w.message)]
+    assert registered() == before
 
 @pytest.mark.parametrize('T_min_app', [5., 30.])
 def test_reboiler_fed_above_saturation_against_steam(T_min_app):
