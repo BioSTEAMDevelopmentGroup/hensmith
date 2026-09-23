@@ -923,7 +923,9 @@ def test_non_monotone_stream_is_a_point_load():
     assert hx.H_lim0 is not None and hx.H_lim1 is not None
     assert not HXN.synthesis_info['dropped']
     heat, cool = actual_loads(HXN)
-    assert heat >= mer_targets(units, 5.)[0]
+    # the network reaches MER here, so the bound holds with equality and the
+    # two sums (utility exchangers vs. problem table) differ by round-off
+    assert heat >= mer_targets(units, 5.)[0] - 1e-9 * total_duty(units)
     assert_feasible(HXN, 5.)
 
 def point_load_units(kind):
