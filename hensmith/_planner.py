@@ -36,7 +36,7 @@ hot streams are moved down by ``T_min_app`` and cold streams are not moved.
 Shifted temperatures closer than ``_LEVEL_EQ`` K are merged, exactly as the
 problem table merges its grid.
 
-**Targets.** The planner builds its own problem table from these curves.
+**Targets.** The planner builds its own problem table [2]_ from these curves.
 For every shifted level ``L`` it computes the heat flow arriving at ``L``
 (before the point loads at ``L``) and the heat flow leaving it (after
 them). The pinch is the first (hottest) minimum of these flows; when no hot
@@ -88,8 +88,8 @@ cold utility, the *penalty*.
 any level ``L``. Let ``S(L)`` be the flex heat beyond the frontiers at
 levels ``<= L`` (inclusive) or ``< L`` (exclusive), and ``D(L)`` the same
 for must heat. Condition (R) is ``s(L) = S(L) - D(L) >= 0`` everywhere. It
-is the problem table of the remaining problem with splits allowed, so any
-completion needs it. Advance the pair ``(i, j)`` by ``x``, and write
+is the problem table of the remaining problem [3]_ with splits allowed, so
+any completion needs it. Advance the pair ``(i, j)`` by ``x``, and write
 ``Rf_j`` and ``Rm_i`` for the residuals of flex ``j`` and must ``i``. Then
 ``s`` becomes ``s - min(x, Rf_j) + min(x, Rm_i)``. Along a feasible match
 ``Rf_j >= Rm_i``, so this value never increases with ``x``. The largest
@@ -112,8 +112,8 @@ matching that saturates the streams that need a partner:
 
 A flat piece *at* the cut has unlimited series capacity, so it may serve
 several partners. A flat piece that needs a partner accepts only a flat
-one. At the root, these rules are the pinch design method's proof that
-MER needs stream splitting. For constant CP they reduce to the number and
+one. At the root, these rules are the pinch design method's [1]_ proof
+that MER needs stream splitting. For constant CP they reduce to the number and
 CP rules at every cascade zero.
 
 **Search.** A depth-first search on an explicit stack builds each side

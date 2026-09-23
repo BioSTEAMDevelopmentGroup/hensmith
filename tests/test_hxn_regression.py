@@ -14,35 +14,64 @@ streams from case 3 on). For each, the synthesized network must
 
 (i)   close its energy balance (|error| < 1e-6 %) without RuntimeWarnings,
 (ii)  never beat the minimum-energy-requirement (MER) targets of the problem
-      table computed on the same streams, and
-(iii) recover at least as much heat as documented in ``CASES`` below, so that
+      table computed on the same streams, and report status 'mer' exactly
+      when it reaches them,
+(iii) keep the minimum approach temperature INSIDE every process exchanger,
+      on the exact states of its streams (``T_min_app - 1e-6`` K, the
+      synthesizer's guarantee; the check of ``test_hxn_mer``, which
+      evaluates temperatures without the flashes of the code under test),
+(iv)  plan on the problem table's own cascade (the planner's targets, pinch
+      and pinch cut equal the table's), and
+(v)   recover at least as much heat as documented in ``CASES`` below, so that
       no future change to ``hensmith`` silently makes the synthesizer perform worse.
 
 The documented utility loads were recorded by running this file directly
-(``python tests/test_hxn_regression.py`` prints them): cases 1-4 and 6-9
-at commit ``1ab689ff`` (branch ``hxn-pinch-diagram``); case 10 after the
-synthesizer fixes on ``hxn-regression-tests`` (non-equilibrium inlets
-clipped to the stream's enthalpy range; network path ordered by its
-connections; H_lim honored at the bubble point); case 5 lowered after the
-pinch state at an end temperature became the equilibrium state at that
-end enthalpy (its 420 K, 5 bar vapor feed is below water's boiling point
-there, a non-equilibrium inlet); case 6 lowered to its MER targets after
-the hot-side offset pass stopped abandoning a hot stream once the first
-cold stream it matched was fully heated (branch
-``fix-hxn-hot-side-offset-break``). Improvements leave slack; a
-maintainer lowers the numbers deliberately when a better network is
-intended. Never raise them to make a failing test pass.
+(``python tests/test_hxn_regression.py`` prints them) with the pinch-outward
+MER planner (``hensmith._planner``) and the curve-based problem table
+(``hensmith._curves``), which replaced the four-pass heuristic synthesizer
+and the grid of stream end temperatures. Cases 1-3, 6, 7 and 10 reach their
+MER targets; cases 4, 8 and 9 need stream splits for MER (the pinch design
+rules fail at the pinch: case 4 above it, where the superheat of the
+ethanol vapor and the hot water both reach the pinch against a single cold
+stream; case 8 above and below it; case 9 above it), so their loads are
+best-effort networks 0.12 %, 0.55 % and 0.06 % above the hot-utility
+target. Relative to the previous baselines (recorded with the heuristic
+synthesizer at commits ``1ab689ff`` and later on branches
+``hxn-regression-tests`` and ``fix-hxn-hot-side-offset-break``):
+
+* cases 4 and 10 were RAISED (2.37319e6 -> 2.40548e6 and 1.40742e7 ->
+  1.44713e7 kJ/hr heating): the old loads lay below the corrected MER
+  targets (2.40262e6 and 1.44713e7) and were reachable only because
+  exchangers of the old networks crossed internally (exact internal
+  approaches of 4.63 K and 2.07 K, below T_min_app = 5 K), which the
+  terminal checks of HXprocess do not see; both new networks keep 5 K
+  everywhere;
+* cases 5, 8 and 9 were LOWERED (case 5 from 3.2224e6 to 0 kJ/hr heating:
+  the new network reaches its threshold target);
+* cases 1-3, 6 and 7 are unchanged.
+
+A documented load of zero is met to within 1e-9 of the total stream duty
+(the problem table's own threshold tolerance): the utilities come from
+enthalpy flashes, which leave residuals of ~1e-12 of the duty.
+Improvements leave slack; a maintainer lowers the numbers deliberately when
+a better network is intended. Never raise them to make a failing test pass
+(cases 4 and 10 were raised because the old networks were infeasible).
 """
 import warnings
 import pytest
 import biosteam as bst
 from numpy.testing import assert_allclose
 from hensmith import HeatExchangerNetwork
-from hensmith.hxn_synthesis import problem_table
+from hensmith.hxn_synthesis import problem_table, _pinch_cut
+# exact stream temperatures from forward property calls only (no flashes)
+from test_hxn_mer import _temperature, _min_approach, APPROACH_TOL
 
 EB_TOLERANCE = 1e-6  # percent; converged networks close to ~1e-10 %
-MER_RTOL = 1e-3      # network may not beat the MER target by more than this
+MER_RTOL = 1e-9      # network may not beat the MER target by more than this x total duty
 DOC_RTOL = 1e-3      # network may not be worse than documented by more than this
+ZERO_RTOL = 1e-9     # a documented zero load, x total stream duty (see above)
+STATUS_RTOL = 1e-6   # 'mer' iff the loads equal the targets, x total duty
+CASCADE_RTOL = 1e-9  # planner targets vs problem table, x total duty
 
 def utility_hx(ID, T, P, phase, T_out, rigorous=None, **flow):
     """A simulated HXutility acting as one process stream (kmol/hr flows)."""
@@ -163,13 +192,13 @@ CASES = {
     'case_01_two_liquids':         (case_01_two_liquids,         0, 1.53912e+06),
     'case_02_pinch_limited':       (case_02_pinch_limited,       1.81522e+06, 0),
     'case_03_condenser_two_colds': (case_03_condenser_two_colds, 0, 9.49905e+06),
-    'case_04_report_case':         (case_04_report_case,         2.37319e+06, 3.56871e+06),
-    'case_05_boiling_cold':        (case_05_boiling_cold,        3.2224e+06, 7.81466e+06),
+    'case_04_report_case':         (case_04_report_case,         2.40548e+06, 3.601e+06),
+    'case_05_boiling_cold':        (case_05_boiling_cold,        0, 4.59225e+06),
     'case_06_mixed_pressures':     (case_06_mixed_pressures,     2.12463e+06, 0),
     'case_07_threshold':           (case_07_threshold,           1.85977e+07, 0),
-    'case_08_two_condensers':      (case_08_two_condensers,      3.02237e+06, 7.36431e+06),
-    'case_09_near_degenerate':     (case_09_near_degenerate,     1.40965e+07, 9.66427e+06),
-    'case_10_ten_streams':         (case_10_ten_streams,         1.40742e+07, 8.06488e+06),
+    'case_08_two_condensers':      (case_08_two_condensers,      3.01517e+06, 7.35711e+06),
+    'case_09_near_degenerate':     (case_09_near_degenerate,     1.40002e+07, 9.56801e+06),
+    'case_10_ten_streams':         (case_10_ten_streams,         1.44713e+07, 8.46199e+06),
 }
 
 # ---------------------------------------------------------------------------
@@ -188,14 +217,19 @@ def synthesize(builder):
         sys.simulate()
     return units, HXN, T_min_app
 
-def mer_targets(units, T_min_app):
+def HXN_table(units, T_min_app):
+    """The problem table of the process streams, prepared as the facility
+    prepares them."""
     hus = [hx.heat_utilities[0] for hx in units]
     hus.sort(key=lambda hu: hu.duty)
     streams_inlet = [hu.unit.ins[0].copy() for hu in hus]
     streams_quenched = [hu.unit.outs[0].copy() for hu in hus]
     for s in streams_quenched: s.vle(H=s.H, P=s.P)
     is_hot = [hu.duty < 0 for hu in hus]
-    table = problem_table(streams_inlet, streams_quenched, is_hot, T_min_app)
+    return problem_table(streams_inlet, streams_quenched, is_hot, T_min_app)
+
+def mer_targets(units, T_min_app):
+    table = HXN_table(units, T_min_app)
     return table.hot_util_load, table.cold_util_load
 
 def actual_loads(HXN):
@@ -204,29 +238,61 @@ def actual_loads(HXN):
     cool = -sum(hu.unit_duty for hu in hus if hu.unit_duty < 0)
     return heat, cool
 
+def internal_approach(hx):
+    """Exact minimum approach [K] inside a process exchanger, on the states of
+    its own streams (inf if it transfers no heat)."""
+    dH = [s_in.H - s_out.H for s_in, s_out in zip(hx.ins, hx.outs)]
+    h = 0 if dH[0] >= dH[1] else 1
+    c = 1 - h
+    if dH[h] <= 0.: return float('inf')
+    return _min_approach(_temperature(hx.ins[h]), hx.ins[h].H, hx.outs[h].H,
+                         _temperature(hx.ins[c]), hx.ins[c].H, hx.outs[c].H)
+
 @pytest.mark.parametrize('name', list(CASES))
 def test_hxn_regression(name):
     builder, doc_heat, doc_cool = CASES[name]
     units, HXN, T_min_app = synthesize(builder)
+    total = sum(abs(hx.heat_utilities[0].unit_duty) for hx in units)
     # (i) energy balance
     assert abs(HXN.energy_balance_percent_error) < EB_TOLERANCE, name
-    # (ii) MER targets are a lower bound; energy identity holds
+    # (ii) MER targets are a lower bound, reached iff the status says so;
+    # energy identity holds
     heat, cool = actual_loads(HXN)
     hot_target, cold_target = mer_targets(units, T_min_app)
     net_duty = sum(hx.heat_utilities[0].unit_duty for hx in units)
-    assert heat >= hot_target * (1 - MER_RTOL), (name, heat, hot_target)
-    assert cool >= cold_target * (1 - MER_RTOL), (name, cool, cold_target)
+    assert heat >= hot_target - MER_RTOL * total, (name, heat, hot_target)
+    assert cool >= cold_target - MER_RTOL * total, (name, cool, cold_target)
     assert_allclose(heat - cool, net_duty, rtol=1e-8, err_msg=name)
-    # (iii) never worse than documented
+    info = HXN.synthesis_info
+    at_mer = (abs(heat - hot_target) <= STATUS_RTOL * total
+              and abs(cool - cold_target) <= STATUS_RTOL * total)
+    assert info['status'] == ('mer' if at_mer else 'best_effort'), (name, info['status'])
+    # (iii) exact internal approach inside every process exchanger
+    for hx in HXN.new_HXs:
+        approach = internal_approach(hx)
+        assert approach >= T_min_app - APPROACH_TOL, (name, hx.ID, approach)
+    assert info['min_approach'] >= T_min_app - APPROACH_TOL, (name, info['min_approach'])
+    # (iv) the planner's cascade is the problem table's
+    table = HXN_table(units, T_min_app)
+    planned = info['plan_targets']
+    assert abs(planned['Q_hot'] - table.hot_util_load) <= CASCADE_RTOL * total, name
+    assert abs(planned['Q_cold'] - table.cold_util_load) <= CASCADE_RTOL * total, name
+    assert abs(planned['pinch_T'] - table.pinch_T) <= 1e-9, name
+    assert planned['cut'] == _pinch_cut(table), name
+    # (v) never worse than documented
     assert doc_heat is not None and doc_cool is not None, f'{name}: baseline not recorded'
-    assert heat <= doc_heat * (1 + DOC_RTOL) + 1e-9, (name, heat, doc_heat)
-    assert cool <= doc_cool * (1 + DOC_RTOL) + 1e-9, (name, cool, doc_cool)
+    atol = ZERO_RTOL * total
+    assert heat <= doc_heat * (1 + DOC_RTOL) + atol, (name, heat, doc_heat)
+    assert cool <= doc_cool * (1 + DOC_RTOL) + atol, (name, cool, doc_cool)
 
 if __name__ == '__main__':
     for name, (builder, *_) in CASES.items():
         units, HXN, T_min_app = synthesize(builder)
         heat, cool = actual_loads(HXN)
         hot_target, cold_target = mer_targets(units, T_min_app)
+        approach = min(map(internal_approach, HXN.new_HXs), default=float('inf'))
         print(f"{name}: heat={heat:.6g} cool={cool:.6g} "
               f"(MER hot={hot_target:.6g} cold={cold_target:.6g}; "
-              f"EB error={HXN.energy_balance_percent_error:.4f}%)")
+              f"status={HXN.synthesis_info['status']}; "
+              f"min internal approach={approach:.6f} K; "
+              f"EB error={HXN.energy_balance_percent_error:.2e}%)")
