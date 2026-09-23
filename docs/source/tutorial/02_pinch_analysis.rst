@@ -70,22 +70,32 @@ temperature range.
 Hot streams are shifted *down* by ``T_min_app`` and cold streams are left
 alone. On that shifted scale, two streams at equal temperature are in reality
 exactly ``T_min_app`` apart, so heat may be cascaded from any shifted
-temperature to any lower one without ever violating the minimum approach. In
-the grid above, the hot stream's two end temperatures appear shifted down by
-the 5 K approach as 395 and 295 K, while the cold stream's appear unshifted as
-390 and 300 K; the grid ``Ts`` is the union of all such end temperatures,
-sorted descending.
+temperature to any lower one without ever violating the minimum approach. The
+grid above runs from 395 K, the hot stream's inlet shifted down by the 5 K
+approach, to 295 K, its shifted outlet; the cold stream's ends, unshifted at
+390 and 300 K, lie in between. The grid holds 25 points rather than those four
+because it is the union, sorted descending, of the breakpoints of every
+stream's temperature-enthalpy curve. hensmith describes each stream by such a
+curve, built once from a handful of flashes: its breakpoints are the stream's
+end temperatures, every phase boundary inside its range, and -- since the heat
+capacity of liquid water varies with temperature -- interior points that keep
+a straight line between neighbours within 0.002 K of the true curve. Every
+temperature at which a curve bends is therefore a grid point, and nothing that
+happens inside an interval can hide a pinch.
 
-Between consecutive grid temperatures, each monotone stream contributes the
-enthalpy it releases or absorbs over that interval, evaluated at its *real*
+Between consecutive grid temperatures, each stream contributes the enthalpy
+its curve releases or absorbs over that interval, evaluated at its *real*
 temperature and clipped to its own enthalpy range, with a positive sign for hot
-streams and a negative one for cold. Because the grid always contains a
-stream's own end temperatures, those contributions telescope exactly to the
-stream's duty: no heat is created or lost by the discretization. Streams with
-no temperature span of their own -- an isothermal condenser, or a stream whose
-outlet moves against its duty, such as a reboiler outlet at equilibrium -- are
-not spread over intervals at all; they enter as *point loads* at their shifted
-outlet temperature.
+streams and a negative one for cold. Because the grid always contains every
+breakpoint of a stream's curve, its own end temperatures among them, those
+contributions telescope exactly to the stream's duty: no heat is created or
+lost by the discretization. Heat that a curve gives up or takes at a single
+temperature is not spread over an interval at all but enters as a *point load*
+at that grid temperature: the latent heat of a pure component boiling or
+condensing at its saturation temperature, and the whole duty of a stream with
+no temperature span of its own -- an isothermal condenser, or a stream whose
+outlet moves against its duty, such as a reboiler outlet at equilibrium --
+which sits at its shifted outlet temperature.
 
 Cascading those contributions down the grid, with no hot utility supplied,
 gives the heat *leaving* each boundary, the ``residual`` field. Feasibility
@@ -114,22 +124,21 @@ The quickstart system is the same computation on five streams:
 .. literalinclude:: /_generated/ch02_table.txt
    :language: text
 
-The five streams produce a grid of ten shifted temperatures, from 372.6 K down
-to 295 K. Ten boundaries out of five streams is itself a statement about the
-streams: a monotone stream contributes both of its end temperatures and a
-point load contributes only one, so every stream here is monotone. Exactly
-equal boundaries would be merged into one grid entry; the two entries that
-print as 333 are the same temperature -- the condenser's outlet is the
-cooler's inlet -- kept apart only by floating-point round-off of the
-equilibrium quench, far below any printed precision. Four of those boundaries
-sit within about half a Kelvin of each other around 333 K -- 333.53, 333 twice,
-and 332.98. The column's condenser spans the upper two, 333.53 down to 333,
-which is 65.4 down to 64.9 °C on the real scale; the distillate cooler
-``D1_H2`` takes the stream from there, so its own upper boundary is that second
-333, and the outlet the analysis works with lies only 0.02 K below it, at
-332.98, because the cooler removes just 3.34e+04 kJ/hr. Neither is a point
-load: both are spread over intervals like any other stream, only very narrow
-ones, and the cooler's load is too small to see on the curves below. The
+The five streams produce a grid of 175 shifted temperatures, from 372.60 K
+down to 295.00 K. Their shifted end temperatures are among them; most of the
+rest trace two-phase glides. Every stream here is a mixture of water, methanol
+and glycerol, so none boils or condenses at a single temperature: the
+column's reboiler and the flash's feed heater heat a liquid past its bubble
+point and on along a glide, the condenser and the distillate cooler ``D1_H2``
+glide from end to end, and the bottoms cooler ``D1_H1`` cools a liquid whose
+heat capacity varies with temperature. Each glide and each curved stretch is
+sampled until a straight line between neighbouring points is within 0.002 K
+of the true curve. With no flat segment in any curve, and every outlet moving
+in the direction of its stream's duty, the table has no point loads at all --
+the second line. The condenser is still the most conspicuous stream: it gives
+up its latent heat over about half a Kelvin, from 65.4 to 64.9 °C on the real
+scale (:doc:`03_network_anatomy` lists every stream's end temperatures), and
+the distillate cooler takes the stream on from there. The
 targets are 2.828e+08 kJ/hr of hot utility and 1.936e+06 kJ/hr of cold utility,
 and the pinch is at 298.15 K on the shifted scale. Since hot streams were
 shifted down by the 5 K approach, that one shifted temperature stands for two
@@ -205,17 +214,17 @@ The same cascade can also be plotted directly, as a grand composite curve:
 .. figure:: /_static/images/examples/tutorial_02_grand_composite.png
    :class: white-bg
    :width: 720
-   :alt: Grand composite curve of the quickstart system: heat cascaded in GJ/hr against shifted temperature in °C, running from the top of the grid down through an open circle where the curve touches zero at the pinch, 25.0 °C on the shifted scale (298.15 K), and on below the pinch to the bottom of the grid at 295 K, with a near-horizontal step near 60 °C shifted where the column condenser condenses over a span of about half a Kelvin, between the grid boundaries 333.53 and 333 K.
+   :alt: Grand composite curve of the quickstart system: heat cascaded in GJ/hr against shifted temperature in °C, running from the top of the grid down through an open circle where the curve touches zero at the pinch, 25.0 °C on the shifted scale (298.15 K), and on below the pinch to the bottom of the grid at 295 K, with a near-horizontal step near 60 °C shifted where the column condenser condenses over a span of about half a Kelvin.
 
    The grand composite curve: the heat cascaded through each shifted grid
    temperature once the minimum hot utility is supplied, plotted against that
    shifted temperature. Each boundary contributes two values, the heat arriving
    at it and the heat leaving it after its point loads, so a point load would
    appear as an exactly horizontal step. This system has none: the
-   near-horizontal step near 60 °C shifted is the column condenser, spread over
-   the two grid boundaries about half a Kelvin apart, 333.53 and 333 K
-   on the shifted scale -- the same load that steps the hot composite curve at
-   the corresponding real temperature. The curve touches zero exactly at the
+   near-horizontal step near 60 °C shifted is the column condenser, whose
+   glide spans about half a Kelvin, 65.4 to 64.9 °C on the real scale and
+   5 K lower on the shifted one -- the same load that steps the hot composite
+   curve at the corresponding real temperature. The curve touches zero exactly at the
    pinch, 298.15 K on the shifted scale, marked with an open circle, and
    continues below it to the bottom of the grid, 295 K. The value at the
    top of the curve is the hot utility supplied, 2.828e+08 kJ/hr, and the value
@@ -238,7 +247,7 @@ of chapter 1 actually achieves is reported by the facility:
 .. literalinclude:: /_generated/ch02_compare.txt
    :language: text
 
-The four lines are two different comparisons, and the difference between them
+The first four lines are two different comparisons, and the difference between them
 is not a property of the network at all. The first pair uses
 ``HXN.actual_heat_util_load`` and ``HXN.actual_cool_util_load``, which sum the
 ``duty`` of each new utility exchanger's ``HeatUtility``. That is the
@@ -249,29 +258,43 @@ instead -- the process-side duty of the same exchangers -- which is the
 quantity the problem table computes, an enthalpy difference of the process
 streams themselves.
 
-Compared like with like, on the process side, the network reaches the hot
-utility target exactly: 2.828e+08 kJ/hr against a target of 2.828e+08 kJ/hr.
-The utility-side figure, 2.977e+08 kJ/hr, is that same target divided by the
+Compared like with like, on the process side, the network reaches both
+targets exactly: 2.828e+08 kJ/hr of hot utility and 1.936e+06 kJ/hr of cold
+utility, against targets of 2.828e+08 and 1.936e+06 kJ/hr. The utility-side
+heating figure, 2.977e+08 kJ/hr, is that same target divided by the
 heat-transfer efficiency of biosteam's low-pressure steam agent, which is
 below one; it is the steam the plant must raise, not heat the network failed
 to recover. The cold utility needs no such correction, because the cooling
-agents used here (chilled and cooling water) have an efficiency of one and
-both lines therefore read 1.96e+06 kJ/hr against a target of 1.936e+06 kJ/hr.
-That small excess is a genuine shortfall of the network: the targets are a
-bound the synthesizer works towards, not a guarantee it attains, because a
-network has to be built from real exchangers between real streams, one side
-of the pinch at a time.
+agents used here (chilled and cooling water) have an efficiency of one, and
+both of its lines read 1.936e+06 kJ/hr.
 
-Both directions of that statement are checked by the test suite, and checked on
-the process side: ``tests/test_hxn_regression.py`` compares with its
-``actual_loads`` helper, which sums ``unit_duty`` exactly as the second pair of
-lines above does. It synthesizes ten synthetic systems of
-increasing complexity and requires of each synthesized network that it close
-its energy balance, that it "never beat the minimum-energy-requirement (MER)
-targets of the problem table computed on the same streams", and that it
-"recover at least as much heat as documented in ``CASES``". A network that beat
-its target would be reporting an infeasible design; a network that fell short
-of a recorded result would be a silent regression in the synthesizer.
+The last line says the same thing in one word: the synthesis reports
+``HXN.synthesis_info['status']`` as ``mer`` because the utilities of the network
+it realized equal these targets. That is by construction rather than by luck.
+The synthesizer plans each side of the pinch from the pinch outward on the
+same stream curves this table was built from, so its own cascade *is* this
+table, and it reaches the targets whenever its search finds a network without
+stream splits that does (:doc:`../concepts` describes the planner). Where the
+pinch design rules prove that the targets need a stream split, which hensmith
+does not make, the status is ``best_effort`` and the network lies slightly
+above the targets instead; :doc:`04_configuring` shows both outcomes on this
+system.
+
+Both directions of that statement are checked by the test suite, on the
+process side. ``tests/test_hxn_mer.py`` synthesizes 40 problems for which an
+unsplit MER network is known to exist and requires every one of them to reach
+its targets and report ``mer``, and 38 problems that provably need splits,
+which must never beat their targets and must report ``best_effort``.
+``tests/test_hxn_regression.py`` compares with its ``actual_loads`` helper,
+which sums ``unit_duty`` exactly as the second pair of lines above does. It
+synthesizes ten synthetic systems of increasing complexity and requires of
+each synthesized network that it close its energy balance, that it never beat
+the MER targets of the problem table computed on the same streams (and report
+``mer`` exactly when it reaches them), that it keep ``T_min_app`` inside every
+exchanger, and that it recover at least as much heat as recorded in the test
+file. A network that beat its target would be reporting an infeasible design;
+a network that fell short of a recorded result would be a silent regression
+in the synthesizer.
 
 Where to next
 -------------

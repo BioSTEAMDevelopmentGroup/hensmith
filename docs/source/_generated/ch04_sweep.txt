@@ -1,7 +1,8 @@
-T_min_app [K]   heating [kJ/hr]   cooling [kJ/hr]   added installed cost [USD]
-            2         2.957e+08         1.167e+05                    2.396e+06
-            5         2.977e+08          1.96e+06                    1.114e+06
-           10         3.009e+08         5.033e+06                    6.025e+05
-           15         3.095e+08         1.317e+07                    4.003e+05
-           20         3.136e+08         1.704e+07                    3.374e+05
-           30         3.289e+08         3.158e+07                    2.454e+05
+T_min_app  heating    cooling    added installed  pinch     process      status
+[K]        [kJ/hr]    [kJ/hr]    cost [USD]       [K]       exchangers
+2          2.957e+08  9.219e+04  2.02e+06         298.15    3            mer
+5          2.977e+08  1.936e+06  1.112e+06        298.15    4            mer
+10         3.009e+08  5.009e+06  6.004e+05        298.15    4            mer
+15         3.053e+08  9.144e+06  6.684e+05        323.53    8            best_effort (+6.63e+03 kJ/hr)
+20         3.131e+08  1.663e+07  4.131e+05        318.53    6            best_effort (+4.7e+03 kJ/hr)
+30         3.289e+08  3.157e+07  2.496e+05        308.53    5            best_effort (+837 kJ/hr)

@@ -1,6 +1,7 @@
-process exchangers: 15
-hot utility:  target 1.394e+07, network 1.481e+07 kJ/hr
-cold utility: target 7.928e+06, network 8.065e+06 kJ/hr
-hot utility,  process side: target 1.394e+07, network 1.407e+07 kJ/hr
-cold utility, process side: target 7.928e+06, network 8.065e+06 kJ/hr
-energy balance error: 1e-11 %
+process exchangers: 10
+hot utility:  target 1.447e+07, network 1.523e+07 kJ/hr
+cold utility: target 8.462e+06, network 8.462e+06 kJ/hr
+hot utility,  process side: target 1.447e+07, network 1.447e+07 kJ/hr
+cold utility, process side: target 8.462e+06, network 8.462e+06 kJ/hr
+energy balance error: 2e-12 %
+synthesis status: mer

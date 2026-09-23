@@ -58,6 +58,7 @@ def main():
         print(f'energy balance error: {HXN.energy_balance_percent_error:.2g} %')
         print(f'added installed cost: {HXN.installed_costs["Heat exchangers"]:.3g} USD')
         print(f'process exchangers: {[hx.ID for hx in HXN.new_HXs]}')
+        print(f"synthesis status: {HXN.synthesis_info['status']}")
         # [end:loads]
     with capturing('ch01_life_cycles'):
         # [start:life_cycles]
@@ -89,6 +90,7 @@ def main():
         'energy_balance_percent_error_abs': f'{abs(HXN.energy_balance_percent_error):.0e}',
     })
     assert len(HXN.new_HXs) == 4 and len(HXN.stream_life_cycles) == 5, 'quickstart network changed'
+    assert HXN.synthesis_info['status'] == 'mer', 'quickstart network no longer reaches MER'
     assert abs(HXN.energy_balance_percent_error) < 1e-6
 
 

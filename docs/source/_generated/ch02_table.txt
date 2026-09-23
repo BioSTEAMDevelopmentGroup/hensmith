@@ -1,4 +1,5 @@
-shifted grid Ts [K]: [372.6  369.07 366.38 333.53 333.   333.   332.98 306.37 298.15 295.  ]
+shifted grid Ts:     175 points, 372.60 down to 295.00 K
+point loads:         0
 hot utility target:  2.828e+08 kJ/hr
 cold utility target: 1.936e+06 kJ/hr
 pinch (shifted):     298.15 K

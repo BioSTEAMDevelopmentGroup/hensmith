@@ -5,12 +5,15 @@ Pinch analysis and synthesis (hensmith.hxn_synthesis)
 
 ``hensmith.hxn_synthesis`` holds the machinery behind
 :class:`HeatExchangerNetwork`: :func:`problem_table` builds the
-temperature-interval heat cascade of a set of process streams and locates
-the pinch, :func:`synthesize_network` adds the sequential, heuristic
-matching of hot and cold streams on each side of that pinch,
-:class:`StreamLifeCycle` records the exchangers each stream ends up passing
-through, and :func:`plot_pinch_diagram` draws the result. All four are
-usable on their own, without a :class:`HeatExchangerNetwork` instance.
+temperature-interval heat cascade of a set of process streams on their
+temperature-enthalpy curves and locates the pinch, :func:`synthesize_network`
+plans an unsplit network from the pinch outward on the same curves -- one that
+reaches the minimum energy requirement (MER) targets whenever its search finds
+one -- and realizes it as BioSTEAM exchangers, :class:`StreamLifeCycle`
+records the exchangers each stream ends up passing through, and
+:func:`plot_pinch_diagram` draws the result. All four are usable on their own,
+without a :class:`HeatExchangerNetwork` instance; :doc:`../concepts` explains
+the method.
 
 .. autofunction:: problem_table
 
@@ -29,9 +32,13 @@ usable on their own, without a :class:`HeatExchangerNetwork` instance.
 
 .. note::
 
-   **Internals.** ``hensmith.hxn_synthesis.temperature_interval_pinch_analysis``,
-   ``hensmith.hxn_synthesis.pinch_state`` and
-   ``hensmith.hxn_synthesis.load_duties`` are public in name only: they are
-   steps of :func:`synthesize_network`, are not exported by ``hensmith``, and
-   are not part of the supported API. Their signatures and behavior may change
-   without notice.
+   **Internals.** ``hensmith.hxn_synthesis.temperature_interval_pinch_analysis``
+   (the first step of :func:`synthesize_network`: preparing the process streams
+   and running the problem table on them), ``hensmith.hxn_synthesis.pinch_state``
+   and ``hensmith.hxn_synthesis.load_duties`` (standalone helpers that split a
+   stream at a pinch temperature; the synthesis itself plans on the stream
+   curves and does not use them) are public in name only: they are not exported
+   by ``hensmith``, and are not part of the supported API. Neither are the
+   private modules ``hensmith._curves`` (the stream temperature-enthalpy curves)
+   and ``hensmith._planner`` (the MER planner). Their signatures and behavior
+   may change without notice.

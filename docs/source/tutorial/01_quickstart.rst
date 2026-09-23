@@ -152,12 +152,19 @@ adding nothing, rather than as a capital credit.
 The heating load falls from 3.609e+08 to 2.977e+08 kJ/hr, a reduction of
 17.5 %; the ratio of the two, 0.82, is the value checked by the
 :class:`~hensmith.HeatExchangerNetwork` docstring example. The cooling load
-falls from 6.201e+07 to 1.96e+06 kJ/hr, a reduction of 96.8 %: nearly all of
+falls from 6.201e+07 to 1.936e+06 kJ/hr, a reduction of 96.9 %: nearly all of
 the cooling duty of this system can be recovered into a stream that needed
 heating. Four process exchangers do that work, and they are the ``new_HXs`` of
 the network. The energy balance error, -1.8e-11 %, checks that the synthesized
 network moves exactly as much heat as the original one; it is computed on
 every synthesis and compared against ``acceptable_energy_balance_error``.
+
+The last line is the verdict of the synthesis, ``HXN.synthesis_info['status']``:
+``mer`` means that the utilities of this network equal the minimum energy
+requirement (MER) targets of the pinch analysis -- no network of process
+exchangers operating with a 5 K approach can use less heating or cooling.
+:doc:`02_pinch_analysis` computes those targets and compares them with the
+network line by line.
 
 Draw the pinch diagram
 ----------------------
@@ -171,7 +178,7 @@ Draw the pinch diagram
 .. figure:: /_static/images/examples/tutorial_01_quickstart_pinch_diagram.png
    :class: white-bg
    :width: 100%
-   :alt: Pinch diagram of the synthesized quickstart network: two blue cold streams above three red hot streams, joined by four vertical process-exchanger connectors labelled 3.34E4, 5.03E6, 3.71E7 and 1.79E7 kJ/hr, all to the right of the dashed pinch line, with hot utility circles at the outlet of both cold streams and one cold utility circle on the hot stream D1_H1 (bottoms_product).
+   :alt: Pinch diagram of the synthesized quickstart network: two blue cold streams above three red hot streams, joined by four vertical process-exchanger connectors labelled 5.05E6, 3.71E7, 3.34E4 and 1.79E7 kJ/hr, all to the right of the dashed pinch line, with hot utility circles at the outlet of both cold streams and one cold utility circle on the hot stream D1_H1 (bottoms_product).
 
    The synthesized network, read as a pinch diagram. The two cold streams
    (blue, drawn left to right) are ``0`` ``D1 - reboiler`` and ``1``
@@ -180,10 +187,10 @@ Draw the pinch diagram
    ``D1 - condenser (vapor)`` and ``4`` ``D1_H2 (distillate)``. Each stream is
    annotated with its inlet and outlet temperature and enthalpy flow. The four
    vertical connectors are the process exchangers, each labelled with its duty
-   in kJ/hr: 3.34E4 between streams 1 and 4, 5.03E6 between 1 and 2, 3.71E7
-   between 0 and 2, and 1.79E7 between 1 and 3. Columns are ordered so that a
+   in kJ/hr: 5.05E6 between streams 1 and 2, 3.71E7 between 0 and 2, 3.34E4
+   between 1 and 4, and 1.79E7 between 1 and 3. Columns are ordered so that a
    stream meets its exchangers in flow direction, which is why stream 1 reads
-   3.34E4, 5.03E6, 1.79E7 from left to right. The dashed line is the pinch,
+   5.05E6, 3.34E4, 1.79E7 from left to right. The dashed line is the pinch,
    separating the cold-side design on its left from the hot-side design on its
    right; all four exchangers of this network lie on the hot side. The open
    circles are the utility exchangers that finish each stream: a hot utility

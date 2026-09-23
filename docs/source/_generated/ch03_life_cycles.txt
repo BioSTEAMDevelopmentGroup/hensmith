@@ -5,16 +5,16 @@ StreamLifeCycle: Stream_0, cold
 	
 StreamLifeCycle: Stream_1, cold
 	life_cycle: 
-		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 0 kJ/hr, H_out = 3.34e+04 kJ/hr>
-		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 3.34e+04 kJ/hr, H_out = 5.06e+06 kJ/hr>
-		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 5.06e+06 kJ/hr, H_out = 2.3e+07 kJ/hr>
+		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 0 kJ/hr, H_out = 5.05e+06 kJ/hr>
+		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 5.05e+06 kJ/hr, H_out = 5.08e+06 kJ/hr>
+		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 5.08e+06 kJ/hr, H_out = 2.3e+07 kJ/hr>
 		<LifeStage: <HXutility: Util_1_hs>, H_in = 2.3e+07 kJ/hr, H_out = 2.79e+08 kJ/hr>
 	
 StreamLifeCycle: Stream_2, hot
 	life_cycle: 
 		<LifeStage: <HXprocess: HX_0_2_hs>, H_in = 4.52e+07 kJ/hr, H_out = 8.12e+06 kJ/hr>
-		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 8.12e+06 kJ/hr, H_out = 3.1e+06 kJ/hr>
-		<LifeStage: <HXutility: Util_2_cs>, H_in = 3.1e+06 kJ/hr, H_out = 1.14e+06 kJ/hr>
+		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 8.12e+06 kJ/hr, H_out = 3.07e+06 kJ/hr>
+		<LifeStage: <HXutility: Util_2_cs>, H_in = 3.07e+06 kJ/hr, H_out = 1.14e+06 kJ/hr>
 	
 StreamLifeCycle: Stream_3, hot
 	life_cycle: 

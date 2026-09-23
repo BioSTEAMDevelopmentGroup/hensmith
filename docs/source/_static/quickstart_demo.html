@@ -547,7 +547,7 @@ Purchase cost            Heat exchangers      USD  3.46e+05
 Total purchase cost                           USD  3.46e+05
 Installed equipment cost                      USD  1.11e+06
 Utility cost                               USD/hr      -605`},
-    callouts:[{"v": "&minus;17.5 %", "l": "heating utility"}, {"v": "&minus;96.8 %", "l": "cooling utility"}, {"v": "&minus;605 USD/hr", "l": "utility cost (savings)"}] },
+    callouts:[{"v": "&minus;17.5 %", "l": "heating utility"}, {"v": "&minus;96.9 %", "l": "cooling utility"}, {"v": "&minus;605 USD/hr", "l": "utility cost (savings)"}] },
   { num:"03", label:"Draw the pinch diagram", dur:13000, lineMs:520,
     code:["fig, ax = HXN.plot_pinch_diagram()"],
     caption:"Cold streams above, hot streams below, one connector per <em>process exchanger</em>.",
@@ -564,15 +564,15 @@ Utility cost                               USD/hr      -605`},
         &lt;LifeStage: &lt;HXutility: Util_0_hs&gt;, H_in = 4.24e+07 kJ/hr, H_out = 6.92e+07 kJ/hr&gt;
     ]&gt;, &lt;StreamLifeCycle: Stream_1, cold
     life_cycle = [
-        &lt;LifeStage: &lt;HXprocess: HX_1_4_hs&gt;, H_in = 0 kJ/hr, H_out = 3.34e+04 kJ/hr&gt;
-        &lt;LifeStage: &lt;HXprocess: HX_1_2_hs&gt;, H_in = 3.34e+04 kJ/hr, H_out = 5.06e+06 kJ/hr&gt;
-        &lt;LifeStage: &lt;HXprocess: HX_1_3_hs&gt;, H_in = 5.06e+06 kJ/hr, H_out = 2.3e+07 kJ/hr&gt;
+        &lt;LifeStage: &lt;HXprocess: HX_1_2_hs&gt;, H_in = 0 kJ/hr, H_out = 5.05e+06 kJ/hr&gt;
+        &lt;LifeStage: &lt;HXprocess: HX_1_4_hs&gt;, H_in = 5.05e+06 kJ/hr, H_out = 5.08e+06 kJ/hr&gt;
+        &lt;LifeStage: &lt;HXprocess: HX_1_3_hs&gt;, H_in = 5.08e+06 kJ/hr, H_out = 2.3e+07 kJ/hr&gt;
         &lt;LifeStage: &lt;HXutility: Util_1_hs&gt;, H_in = 2.3e+07 kJ/hr, H_out = 2.79e+08 kJ/hr&gt;
     ]&gt;, &lt;StreamLifeCycle: Stream_2, hot
     life_cycle = [
         &lt;LifeStage: &lt;HXprocess: HX_0_2_hs&gt;, H_in = 4.52e+07 kJ/hr, H_out = 8.12e+06 kJ/hr&gt;
-        &lt;LifeStage: &lt;HXprocess: HX_1_2_hs&gt;, H_in = 8.12e+06 kJ/hr, H_out = 3.1e+06 kJ/hr&gt;
-        &lt;LifeStage: &lt;HXutility: Util_2_cs&gt;, H_in = 3.1e+06 kJ/hr, H_out = 1.14e+06 kJ/hr&gt;
+        &lt;LifeStage: &lt;HXprocess: HX_1_2_hs&gt;, H_in = 8.12e+06 kJ/hr, H_out = 3.07e+06 kJ/hr&gt;
+        &lt;LifeStage: &lt;HXutility: Util_2_cs&gt;, H_in = 3.07e+06 kJ/hr, H_out = 1.14e+06 kJ/hr&gt;
     ]&gt;, &lt;StreamLifeCycle: Stream_3, hot
     life_cycle = [
         &lt;LifeStage: &lt;HXprocess: HX_1_3_hs&gt;, H_in = 2.04e+07 kJ/hr, H_out = 2.47e+06 kJ/hr&gt;

@@ -84,7 +84,7 @@ def main():
         cold_in = bst.Stream(Water=900., T=300., P=5e5, phase='l', units='kmol/hr')
         cold_out = cold_in.copy(); cold_out.vle(T=390., P=5e5)
         table = problem_table([hot_in, cold_in], [hot_out, cold_out], [True, False], 5.)
-        print('shifted grid Ts [K]:', table.Ts)
+        print('shifted grid Ts [K]:', table.Ts.size, 'points,', table.Ts[0], 'down to', table.Ts[-1])
         print('hot utility target [kJ/hr]: ', round(table.hot_util_load, 3))
         print('cold utility target [kJ/hr]:', round(table.cold_util_load, -1))
         print('pinch (shifted) [K]:', table.pinch_T)
@@ -117,7 +117,8 @@ def main():
         for s in streams_quenched: s.vle(H=s.H, P=s.P)
         is_hot = [hu.duty < 0 for hu in hus]
         table = problem_table(streams_inlet, streams_quenched, is_hot, T_min_app=5.)
-        print('shifted grid Ts [K]:', table.Ts.round(2))
+        print(f'shifted grid Ts:     {table.Ts.size} points, {table.Ts[0]:.2f} down to {table.Ts[-1]:.2f} K')
+        print(f'point loads:         {np.count_nonzero(table.point_H)}')
         print(f'hot utility target:  {table.hot_util_load:.4g} kJ/hr')
         print(f'cold utility target: {table.cold_util_load:.4g} kJ/hr')
         print(f'pinch (shifted):     {table.pinch_T:.2f} K')
@@ -169,6 +170,7 @@ def main():
         cool = -sum(hu.unit_duty for hu in new_hus if hu.unit_duty < 0)
         print(f'hot utility,  process side: target {table.hot_util_load:.4g}, network {heat:.4g} kJ/hr')
         print(f'cold utility, process side: target {table.cold_util_load:.4g}, network {cool:.4g} kJ/hr')
+        print(f"synthesis status: {HXN.synthesis_info['status']}")
         # [end:compare]
     # plumbing checks: the drawn curves are consistent with the table
     gap = min_vertical_gap(hot_T, hot_H, cold_T, cold_H)
