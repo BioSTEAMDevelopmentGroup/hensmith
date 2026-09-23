@@ -135,13 +135,6 @@ body{
 }
 .brand{display:flex;align-items:center;gap:10px;min-width:0}
 .brand img{height:26px;width:auto;display:block}
-.brand .logo-dark{display:none}
-:root[data-theme="dark"] .brand .logo-light{display:none}
-:root[data-theme="dark"] .brand .logo-dark{display:block}
-@media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]) .brand .logo-light{display:none}
-  :root:not([data-theme="light"]) .brand .logo-dark{display:block}
-}
 .brand .name{
   font-weight:600;letter-spacing:-.01em;font-size:1.02rem;
 }
@@ -310,14 +303,6 @@ body{
 }
 .intro .mark{height:52px;width:auto;opacity:0;transform:translateY(8px);transition:.7s ease}
 .intro.on .mark{opacity:1;transform:none}
-/* show only the theme-appropriate intro mark (mirrors the .brand rules) */
-.intro .logo-dark{display:none}
-:root[data-theme="dark"] .intro .logo-light{display:none}
-:root[data-theme="dark"] .intro .logo-dark{display:block}
-@media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]) .intro .logo-light{display:none}
-  :root:not([data-theme="light"]) .intro .logo-dark{display:block}
-}
 .intro h1{
   font-family:"Spectral", Georgia, serif;
   font-weight:700;font-size:clamp(1.6rem,3.4vw,2.5rem);
@@ -464,8 +449,7 @@ body{
   <div class="player" id="player">
     <div class="chrome">
       <div class="brand">
-        <img class="logo-light" src="images/logo/logo_hensmith_light.png" alt="hensmith logo">
-        <img class="logo-dark" src="images/logo/logo_hensmith_dark.png" alt="hensmith logo">
+        <img src="images/logo/logo_hensmith.png" alt="hensmith logo">
         <span class="dots"><i></i><i></i><i></i></span>
       </div>
       <div class="now"><span class="num" id="nowNum">00</span><span class="lbl" id="nowLbl">Intro</span></div>
@@ -486,8 +470,7 @@ body{
       </div>
 
       <div class="intro" id="intro">
-        <img class="mark logo-light" src="images/logo/mark_hensmith_light.png" alt="">
-        <img class="mark logo-dark" src="images/logo/mark_hensmith_dark.png" alt="">
+        <img class="mark" src="images/logo/mark_hensmith.png" alt="">
         <h1>Synthesize the heat exchanger network of <em>any BioSTEAM system.</em></h1>
         <div class="flow">
           <span>Build</span><i>&rarr;</i><span>Simulate</span><i>&rarr;</i><span>Savings</span><i>&rarr;</i><span>Pinch diagram</span>

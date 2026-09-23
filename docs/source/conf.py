@@ -69,11 +69,11 @@ html_theme = 'pydata_sphinx_theme'
 html_title = 'hensmith'
 html_static_path = ['_static']
 html_css_files = ['css/custom.css']
-html_favicon = '_static/images/logo/mark_hensmith_light.png'
+html_favicon = '_static/images/logo/mark_hensmith.png'
 html_theme_options = {
     'logo': {
-        'image_light': '_static/images/logo/logo_hensmith_light.png',
-        'image_dark': '_static/images/logo/logo_hensmith_dark.png',
+        'image_light': '_static/images/logo/logo_hensmith.png',
+        'image_dark': '_static/images/logo/logo_hensmith.png',
     },
     'show_toc_level': 2,
     'icon_links': [

@@ -20,7 +20,7 @@ directories themselves.
 
 | Script | Outputs |
 | --- | --- |
-| `make_logo.py` | `_static/images/logo/logo_hensmith_light.png`, `_static/images/logo/logo_hensmith_dark.png` (2000 px wide), `_static/images/logo/mark_hensmith_light.png`, `_static/images/logo/mark_hensmith_dark.png` (600 × 600) |
+| `make_logo.py` | `_static/images/logo/logo_hensmith.png` (2000 px wide), `_static/images/logo/mark_hensmith.png` (600 × 600) — both derived from the master artwork `hensmith_logo_source.png`; one logo serves both themes |
 | `make_icons.py` | `_static/images/icons/{getting-started,concepts,api,contributing}_{light,dark}.png` — eight 512 × 512 transparent card icons |
 | `examples/ch01_quickstart.py` | `_static/images/examples/tutorial_01_quickstart_flowsheet_light.png`, `…_flowsheet_dark.png`, `_static/images/examples/tutorial_01_quickstart_pinch_diagram.png`; `_generated/ch01_results.txt`, `ch01_loads.txt`, `ch01_life_cycles.txt`, `ch01_summary.txt` |
 | `examples/ch02_pinch_analysis.py` | `_static/images/examples/tutorial_02_composite_curves.png`, `tutorial_02_grand_composite.png`; `_generated/ch02_threshold.txt`, `ch02_table.txt`, `ch02_compare.txt` |
@@ -30,17 +30,18 @@ directories themselves.
 | `build_demo.py` | `_static/quickstart_demo.html` — the interactive quickstart demo, filled in from `quickstart_demo_template.html` |
 | `make_poster.py` | `_static/images/examples/quickstart_demo_poster.png` — the README poster that links to the demo (2400 × 1260) |
 
-Two files here are not scripts: `_common.py` (shared helpers: paths, themes,
+Three files here are not scripts: `_common.py` (shared helpers: paths, themes,
 the capture context manager, figure saving, the quickstart system builder) and
 `quickstart_demo_template.html` (the demo's hand-written template, with
-`__TOKEN__` placeholders that `build_demo.py` fills). The only committed asset
+`__TOKEN__` placeholders that `build_demo.py` fills). `hensmith_logo_source.png`
+is the master logo artwork that `make_logo.py` trims and crops. The only committed asset
 under `docs/source/_static/` that is *not* generated here is
 `_static/css/custom.css`, which is hand-written.
 
 Order matters: `make_hero_gif.py` imports `composite_curves` from
 `examples/ch02_pinch_analysis.py`; `build_demo.py` consumes the chapter-01
 captures and figures; `make_poster.py` consumes the chapter-01 pinch diagram
-and the dark logo. `build_all.py` lists the scripts in a valid order.
+and the logo. `build_all.py` lists the scripts in a valid order.
 
 ## Regenerate
 

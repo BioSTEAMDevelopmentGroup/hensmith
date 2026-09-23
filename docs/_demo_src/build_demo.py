@@ -30,10 +30,8 @@ OUT = STATIC / 'quickstart_demo.html'
 CH01 = HERE / 'examples' / 'ch01_quickstart.py'
 
 IMAGES = {
-    '__LOGO_LIGHT__': 'images/logo/logo_hensmith_light.png',
-    '__LOGO_DARK__': 'images/logo/logo_hensmith_dark.png',
-    '__MARK_LIGHT__': 'images/logo/mark_hensmith_light.png',
-    '__MARK_DARK__': 'images/logo/mark_hensmith_dark.png',
+    '__LOGO__': 'images/logo/logo_hensmith.png',
+    '__MARK__': 'images/logo/mark_hensmith.png',
     '__FIG_FLOWSHEET_LIGHT__': 'images/examples/tutorial_01_quickstart_flowsheet_light.png',
     '__FIG_FLOWSHEET_DARK__': 'images/examples/tutorial_01_quickstart_flowsheet_dark.png',
     '__FIG_PINCH__': 'images/examples/tutorial_01_quickstart_pinch_diagram.png',
