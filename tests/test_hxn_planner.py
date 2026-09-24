@@ -1674,3 +1674,420 @@ def test_candidate_key_and_signature():
     # a cell that fails (C) is never accepted
     with pytest.raises(SP._SplitInvariantError):
         SP._Candidate('V', (1, 0), side, [0.], [B(0, 0, 5., 0., 1.)])
+
+
+# %% 17. Split plans end to end (records and the switch)
+
+MATCH_KEYS = {'side', 'hot', 'cold', 'Q', 'T_hot_in', 'T_hot_out',
+              'T_cold_in', 'T_cold_out', 'hot_seq', 'cold_seq', 'pair_index'}
+SPLIT_KEYS = {'hot_frac', 'cold_frac', 'hot_branch', 'cold_branch'}
+SPLIT_ON = dict(stream_splitting=True)
+
+
+def split_infos(plan):
+    """``{side: info['sides'][side]['split']}`` of the split sides."""
+    return {name: s['split'] for name, s in plan.info['sides'].items()
+            if s.get('split')}
+
+
+def check_split_network(streams, dT, net, tol=1e-6, exact=True):
+    """
+    Walk every stream along ``plan.paths``: trunk exchangers in series and
+    the branches of every split in parallel from the split state, each at
+    ``Q / (f CP)``, then the mix at ``Q / CP`` of the total. Recompute the
+    temperatures and assert: the recorded temperatures, fractions and
+    branches; both ends of every exchanger keep dT (constant CP: linear
+    profiles); fractions in (0, 1] summing to 1; ``H_split`` is the state
+    reached and ``H_mix = H_split -/+ sum Q``; the flattened paths are
+    ``plan.stages`` with consecutive seqs; utilities >= 0 close every
+    stream and equal the targets up to the pre-leak; every must of a split
+    side is served exactly up to its gap (MF4). With `exact`, the penalty
+    is at most the pre-leak (+ 1e-12 of the scale); without it, only
+    'mer'-close: temperatures offset by less than tolQ/CP let the unsplit
+    planner's own tolerances reach the utilities (`_sides` omits a stream
+    part of at most tolQ at the pinch; `_cascade` thresholds the target of
+    a side with no must). Returns the hot and cold utility.
+    """
+    plan = net['plan']
+    matches = net['matches']
+    scale = duty_scale(streams)
+    qtol = 1e-9 * scale
+    preleak = math.fsum(s['preleak'] for s in split_infos(plan).values())
+    index = {id(s): k for k, s in enumerate(plan.splits)}
+    assert len(index) == len(plan.splits)
+    temps = [{} for _ in matches]
+    assert all(u >= 0. for u in plan.utility)
+    for j, s in enumerate(streams):
+        hot = s['kind'] == 'hot'
+        role = 'hot' if hot else 'cold'
+        sg, CP = (-1. if hot else 1.), s['CP']
+        lo = min(s['T_in'], s['T_out'])
+        flat = []
+
+        def run(ns, T, f, branch):
+            for n in ns:
+                m = matches[n]
+                assert m[role] == s['name'] and m['Q'] > 0.
+                if plan.splits:
+                    assert m[role + '_frac'] == f
+                    assert m[role + '_branch'] == branch
+                T2 = T + sg * m['Q'] / (f * CP)
+                assert_allclose((m[f'T_{role}_in'], m[f'T_{role}_out']),
+                                (T, T2), rtol=1e-9, atol=tol)
+                temps[n][hot] = (T, T2)
+                flat.append(n)
+                T = T2
+            return T
+        T = s['T_in']
+        for item in plan.paths[j]:
+            if not isinstance(item, SP.Split):
+                T = run([item], T, 1., None)
+                continue
+            k = index[id(item)]
+            fr = item.fractions
+            assert item.stream == j and len(fr) == len(item.branches) >= 2
+            assert all(0. < f <= 1. for f in fr)
+            assert abs(math.fsum(fr) - 1.) <= 1e-12
+            assert item.H_split == pytest.approx(CP * (T - lo), abs=qtol)
+            D = 0.
+            for b, (f, ns) in enumerate(zip(fr, item.branches)):
+                assert ns
+                run(ns, T, f, (k, b))
+                D += math.fsum(matches[n]['Q'] for n in ns)
+            assert item.H_mix == pytest.approx(item.H_split + sg * D,
+                                               abs=1e-12 * scale)
+            T += sg * D / CP
+        assert flat == plan.stages[j]
+        assert ([matches[n][role + '_seq'] for n in flat]
+                == list(range(1, len(flat) + 1)))
+        need = CP * ((T - s['T_out']) if hot else (s['T_out'] - T))
+        u = (net['cold_utility'] if hot else net['hot_utility']).get(
+            s['name'], 0.)
+        assert need >= -qtol and abs(u - need) <= qtol
+    assert all(len(t) == 2 for t in temps)   # every exchanger walked twice
+    for t in temps:
+        (hi, ho), (ci, co) = t[True], t[False]
+        assert min(hi - co, ho - ci) >= dT - tol
+    Qh = sum(net['hot_utility'].values())
+    Qc = sum(net['cold_utility'].values())
+    Qh_t, Qc_t, _ = cascade(streams, dT)
+    assert abs(Qh - Qh_t) <= qtol + preleak
+    assert abs(Qc - Qc_t) <= qtol + preleak
+    # MF4: the split machinery adds no heat error
+    sides = sides_from_knots(
+        [([min(s['T_in'], s['T_out']), max(s['T_in'], s['T_out'])],
+          [0., s['CP'] * abs(s['T_in'] - s['T_out'])]) for s in streams],
+        [s['kind'] == 'hot' for s in streams], dT)
+    exact_tol = 1e-12 * plan.info['scale']
+    for name in split_infos(plan):
+        role = 'hot' if name == 'above' else 'cold'
+        gaps = plan.info['sides'][name]['gaps']
+        for c in sides[name].musts:
+            served = math.fsum(m['Q'] for m in matches if m['side'] == name
+                               and m[role] == streams[c.stream]['name'])
+            assert served + gaps.get(c.stream, 0.) == pytest.approx(
+                c.Q, abs=exact_tol)
+    if exact:
+        assert plan.penalty <= preleak + exact_tol
+    return Qh, Qc
+
+
+@pytest.mark.parametrize('name', sorted(SPLIT))
+def test_split_cases_reach_mer(name):
+    dT, rows = SPLIT[name]
+    streams = streams_from(rows)
+    net = P._plan_numeric(streams, dT, **SPLIT_ON)
+    plan = net['plan']
+    assert net['status'] == 'mer' and plan.splits
+    assert plan.info['dropped'] == [] and plan.info['qmin_dropped'] == []
+    check_split_network(streams, dT, net)
+    assert set(net['matches'][0]) == MATCH_KEYS | SPLIT_KEYS
+    for sname, s in plan.info['sides'].items():
+        sp = s['split']
+        if sp is None:   # a side the unsplit search serves
+            assert s['status'] in ('mer', 'trivial')
+            continue
+        assert s['status'] == 'mer' and s['method'] == 'split-V'
+        assert s['proof']['rule'] in ('outward', 'inward')
+        assert sp['candidate'] == 'V' and sp['preleak'] == sp['leak'] == 0.
+        assert sp['errors'] == [] and sp['small'] == []
+        assert isinstance(sp['candidates']['V'], tuple)
+        assert s['units'] == len([e for e in plan.exchangers
+                                  if e.side == sname])
+
+
+def test_split_plan_heat_closes_exactly():
+    # a leak event (_SPLIT_R_TOL tolQ, 1e-14 of the scale) is 100 times
+    # inside the planner's 1e-12 heat closure; the module says so
+    assert SP._SPLIT_R_TOL * P._REL_Q == pytest.approx(1e-14)
+    assert "``1e-12`` heat closure" in SP.__doc__
+    n = 0
+    for dT, rows in [*SPLIT.values(), NEAR_THRESHOLD, NEAR_DOUBLE_PINCH]:
+        streams = streams_from(rows)
+        plan = P._plan_numeric(streams, dT, **SPLIT_ON)['plan']
+        scale = plan.info['scale']
+        infos = split_infos(plan)
+        assert infos
+        preleak = math.fsum(sp['preleak'] for sp in infos.values())
+        assert all(sp['leak'] == 0. for sp in infos.values())
+        assert plan.penalty <= preleak + 1e-12 * scale
+        for name, sp in infos.items():   # truthful gaps (MF4)
+            gaps = plan.info['sides'][name]['gaps']
+            assert math.fsum(gaps.values()) == pytest.approx(
+                sp['preleak'] + sp['leak'], abs=1e-12 * scale)
+            n += 1
+    assert n >= 5
+
+
+def test_splitting_off_adds_nothing():
+    # every fixture but the two slowest (4.5 s and 3 s of best effort; the
+    # R1 oracle proves the bitwise identity on the whole corpus)
+    slow = ('hold_nested_n21-40_s100233',)
+    cases = [(10., R002), (10., LINNHOFF4), *REPEATED_PAIR.values(),
+             *(v for k, v in HARD.items() if k not in slow),
+             *SPLIT.values(), NEAR_THRESHOLD, (10., MERGED_BREAKPOINT)]
+    info_keys = {'sides', 'qmin_dropped', 'dropped', 'min_approach', 'work',
+                 'scale', 'tolQ', 'cascade'}
+    side_keys = {'status', 'method', 'work', 'proof', 'units', 'M', 'F',
+                 'gaps'}
+    for dT, rows in cases:
+        net = P._plan_numeric(streams_from(rows), dT, stream_splitting=False)
+        plan = net['plan']
+        assert set(plan.info) == info_keys
+        assert all(set(s) == side_keys for s in plan.info['sides'].values())
+        assert plan.splits == []
+        assert plan.paths == {j: list(s) for j, s in plan.stages.items()}
+        assert all(set(m) == MATCH_KEYS for m in net['matches'])
+        assert all((e.hot_frac, e.cold_frac, e.hot_branch, e.cold_branch)
+                   == (1., 1., None, None) for e in plan.exchangers)
+
+
+def test_threshold_and_near_tie_roots_preleak():
+    # _cascade's own tolerances leave these roots slightly negative (a
+    # threshold deficit of 23.7 tolQ = 9e-8; near-equal minima, 0.05 tolQ):
+    # the core starts from the pre-leaked root and the deficit is booked
+    for (dT, rows), rel in ((NEAR_THRESHOLD, 23.7), (NEAR_DOUBLE_PINCH, .05)):
+        streams = streams_from(rows)
+        net = P._plan_numeric(streams, dT, **SPLIT_ON)
+        plan = net['plan']
+        assert net['status'] == 'mer'
+        check_split_network(streams, dT, net)
+        sides = sides_from(rows, dT)
+        infos = split_infos(plan)
+        leaked = {n: sp for n, sp in infos.items() if sp['preleak'] > 0.}
+        assert len(leaked) == 1
+        for name, sp in leaked.items():
+            side = sides[name]
+            slack = side.analyse([0.] * side.M, [0.] * side.F).slack
+            assert sp['preleak'] == -slack
+            assert sp['preleak'] == pytest.approx(rel * side.tolQ, rel=.01)
+            assert sp['preleak'] <= SP._preleak_max(side)
+    # a 'cascade' root with a deficit beyond the cascade's tolerances: the
+    # targets cannot be met, so today's best effort (no split) applies
+    L = P._LevelCurve
+    side = P._Side('above', [L([0., 10.], [50., 60.])],
+                   [L([0., 5.], [0., 10.])], 1e-9, 1e-9)
+    z = ([0.], [0.])
+    d = side.analyse(*z)
+    assert side.rules_violation(*z, d) is None
+    assert -d.slack > SP._preleak_max(side)
+    off = P._plan_side(side)
+    on = P._plan_side(side, split=dict(Qmin=0., exclude={}, prefer={}))
+    assert off.proof['rule'] == on.proof['rule'] == 'cascade'
+    assert on.status == 'best_effort' and on.cells == [] and on.split is None
+    assert (on.pieces, on.gaps, on.method) == (off.pieces, off.gaps,
+                                               off.method)
+
+
+def records_case():
+    """A hand-built split side: H1 (200 kW, far above both colds, which
+    need 100 kW of heating: all above the pinch) splits at its far end into
+    two halves that re-join non-isothermally at 100, then serves C2 and C1
+    on its trunk."""
+    rows = [('H1', 'h', 400, 200, 1.), ('C1', 'c', 20, 170, 1.),
+            ('C2', 'c', 20, 170, 1.)]
+    streams = streams_from(rows)
+    knots = [([min(s['T_in'], s['T_out']), max(s['T_in'], s['T_out'])],
+              [0., s['CP'] * abs(s['T_in'] - s['T_out'])]) for s in streams]
+    hot = [s['kind'] == 'hot' for s in streams]
+    curves = P._stream_curves(knots, hot, 10.)
+    sides = sides_from_knots(knots, hot, 10.)
+    side = sides['above']
+    assert (side.M, side.F, sides['below'].M + sides['below'].F) == (1, 2, 0)
+    B = SP._Cell
+    cells = [B(0, 0, 60., 80., 0., .5, 1., ('S', 0, 0)),    # [80, 200]
+             B(0, 1, 40., 120., 0., .5, 1., ('S', 0, 1)),   # [120, 200]
+             B(0, 1, 60., 40., 40.), B(0, 0, 40., 0., 60.)]
+    _verify_side_cells(side, cells)
+    plans = {'above': P._SidePlan([], [0.], 'mer', 'split-X', cells=cells,
+                                  units=4)}
+    return sides, plans, curves
+
+
+def test_split_records_walk_a_non_isothermal_remix(monkeypatch):
+    sides, plans, curves = records_case()
+    tolQ = sides['above'].tolQ
+    (recs, qmin_dropped, dropped, stages, utility, min_dT, splits,
+     paths) = SP._split_records(sides, plans, curves, 3, 0., tolQ)
+    assert qmin_dropped == dropped == [] and min_dT >= 0.
+    b0, b1, t1, t0 = range(4)   # records in cell order
+    s, = splits
+    # the must flows from its far end: the split, then its trunk
+    assert paths == {0: [s, t1, t0], 1: [b0, t0], 2: [b1, t1]}
+    assert stages == {0: [b0, b1, t1, t0], 1: [b0, t0], 2: [b1, t1]}
+    assert (s.stream, s.side, s.key, s.fractions) == (0, 'above', ('S', 0),
+                                                      (.5, .5))
+    assert s.branches == [[b0], [b1]] and not s.isothermal
+    assert (s.H_split, s.H_mix) == (200., 100.)
+    H = [(e.H_hot_in, e.H_hot_out, e.hot_seq, e.hot_branch) for e in recs]
+    assert H == [(200., 80., 1, (0, 0)), (200., 120., 2, (0, 1)),
+                 (100., 40., 3, None), (40., 0., 4, None)]
+    C = [(e.H_cold_in, e.H_cold_out, e.cold_seq, e.cold_frac) for e in recs]
+    assert C == [(0., 60., 1, 1.), (0., 40., 1, 1.), (40., 100., 2, 1.),
+                 (60., 100., 2, 1.)]
+    assert utility == [0., 50., 50.]
+    # the safety net (a bug if it fires) keeps a dropped branch, empty
+    real = SP._approach_violation_split
+    monkeypatch.setattr(SP, '_approach_violation_split', lambda ch, cc, e: (
+        -1. if e.Q == 40. and e.hot_frac == .5 else real(ch, cc, e)))
+    sides, plans, curves = records_case()
+    recs, _, dropped, stages, utility, _, splits, paths = (
+        SP._split_records(sides, plans, curves, 3, 0., tolQ))
+    s, = splits
+    assert dropped == [('above', 0, 2, 40., -1.)]
+    assert s.branches == [[0], []] and s.fractions == (.5, .5)
+    assert paths[0] == [s, 1, 2] and paths[2] == [1]
+    assert s.H_mix == 140. and utility == [40., 50., 90.]
+
+
+def test_split_side_candidates_and_the_hook():
+    # the hook: a side the unsplit search serves returns exactly as today;
+    # a root proof goes to the split path, which reports its candidates
+    dT, rows = SPLIT['smith2005_exr18_4']
+    sides = sides_from(rows, dT)
+    split = dict(Qmin=0., exclude={}, prefer={})
+    for name, side in sides.items():
+        off = P._plan_side(side)
+        on = P._plan_side(side, split=split)
+        if off.status != 'best_effort':   # 'mer' or 'trivial'
+            assert (on.pieces, on.gaps, on.method, on.work, on.units) == (
+                off.pieces, off.gaps, off.method, off.work, off.units)
+            assert on.cells == [] and on.split is None
+            continue
+        assert on.status == 'mer' and on.pieces == [] and on.cells
+        assert on.proof == off.proof and on.gaps == [0.] * side.M
+        assert on.units == len(SP._merge_cells(on.cells, side.tolQ))
+        assert set(on.split) == {'candidate', 'signature', 'candidates',
+                                 'stages', 'branches', 'preleak', 'leak',
+                                 'small', 'errors'}
+        _verify_side_cells(side, on.cells)
+
+
+def test_exhausted_schedule_splits(monkeypatch):
+    # no root proof, but the unsplit search runs out of budget and best
+    # effort leaves a penalty (> 1e-3 tolQ): the split path serves the side
+    monkeypatch.setattr(P, '_SCHEDULE', tuple(p[:3] + (1.,)
+                                              for p in P._SCHEDULE))
+    monkeypatch.setattr(P, '_BE_WORK', 3000.)   # keep best effort short
+    dT, rows = HARD['rnd_nested_n2-6_s237']
+    streams = streams_from(rows)
+    off = P._plan_numeric(streams, dT)
+    assert off['status'] == 'best_effort' and not root_proof(off['plan'])
+    net = P._plan_numeric(streams, dT, **SPLIT_ON)
+    assert net['status'] == 'mer'
+    check_split_network(streams, dT, net)
+    infos = split_infos(net['plan'])
+    assert infos
+    for name, sp in infos.items():
+        s = net['plan'].info['sides'][name]
+        assert s['proof'] is None and s['method'] == 'split-V'
+        # the best effort's work is counted once
+        assert s['work'] > off['plan'].info['sides'][name]['work']
+
+
+def two_core_generators(monkeypatch):
+    """A second core generator for the selection tests: 'V0' is the chain
+    of elementary vertical blocks (a different network from V)."""
+    drive = SP._drive
+
+    def fake(side, a0, strategy, *args, **kw):
+        if strategy != 'V0':
+            return drive(side, a0, strategy, *args, **kw)
+        with monkeypatch.context() as m:
+            m.setattr(SP, '_SPLIT_COARSEN', False)
+            return drive(side, a0, strategy, *args, **kw)
+    monkeypatch.setattr(SP, '_CORE_ORDER', SP._CORE_ORDER + ('V0',))
+    monkeypatch.setattr(SP, '_CORE_STRATEGIES', ('V', 'V0'))
+    monkeypatch.setattr(SP, '_drive', fake)
+
+
+def test_split_exclusion_by_signature(monkeypatch):
+    dT, rows = SPLIT['smith2005_ex16_5_five_stream']
+    streams = streams_from(rows)
+
+    def plan(**kw):
+        net = P._plan_numeric(streams, dT, **SPLIT_ON, **kw)
+        check_split_network(streams, dT, net)
+        (name, sp), = split_infos(net['plan']).items()
+        return name, sp
+    # one core candidate: excluding its signature still returns it (a
+    # side's last candidate is never excluded)
+    name, sp = plan()
+    sig = sp['signature']
+    name2, sp2 = plan(_split_exclude={name: {sig}})
+    assert (name2, sp2['candidate'], sp2['signature']) == (name, 'V', sig)
+    assert sp2['candidates'] == {'V': 'excluded'}
+    # two core candidates with different networks
+    two_core_generators(monkeypatch)
+    _, sp = plan()
+    assert set(sp['candidates']) == {'V', 'V0'}
+    assert sp['candidate'] == 'V'   # fewer units + branches + stages
+    assert sp['candidates']['V'] < sp['candidates']['V0']
+    _, ex = plan(_split_exclude={name: {sig}})
+    assert ex['candidate'] == 'V0' and ex['signature'] != sig
+    assert ex['candidates']['V'] == 'excluded'
+    both = {sig, ex['signature']}
+    _, last = plan(_split_exclude={name: both})
+    assert last['candidate'] == 'V' and last['signature'] == sig
+    # stickiness: a live preferred candidate is taken as is, first
+    _, pr = plan(_split_prefer={name: 'V0'})
+    assert pr['candidate'] == 'V0' and set(pr['candidates']) == {'V0'}
+    _, pr = plan(_split_prefer={name: 'V0'},
+                 _split_exclude={name: {ex['signature']}})
+    assert pr['candidate'] == 'V' and set(pr['candidates']) == {'V', 'V0'}
+    # the exclusion is by network, not by name: another side's is ignored
+    _, other = plan(_split_exclude={'none': {sig}})
+    assert other['candidate'] == 'V'
+
+
+def test_fuzz_splitting_always_reaches_mer(monkeypatch):
+    monkeypatch.setattr(P, '_BE_WORK', 3000.)   # keep best effort short
+    rng = random.Random(29)
+    n_split = n_same = 0
+    for seed in range(300):
+        jitter = seed % 3 == 2   # temperatures closer than tolQ/CP
+        if jitter:
+            rows, dT = jittered_problem(seed)
+        elif seed % 3:   # built around a pinch, violating the pinch rules
+            rows, dT = pinch_problem(rng)
+            while not needs_split(streams_from(rows), dT):
+                rows, dT = pinch_problem(rng)
+        else:
+            rows, dT = random_problem(rng)
+        streams = streams_from(rows)
+        net = P._plan_numeric(streams, dT, **SPLIT_ON)
+        plan = net['plan']
+        assert net['status'] == 'mer', (seed, rows, dT)
+        assert plan.info['dropped'] == []
+        check_split_network(streams, dT, net, exact=not jitter)
+        infos = split_infos(plan)
+        assert all(sp['leak'] == 0. and sp['errors'] == []
+                   for sp in infos.values())
+        n_split += bool(infos)
+        if not needs_split(streams, dT):
+            off = P._plan_numeric(streams, dT)
+            assert fingerprint(off) == fingerprint(net) and not plan.splits
+            assert [(e.H_hot_in, e.H_cold_in) for e in plan.exchangers] == [
+                (e.H_hot_in, e.H_cold_in) for e in off['plan'].exchangers]
+            n_same += 1
+    assert n_split >= 110 and n_same >= 150

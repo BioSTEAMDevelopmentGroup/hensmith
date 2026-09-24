@@ -1336,18 +1336,24 @@ def _merge(pieces):
 
 class _SidePlan:
     """Plan of one side: pieces (i, j, a0, b0, x), per-must gaps,
-    status ('trivial' | 'mer' | 'best_effort') and diagnostics."""
+    status ('trivial' | 'mer' | 'best_effort') and diagnostics. A split
+    side (`hensmith._splitting`) has no pieces but `cells` (branch
+    exchangers in parent coordinates), its `split` info, and `units` given
+    by the caller."""
     __slots__ = ('pieces', 'gaps', 'status', 'proof', 'method', 'work',
-                 'units')
+                 'units', 'cells', 'split')
 
-    def __init__(self, pieces, gaps, status, method, work=0., proof=None):
+    def __init__(self, pieces, gaps, status, method, work=0., proof=None,
+                 cells=None, split=None, units=None):
         self.pieces = pieces
         self.gaps = gaps
         self.status = status
         self.method = method
         self.work = work
         self.proof = proof
-        self.units = _count_units(pieces)
+        self.units = _count_units(pieces) if units is None else units
+        self.cells = [] if cells is None else cells
+        self.split = split
 
     @property
     def penalty(self):
@@ -1360,9 +1366,14 @@ def _combine_cap(cap, cap1):
     return cap
 
 
-def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.):
+def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.,
+               split=None):
     """MER search on one side, then units; best effort when there is a root
-    proof or the search runs out of budget."""
+    proof or the search runs out of budget. With `split` (stream splitting:
+    ``dict(Qmin, exclude, prefer)``), a side with a root proof, or whose
+    best effort leaves a penalty, is planned with stream splits first
+    (`hensmith._splitting._split_side`); a side the search serves returns
+    exactly as without it."""
     M, F = side.M, side.F
     if M == 0:
         return _SidePlan([], [], 'trivial', 'trivial')
@@ -1374,6 +1385,16 @@ def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.):
     if proof is None and d.slack < -10. * side.tolQ:
         proof = dict(side=side.name, rule='cascade', slack=d.slack)
     if proof is not None:
+        if split:
+            from . import _splitting
+            # a 'cascade' root splits only if its deficit is the cascade's
+            # own tolerance (Lemma P); beyond it the targets cannot be met
+            if (proof['rule'] != 'cascade'
+                    or -d.slack <= _splitting._preleak_max(side)):
+                sp = _splitting._split_side(side, d, proof, cap1, forbid,
+                                            work_scale, 0., split)
+                if sp is not None:
+                    return sp
         return _best_effort(side, proof, cap1, forbid, work_scale, 0.)
     work = 0.
     pieces = method = None
@@ -1391,7 +1412,17 @@ def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.):
             method = f'{mode}-cap{cap}' + ('-extra' if extra else '')
             break
     if pieces is None:
-        return _best_effort(side, None, cap1, forbid, work_scale, work)
+        be = _best_effort(side, None, cap1, forbid, work_scale, work)
+        if split:
+            from . import _splitting
+            # below R2's 1e-12 of the scale: no best-effort penalty R2
+            # would see is accepted without trying the split path
+            if be.penalty > _splitting._SPLIT_R_TOL * side.tolQ:
+                sp = _splitting._split_side(side, d, None, cap1, forbid,
+                                            work_scale, be.work, split)
+                if sp is not None:
+                    return sp
+        return be
     first = work
     pieces, w = _improve_units(side, pieces, first, cap1, forbid, work_scale)
     work += w
@@ -1884,18 +1915,20 @@ def _sides(curves, table, tolQ, tolP):
             for name, (m, f) in parts.items()}
 
 
-def _plan_sides(sides, avoid_recycle, work_scale):
+def _plan_sides(sides, avoid_recycle, work_scale, split=None):
     if not avoid_recycle:
-        return {name: _plan_side(side, work_scale=work_scale)
+        return {name: _plan_side(side, work_scale=work_scale, split=split)
                 for name, side in sides.items()}
 
     def run(order):
         used, plans = set(), {}
         for name in order:
             side = sides[name]
-            sp = _plan_side(side, True, side.local_pairs(used), work_scale)
+            sp = _plan_side(side, True, side.local_pairs(used), work_scale,
+                            split)
             plans[name] = sp
             used.update(side.hot_cold(i, j) for i, j, *_ in sp.pieces)
+            used.update(side.hot_cold(c.i, c.j) for c in sp.cells)
         return plans
 
     def score(plans):
@@ -1916,10 +1949,23 @@ class Exchanger:
     flow-order walk; `hot` and `cold` are stream indices; `hot_seq` and
     `cold_seq` are 1-based positions in each stream's flow order;
     `pair_index` numbers repeated pairs on one side in the order the hot
-    stream meets them)."""
+    stream meets them).
+
+    With stream splitting, `hot_frac` and `cold_frac` are the flow
+    fractions of the branches the exchanger is on (1 on a trunk), and
+    `hot_branch` and `cold_branch` are ``(index into Plan.splits, branch)``
+    or None on a trunk. The enthalpies are *parent-equivalent* (the
+    parent's state at that enthalpy is the branch's state), so
+    ``H_hot_in - H_hot_out == Q / hot_frac``; on a trunk they are the
+    stream's enthalpies, as without splits."""
     __slots__ = ('side', 'hot', 'cold', 'Q', 'pair_index', 'hot_seq',
                  'cold_seq', 'H_hot_in', 'H_hot_out', 'H_cold_in',
-                 'H_cold_out', '_kh', '_kc')
+                 'H_cold_out', '_kh', '_kc', 'hot_frac', 'cold_frac',
+                 'hot_branch', 'cold_branch')
+
+    def __init__(self):
+        self.hot_frac = self.cold_frac = 1.
+        self.hot_branch = self.cold_branch = None
 
     def __repr__(self):
         return (f'<Exchanger {self.side} hot={self.hot} cold={self.cold} '
@@ -1950,7 +1996,15 @@ class Plan:
         (pinch outward).
     stages : dict[int, list[int]]
         For every stream, its exchangers (indices into `exchangers`) in flow
-        order.
+        order. With splits, the flat topological order: the exchangers
+        before a split, those of its branches (branch by branch, each in
+        flow order), then those after it.
+    splits : list[hensmith._splitting.Split]
+        The stream splits (empty without stream splitting).
+    paths : dict[int, list[int or Split]]
+        For every stream, its flow order with each split as one item (its
+        branches run in parallel); ``stages[j]`` flattened. Without splits,
+        ``paths[j] == stages[j]``.
     utility : list[float]
         Duty left for each stream's utility at its outlet end (cooling for
         hot streams, heating for cold ones; >= 0).
@@ -1959,7 +2013,12 @@ class Plan:
     penalty : float
         ``Q_hot - Q_hot_target`` (>= 0).
     info : dict
-        ``sides`` (per side: status, method, work, proof, gaps, units),
+        ``sides`` (per side: status, method, work, proof, gaps, units, and
+        with `stream_splitting` also ``split``: None for an unsplit side,
+        else a dict with the chosen ``candidate``, its network
+        ``signature``, every ``candidates`` key or failure reason,
+        ``stages``, ``branches``, ``preleak``, ``leak``, ``small`` (split
+        exchangers below `Qmin`, kept) and ``errors``),
         ``qmin_dropped`` (list of (side, hot, cold, Q)), ``dropped`` (matches
         removed by the safety net; always empty unless there is a bug),
         ``min_approach`` (on the knot curves), ``work``, ``scale``,
@@ -1967,7 +2026,7 @@ class Plan:
     """
     __slots__ = ('status', 'Q_hot_target', 'Q_cold_target', 'pinch_T', 'cut',
                  'exchangers', 'stages', 'utility', 'Q_hot', 'Q_cold',
-                 'penalty', 'info')
+                 'penalty', 'info', 'splits', 'paths')
 
     def __repr__(self):
         return (f'<Plan {self.status}: {len(self.exchangers)} exchangers, '
@@ -2025,9 +2084,11 @@ def _walk(curves, recs, N):
 
 
 def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
-                 work_scale=1.):
+                 work_scale=1., stream_splitting=False, _split_exclude=None,
+                 _split_prefer=None):
     """
-    Plan an unsplit heat exchanger network at minimum energy requirement.
+    Plan a heat exchanger network at minimum energy requirement, unsplit
+    unless `stream_splitting` is on and a side needs splits.
 
     Parameters
     ----------
@@ -2046,9 +2107,28 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
         Never match the same (hot, cold) pair twice anywhere.
     Qmin : float, optional
         Exchangers with a smaller duty are dropped; their duty goes to the
-        utilities (this can cost MER).
+        utilities (this can cost MER). Exchangers of a split side are never
+        dropped; those below `Qmin` are reported in the side's
+        ``info['sides'][side]['split']['small']``.
     work_scale : float, optional
         Multiplies every work budget.
+    stream_splitting : bool, optional
+        Allow a process stream to be split into parallel branches that
+        re-join. A side of the pinch that no unsplit network serves at the
+        minimum energy requirement (a pinch-rule proof, or an unsplit
+        search that leaves a utility penalty) is planned with splits
+        instead, and then reaches the MER targets exactly on the planner's
+        knots (see Notes, "Stream splitting"). Sides that an unsplit
+        network serves are never split, so a problem that needs no split
+        gets the same network as with the default. With `avoid_recycle`, a
+        split that would repeat a stream pair is not used, and MER is then
+        not guaranteed. Defaults to False.
+    _split_exclude : dict[str, set[tuple]], optional
+        Private (the refine loop): per side, network signatures a split
+        candidate may not have unless it is the side's last candidate.
+    _split_prefer : dict[str, str], optional
+        Private (the refine loop): per side, the candidate tried first
+        (the previous round's pick).
 
     Returns
     -------
@@ -2061,6 +2141,16 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
     placement and match removal, the residual condition (R), the pinch
     rules at tight levels, the events and the guarantees. The result is
     deterministic: budgets are counted in work units, never in seconds.
+
+    **Stream splitting.** A split side is planned by `hensmith._splitting`
+    as verified cells in parent coordinates: a branch of flow fraction
+    ``f`` is the parent's curve with every heat times ``f``. Its records
+    carry the fractions and branches; ``plan.splits`` lists the splits and
+    ``plan.paths`` each stream's flow order with the splits as items. A
+    root deficit that the cascade's own tolerances absorbed into the
+    targets (at most about 100 ``tolQ``) is left to the musts' utilities
+    (the side's ``preleak``, included in its gaps); a split side adds
+    nothing else to the penalty.
 
     Examples
     --------
@@ -2098,41 +2188,53 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
     tolP = _REL_T * max(tspan, 1.)
     table = _cascade(curves, scale)
     sides = _sides(curves, table, tolQ, tolP) if act else {}
-    plans = _plan_sides(sides, avoid_recycle, work_scale) if act else {}
-    # exchangers in plan order (above first), with flow-order keys
-    recs, qmin_dropped = [], []
-    for name in ('above', 'below'):
-        if name not in plans:
-            continue
-        side = sides[name]
-        for i, j, a0, b0, Q in _merge(plans[name].pieces):
-            hot, cold = side.hot_cold(i, j)
-            if Q < Qmin:
-                qmin_dropped.append((name, hot, cold, Q))
+    split = (dict(Qmin=Qmin, exclude=dict(_split_exclude or {}),
+                  prefer=dict(_split_prefer or {}))
+             if stream_splitting else None)
+    plans = _plan_sides(sides, avoid_recycle, work_scale, split) if act else {}
+    split_mode = any(p.cells for p in plans.values())
+    if split_mode:
+        from . import _splitting
+        (recs, qmin_dropped, dropped, stages, utility, min_dT, splits,
+         paths) = _splitting._split_records(sides, plans, curves, N, Qmin,
+                                            tolQ)
+    else:
+        # exchangers in plan order (above first), with flow-order keys
+        recs, qmin_dropped = [], []
+        for name in ('above', 'below'):
+            if name not in plans:
                 continue
-            e = Exchanger()
-            e.side, e.hot, e.cold, e.Q = name, hot, cold, Q
-            if name == 'above':   # hot is the must (a0), cold the flex (b0)
-                e._kh, e._kc = (0, -a0), (1, b0)
-            else:                 # cold is the must (a0), hot the flex (b0)
-                e._kh, e._kc = (1, b0), (0, -a0)
-            recs.append(e)
-    # walk; a match violating the approach (a bug) is dropped (L1)
-    dropped = []
-    min_dT = math.inf
-    while True:
-        stages, utility = _walk(curves, recs, N)
-        worst = None
+            side = sides[name]
+            for i, j, a0, b0, Q in _merge(plans[name].pieces):
+                hot, cold = side.hot_cold(i, j)
+                if Q < Qmin:
+                    qmin_dropped.append((name, hot, cold, Q))
+                    continue
+                e = Exchanger()
+                e.side, e.hot, e.cold, e.Q = name, hot, cold, Q
+                if name == 'above':   # hot is the must (a0), cold the flex
+                    e._kh, e._kc = (0, -a0), (1, b0)
+                else:                 # cold is the must (a0), hot the flex
+                    e._kh, e._kc = (1, b0), (0, -a0)
+                recs.append(e)
+        # walk; a match violating the approach (a bug) is dropped (L1)
+        dropped = []
         min_dT = math.inf
-        for n, e in enumerate(recs):
-            v = _approach_violation(curves[e.hot], curves[e.cold], e)
-            min_dT = min(min_dT, v)
-            if v < -_APPROACH_TOL and (worst is None or v < worst[0]):
-                worst = (v, n)
-        if worst is None:
-            break
-        e = recs.pop(worst[1])
-        dropped.append((e.side, e.hot, e.cold, e.Q, worst[0]))
+        while True:
+            stages, utility = _walk(curves, recs, N)
+            worst = None
+            min_dT = math.inf
+            for n, e in enumerate(recs):
+                v = _approach_violation(curves[e.hot], curves[e.cold], e)
+                min_dT = min(min_dT, v)
+                if v < -_APPROACH_TOL and (worst is None or v < worst[0]):
+                    worst = (v, n)
+            if worst is None:
+                break
+            e = recs.pop(worst[1])
+            dropped.append((e.side, e.hot, e.cold, e.Q, worst[0]))
+        splits = []
+        paths = {j: list(s) for j, s in stages.items()}
     # round-off of the summed duties (pieces are exact to tolQ) is not a
     # negative utility
     utility = [0. if -10. * tolQ < u < 0. else u for u in utility]
@@ -2165,6 +2267,8 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
     plan.utility = utility
     plan.Q_hot, plan.Q_cold = Q_hot, Q_cold
     plan.penalty = max(0., penalty)
+    plan.splits = splits
+    plan.paths = paths
     side_info = {}
     for name, p in plans.items():
         side = sides[name]
@@ -2173,6 +2277,8 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
             units=p.units, M=side.M, F=side.F,
             gaps={side.musts[i].stream: g for i, g in enumerate(p.gaps)
                   if g > 0.})
+        if stream_splitting:
+            side_info[name]['split'] = p.split
     plan.info = dict(sides=side_info, qmin_dropped=qmin_dropped,
                      dropped=dropped,
                      min_approach=(dT + min_dT) if recs else None,
@@ -2192,9 +2298,11 @@ def _plan_numeric(streams, dTmin, knots=1, **kwargs):
 
     Returns a dict in the certificate format of the scratch oracle:
     ``matches`` (side, hot, cold, Q, T_hot_in, T_hot_out, T_cold_in,
-    T_cold_out, hot_seq, cold_seq, pair_index), ``hot_utility`` ({cold name:
-    Q}), ``cold_utility`` ({hot name: Q}), ``dTmin``, ``status``,
-    ``penalty``, ``targets`` (Qh, Qc), ``n_units`` and ``plan``.
+    T_cold_out, hot_seq, cold_seq, pair_index; with splits also hot_frac,
+    cold_frac, hot_branch and cold_branch, and branch temperatures),
+    ``hot_utility`` ({cold name: Q}), ``cold_utility`` ({hot name: Q}),
+    ``dTmin``, ``status``, ``penalty``, ``targets`` (Qh, Qc), ``n_units``
+    and ``plan``.
 
     Examples
     --------
@@ -2235,6 +2343,10 @@ def _plan_numeric(streams, dTmin, knots=1, **kwargs):
             T_cold_out=lo[c] + e.H_cold_out / cp[c],
             hot_seq=e.hot_seq, cold_seq=e.cold_seq,
             pair_index=e.pair_index))
+        if plan.splits:
+            matches[-1].update(hot_frac=e.hot_frac, cold_frac=e.cold_frac,
+                               hot_branch=e.hot_branch,
+                               cold_branch=e.cold_branch)
     hu = {names[j]: float(u) for j, u in enumerate(plan.utility)
           if not hot[j] and u > 0.}
     cu = {names[j]: float(u) for j, u in enumerate(plan.utility)

@@ -143,14 +143,27 @@ mixers; exchangers parallel at the minimum approach on sides with a curved
 stream; units + extra branches + split stages; the most mixers on one
 stream; the candidate order. Its signature holds no duty or position, so it
 identifies the same network across knot refinements and generators.
+
+Selection and records
+---------------------
+`_split_side` generates the candidates of a side from the pre-leaked root.
+The previous refine round's pick is tried first and kept if its signature
+is not excluded; otherwise the smallest key wins among the candidates not
+excluded (a side's last candidate is never excluded). Each must's gap is
+its pre-leak plus its leak, so the side's penalty is truthful.
+`_split_records` turns the side plans into the plan's records: every
+split stage becomes a `Split`, branch enthalpies are parent-equivalent (a
+branch exchanger moves its branch by ``Q/f``), a mix is written with the
+duties (``H_mix = H_split -/+ sum Q``), and a stream's flow order lists
+each split as one item (``Plan.paths``) or flattened (``Plan.stages``).
 """
 import math
 from collections import Counter, defaultdict, deque
 
 import numpy as np
 
-from ._planner import (_LevelCurve, _REL_Q, _Side, _THRESHOLD_TOL,
-                       _WORK_EVENT)
+from ._planner import (Exchanger, _APPROACH_TOL, _LevelCurve, _REL_Q,
+                       _Side, _SidePlan, _THRESHOLD_TOL, _WORK_EVENT, _merge)
 
 __all__ = ()
 
@@ -1346,3 +1359,376 @@ class _Candidate:
 
     def __repr__(self):
         return f'<_Candidate {self.name} key={self.key()}>'
+
+
+# %% Portfolio and selection
+
+def _excluded(split, side_name, cand):
+    """True if the network signature of `cand` is excluded on its side
+    (exclusion is by network, never by generator name)."""
+    return cand.signature in split['exclude'].get(side_name, ())
+
+
+def _side_plan(side, best, cands, reasons, a0, delta, errors, work, proof):
+    """The side plan of the chosen candidate `best`. Each must's gap is its
+    pre-leak plus its leak, so the penalty is truthful."""
+    gaps = [a0[i] + best.leak_by_must[i] for i in range(side.M)]
+    info = dict(best.meta, signature=best.signature, candidates=reasons,
+                preleak=delta, errors=errors)
+    return _SidePlan([], gaps, 'mer', 'split-' + best.name,
+                     work + math.fsum(c.work for c in cands), proof,
+                     cells=best.cells, split=info, units=best.units)
+
+
+def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
+    """
+    Split plan of a side that no unsplit network serves at MER.
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    d : _Residual
+        The search's analysis of the root, which triggered the split. The
+        core analyses the root again, exactly (`_preleak_root`).
+    proof : dict or None
+        The root proof, kept in the side plan (it says why the side
+        split), or None if the unsplit search left a penalty.
+    cap1 : bool
+        avoid_recycle: every pair in at most one exchanger.
+    forbid : collection[tuple[int, int]]
+        Pairs never used (avoid_recycle: those of the other side).
+    work_scale : float
+        Scale of the search budgets.
+    work : float
+        Work already spent on the side.
+    split : dict
+        ``Qmin`` (exchangers below it count as small in the key; none is
+        dropped), ``exclude`` (per side, excluded network signatures) and
+        ``prefer`` (per side, the candidate tried first).
+
+    Returns
+    -------
+    _SidePlan or None
+        A side plan with status 'mer', method ``'split-<candidate>'``, the
+        cells of the chosen candidate and the ``split`` info; None only if
+        no candidate exists: the root deficit exceeds `_preleak_max`, or
+        avoid_recycle's pairs left no block.
+
+    Notes
+    -----
+    The core starts from the pre-leaked root ``a0 = P(delta)`` (Lemma P).
+    The preferred candidate (the previous refine round's pick) is generated
+    first and taken as is unless its signature is excluded. Otherwise every
+    generator runs (the preferred one is not run again) and the smallest
+    `_Candidate.key` wins among the candidates not excluded or, if all are
+    excluded, among all of them: a side's last candidate is never excluded.
+    A generator that raises `_SplitInvariantError` is recorded in
+    ``errors`` and the others remain.
+    """
+    delta, a0 = _preleak_root(side)
+    core = delta <= _preleak_max(side)
+    prefer = split['prefer'].get(side.name)
+    cands, errors, reasons = [], [], {}
+
+    def generate(name):
+        try:
+            c = _drive(side, a0, name, cap1, forbid, work_scale,
+                       split['Qmin'])
+        except _SplitInvariantError as e:
+            errors.append(f'{name}: {e}')
+            reasons[name] = 'error'
+            return None
+        if c is None:
+            reasons[name] = 'forbidden pairs'
+            return None
+        c.excluded = _excluded(split, side.name, c)
+        reasons[name] = 'excluded' if c.excluded else c.key()
+        cands.append(c)
+        return c
+    if core and prefer in _CORE_STRATEGIES:
+        c = generate(prefer)
+        if c is not None and not c.excluded:
+            return _side_plan(side, c, cands, reasons, a0, delta, errors,
+                              work, proof)
+    if core:
+        for strategy in _CORE_STRATEGIES:
+            if strategy != prefer:
+                generate(strategy)
+    if not cands:
+        return None
+    live = [c for c in cands if not c.excluded] or cands
+    return _side_plan(side, min(live, key=_Candidate.key), cands, reasons,
+                      a0, delta, errors, work, proof)
+
+
+# %% Plan records
+
+class Split:
+    """
+    One split of a stream in a plan (`hensmith._planner.Plan.splits`): the
+    stream divides into parallel branches that re-join in a mixer.
+
+    Attributes
+    ----------
+    stream : int
+        The stream (index into the plan's streams).
+    side : {'above', 'below'}
+        The side of the pinch.
+    key : tuple
+        The planner's stage id, e.g. ``('B', block, local stream)``.
+    fractions : tuple[float]
+        Flow fraction of every branch; they sum to 1 within round-off.
+    branches : list[list[int]]
+        The exchangers of every branch (indices into ``Plan.exchangers``),
+        in flow order. A branch whose exchangers were all dropped by the
+        safety net (a bug) is empty: its flow bypasses.
+    H_split, H_mix : float
+        Stream enthalpies (the scale of the exchangers' enthalpies) where
+        the stream splits and where the branches re-join: ``H_mix = H_split
+        -/+ sum of the branch duties`` (hot/cold), so the fractions add no
+        round-off to the stream's heat balance.
+    isothermal : bool
+        Every branch ends within ``_ISO_TOL tolQ`` (parent-equivalent) of
+        ``H_mix``: the branches re-join at one temperature.
+    """
+    __slots__ = ('stream', 'side', 'key', 'fractions', 'branches',
+                 'H_split', 'H_mix', 'isothermal')
+
+    def __init__(self, stream, side, key, fractions, branches):
+        self.stream, self.side, self.key = stream, side, key
+        self.fractions, self.branches = fractions, branches
+        self.H_split = self.H_mix = math.nan
+        self.isothermal = None
+
+    def __repr__(self):
+        return (f'<Split stream={self.stream} {self.side} key={self.key} '
+                f'fractions=({", ".join(f"{f:.4g}" for f in self.fractions)})'
+                f' isothermal={self.isothermal}>')
+
+
+def _record(side, c):
+    """
+    The plan record of cell `c` of `side`. Its place on each stream,
+    ``(rank, role, stage key, start, end)`` in `_kh` and `_kc`, holds the
+    side's rank in that stream's flow (a hot stream runs above, then
+    below; a cold stream below, then above), the stream's role ('m' must,
+    'f' flex), its stage key (None on a trunk) and its parent range.
+    """
+    e = Exchanger()
+    e.side = side.name
+    e.hot, e.cold = side.hot_cold(c.i, c.j)
+    e.Q = c.x
+    must = ('m', c.km, c.a, c.a_end)
+    flex = ('f', c.kf, c.b, c.b_end)
+    if side.name == 'above':   # the hot stream is the must
+        e._kh, e._kc = (0,) + must, (1,) + flex
+        e.hot_frac, e.cold_frac = c.f, c.g
+    else:                      # the cold stream is the must
+        e._kh, e._kc = (1,) + flex, (0,) + must
+        e.hot_frac, e.cold_frac = c.g, c.f
+    return e
+
+
+def _paths(recs, N, ghosts=()):
+    """
+    Flow order of every stream from the records' places.
+
+    Per stream and side, the trunk records and the stages (one `Split`
+    each) occupy disjoint parent ranges, so one sort by the midpoint puts
+    them pinch outward; musts flow toward the pinch (the order reversed),
+    flexes away from it. Within a split, branches run in stage-key order,
+    each branch's records in flow order. `ghosts` (records dropped by the
+    safety net) keep their branches, empty, so the fractions still sum to
+    1. Sets the records' `hot_branch` and `cold_branch`.
+
+    Returns
+    -------
+    stages : dict[int, list[int]]
+        Flat flow order of every stream.
+    paths : dict[int, list[int or Split]]
+        Flow order with each split as one item.
+    splits : list[Split]
+        In stream order, then flow order.
+    """
+    trunks = defaultdict(list)   # stream -> [(order, record)]
+    stages_ = defaultdict(dict)  # stream -> {(rank, role, stage id, side):
+    #                               {branch: [fraction, [(lo, hi, Q, n)]]}}
+    for live, lst in ((True, recs), (False, ghosts)):
+        for n, e in enumerate(lst):
+            e.hot_branch = e.cold_branch = None
+            for j, (rank, role, key, lo, hi), f in (
+                    (e.hot, e._kh, e.hot_frac), (e.cold, e._kc, e.cold_frac)):
+                sg = -1. if role == 'm' else 1.
+                if key is None:
+                    if live:
+                        trunks[j].append(((rank, sg * (lo + hi), 0, n), n))
+                    continue
+                br = stages_[j].setdefault((rank, role, key[:-1], e.side), {})
+                br.setdefault(key[-1], [f, []])[1].append(
+                    (lo, hi, e.Q, n if live else None))
+    stages, paths, splits = {}, {}, []
+    for j in range(N):
+        items = list(trunks[j])
+        for k, ((rank, role, sid, side), br) in enumerate(
+                stages_[j].items()):
+            # the stage's parent range: a must splits at its far end and
+            # mixes toward the pinch, a flex splits at its start
+            members = [m for _, ms in br.values() for m in ms]
+            D = math.fsum(m[2] for m in members)
+            if role == 'm':
+                hi = max(m[1] for m in members)
+                mid, sg = 2. * hi - D, -1.
+            else:
+                mid, sg = 2. * min(m[0] for m in members) + D, 1.
+            branches, fr = [], []
+            for b in sorted(br):
+                f, ms = br[b]
+                ms.sort(key=lambda m: sg * (m[0] + m[1]))
+                branches.append([m[3] for m in ms if m[3] is not None])
+                fr.append(f)
+            items.append(((rank, sg * mid, 1, k),
+                          Split(j, side, sid, tuple(fr), branches)))
+        items.sort(key=lambda it: it[0])
+        path, flat = [], []
+        for _, item in items:
+            if isinstance(item, Split):
+                for b, ns in enumerate(item.branches):
+                    for n in ns:
+                        e = recs[n]
+                        if e.hot == j:
+                            e.hot_branch = (len(splits), b)
+                        else:
+                            e.cold_branch = (len(splits), b)
+                    flat += ns
+                splits.append(item)
+            else:
+                flat.append(item)
+            path.append(item)
+        stages[j], paths[j] = flat, path
+    return stages, paths, splits
+
+
+def _walk_paths(curves, recs, paths, N, tolQ):
+    """
+    Flow-order walk of a plan with splits (the split-aware `_walk`).
+
+    A trunk record moves the stream's enthalpy by its duty. A split
+    records ``H_split``, walks every branch from it by ``Q / f`` per record
+    (parent-equivalent enthalpies), sets ``H_mix = H_split -/+ sum Q`` and
+    whether the remix is isothermal. Fills the records' enthalpies and
+    1-based positions in the flat flow order; returns the utility of every
+    stream (at its outlet end).
+    """
+    utility = [0.] * N
+    for j in range(N):
+        c = curves[j]
+        if c is None:
+            continue
+        hot = c.hot
+        H = c.H_hi if hot else c.H_lo
+        pos = 0
+        for item in paths[j]:
+            if not isinstance(item, Split):
+                pos += 1
+                H = _step(recs[item], hot, H, 1., pos)
+                continue
+            item.H_split = H
+            ends = []
+            for f, ns in zip(item.fractions, item.branches):
+                Hb = H
+                for n in ns:
+                    pos += 1
+                    Hb = _step(recs[n], hot, Hb, f, pos)
+                ends.append(Hb)
+            D = math.fsum(recs[n].Q for ns in item.branches for n in ns)
+            H = H - D if hot else H + D
+            item.H_mix = H
+            item.isothermal = all(abs(x - H) <= _ISO_TOL * tolQ for x in ends)
+        utility[j] = H - c.H_lo if hot else c.H_hi - H
+    return utility
+
+
+def _step(e, hot, H, f, pos):
+    """Walk record `e` on its hot or cold stream from enthalpy `H` on a
+    branch of fraction `f`; returns the enthalpy after it."""
+    if hot:
+        e.H_hot_in = H
+        H = H - e.Q / f
+        e.H_hot_out = H
+        e.hot_seq = pos
+    else:
+        e.H_cold_in = H
+        H = H + e.Q / f
+        e.H_cold_out = H
+        e.cold_seq = pos
+    return H
+
+
+def _approach_violation_split(ch, cc, e):
+    """
+    Smallest ``T*_hot - T*_cold`` inside branch exchanger `e` (shifted
+    scale: >= 0 is feasible), like `_approach_violation`: duty ``t`` in
+    ``[0, Q]`` is at the parent-equivalent enthalpies ``H_hot_in -
+    t/hot_frac`` and ``H_cold_out - t/cold_frac``; a knot ``H`` of either
+    curve inside the exchanger at ``t = (H_hot_in - H) hot_frac`` or
+    ``(H_cold_out - H) cold_frac``.
+    """
+    Q, fh, fc = e.Q, e.hot_frac, e.cold_frac
+    hin, cout = e.H_hot_in, e.H_cold_out
+    Hh = ch.H[(ch.H > e.H_hot_out) & (ch.H < hin)]
+    Hc = cc.H[(cc.H > e.H_cold_in) & (cc.H < cout)]
+    t = np.concatenate(([0., Q], (hin - Hh) * fh, (cout - Hc) * fc))
+    return float((np.interp(hin - t / fh, ch.H, ch.T)
+                  - np.interp(cout - t / fc, cc.H, cc.T)).min())
+
+
+def _split_records(sides, plans, curves, N, Qmin, tolQ):
+    """
+    Plan records of a network with split sides (`plan_network`).
+
+    A side without cells converts its pieces as `plan_network` does,
+    including the `Qmin` filter; a split side's cells merge into its
+    exchangers (`_merge_cells`) and are never dropped for `Qmin`. The walk
+    (`_paths`, `_walk_paths`) and the safety net are those of
+    `plan_network` with fractions (`_approach_violation_split`); a record
+    the safety net drops (a bug) is reported in `dropped`.
+
+    Returns
+    -------
+    recs, qmin_dropped, dropped, stages, utility, min_dT, splits, paths
+        As in `plan_network`, plus the splits and the paths.
+    """
+    recs, qmin_dropped = [], []
+    for name in ('above', 'below'):
+        if name not in plans:
+            continue
+        side, p = sides[name], plans[name]
+        if p.cells:
+            cells = _merge_cells(p.cells, side.tolQ)
+        else:
+            cells = []
+            for i, j, a0, b0, Q in _merge(p.pieces):
+                if Q < Qmin:
+                    qmin_dropped.append((name, *side.hot_cold(i, j), Q))
+                    continue
+                cells.append(_Cell(i, j, Q, a0, b0))
+        recs += [_record(side, c) for c in cells]
+    dropped, ghosts = [], []
+    while True:
+        stages, paths, splits = _paths(recs, N, ghosts)
+        utility = _walk_paths(curves, recs, paths, N, tolQ)
+        worst = None
+        min_dT = math.inf
+        for n, e in enumerate(recs):
+            v = _approach_violation_split(curves[e.hot], curves[e.cold], e)
+            min_dT = min(min_dT, v)
+            if v < -_APPROACH_TOL and (worst is None or v < worst[0]):
+                worst = (v, n)
+        if worst is None:
+            break
+        e = recs.pop(worst[1])
+        ghosts.append(e)
+        dropped.append((e.side, e.hot, e.cold, e.Q, worst[0]))
+    return (recs, qmin_dropped, dropped, stages, utility, min_dT, splits,
+            paths)
