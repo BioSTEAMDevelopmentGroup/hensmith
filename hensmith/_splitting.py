@@ -82,6 +82,20 @@ level, far more than ``tolP``. An interval over which no must position
 changes in floating point carries no must heat; it is folded into the next
 one (or, at the end, into the previous one).
 
+Stage S (pinch splits)
+----------------------
+At a tight cut where the pinch rules fail (`_cut_sets`), each demand (a
+must leaving the cut outward, or a flex reaching it from below) needs its
+own capacity branch with ``CP_cap >= CP_dem``. `_cut_transport` splits the
+demands and capacities there by one of `_SPLIT_RULES`: demands whole,
+capacities whole, Linnhoff and Hindmarsh's minimum-cell structure, or the
+north-west corner with the CP slack spread uniformly or not at all. Its
+branches are whole-side branches, so by Lemma R the branched side keeps
+the cascade, and one `rules_violation` call at its pre-leaked root screens
+the split (`_pinch_split`); on a double pinch the same rule is applied at
+the cut that still fails. The branched side is an ordinary side for the
+planner's search.
+
 The core (the provable backstop)
 --------------------------------
 **Theorem V'.** Let a node satisfy (R) and let ``[t_s, t_e]`` be two
@@ -159,6 +173,7 @@ each split as one item (``Plan.paths``) or flattened (``Plan.stages``).
 """
 import math
 from collections import Counter, defaultdict, deque
+from itertools import accumulate, combinations
 
 import numpy as np
 
@@ -175,6 +190,11 @@ _SPLIT_MIX_CAP = 2           # mixers per curved stream and side (the key)
 _ISO_TOL = 10.               # isothermal remix, x tolQ
 _CORE_ORDER = ('V', 'LV', 'VT', 'LVT')   # candidate order of the core
 _CORE_STRATEGIES = ('V',)    # the core strategies `_drive` runs
+_SPLIT_RULES = ('partner', 'demand', 'mincell', 'nw-rho-desc', 'nw-rho-asc',
+                'nw-exact-desc', 'nw-exact-asc')   # Stage S, in order
+_SPLIT_CUTS = 3              # cuts per Stage S rule (double pinches)
+_MINCELL_WORK = 20000        # search nodes of one 'mincell' transport
+_CP_TOL = 1e-12              # CP compatibility, as in `rules_violation`
 
 
 # %% Cells and branch curves
@@ -1359,6 +1379,459 @@ class _Candidate:
 
     def __repr__(self):
         return f'<_Candidate {self.name} key={self.key()}>'
+
+
+# %% Stage S: cut transports and the branched side
+
+def _fits(c, m):
+    """True if a capacity of CP `c` can take a demand of CP `m`: the
+    compatibility of `_Side.rules_violation`, with its relative tolerance."""
+    return c >= m * (1. - _CP_TOL)
+
+
+def _cut_sets(side, a, b, L, cut, rule):
+    """
+    Demands and capacities of a pinch rule at a tight level.
+
+    It repeats `_Side.rules_violation`'s selection at the cut, on the
+    side's local indices. Outward, the demands are the musts that leave
+    level `L` outward and the capacities the flexes at `L`, with ``CP =
+    1/slope_right``; inward, the demands are the flexes that reach `L`
+    from below and the capacities the musts, with ``CP = 1/slope_left``.
+    Either way the rule is that each demand needs its own capacity branch
+    with ``CP_cap >= CP_dem``.
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    a, b : sequence[float]
+        The frontiers.
+    L : float
+        The level of the cut.
+    cut : {'+', '-'}
+        As in `_Side.tight_cuts`.
+    rule : {'outward', 'inward'}
+        The rule.
+
+    Returns
+    -------
+    dem, cap : list[tuple[int, float]]
+        ``(local index, CP)`` of the demands and of the sloped capacities,
+        in index order. A flat capacity is left out: its level curve is
+        split-invariant and it already has unlimited series capacity (a
+        cut with one violates no rule).
+    None
+        If a demand is flat: a flat demand accepts only a flat partner, so
+        no split serves it.
+    """
+    tolQ, tolP = side.tolQ, side.tolP
+    above = cut == '-'
+
+    def outward(curves, front):
+        out = []
+        for k, c in enumerate(curves):
+            if c.Q - front[k] <= tolQ or c.at(front[k]) > L + tolP:
+                continue
+            q = max(c.x_lt(L) if above else c.x_le(L), front[k])
+            if q < c.Q - tolQ:
+                out.append((k, c.slope_right(q)))
+        return out
+
+    def inward(curves, front):
+        out = []
+        for k, c in enumerate(curves):
+            if c.Q - front[k] <= tolQ or c.y[-1] < L - tolP:
+                continue
+            y = c.at(front[k])
+            if above:
+                if y >= L - tolP:
+                    continue
+                q = c.x_lt(L)
+            else:
+                if y > L + tolP:
+                    continue
+                q = c.x_le(L)
+            if q > front[k] + tolQ:
+                out.append((k, c.slope_left(q)))
+        return out
+    if rule == 'outward':
+        dem, cap = outward(side.musts, a), outward(side.flexes, b)
+    else:
+        dem, cap = inward(side.flexes, b), inward(side.musts, a)
+    if any(s == 0. for _, s in dem):
+        return None
+    return ([(k, 1. / s) for k, s in dem],
+            [(k, 1. / s) for k, s in cap if s > 0.])
+
+
+def _cut_transport(dem, cap, rule):
+    """
+    Branches that satisfy the pinch rule at a cut (design 2.3.2).
+
+    Parameters
+    ----------
+    dem, cap : sequence[tuple[object, float]]
+        ``(id, CP)`` of the demands and capacities (`_cut_sets`), CP > 0.
+    rule : str
+        One of `_SPLIT_RULES`:
+
+        * 'partner' (demands stay whole): a best-fit maximum matching,
+          demands by CP descending each taking the smallest free capacity
+          that fits (optimal, as the neighbourhoods are nested); each
+          unmatched demand then joins the capacity with the most room left,
+          if that is enough.
+        * 'demand' (capacities stay whole): the same matching; each
+          unmatched demand then takes the largest free capacities until
+          their CPs add up to its own, in proportion to them.
+        * 'mincell' (the minimum-cell structure, `_mincell`).
+        * 'nw-rho-desc', 'nw-rho-asc': the north-west corner, CP descending
+          (ascending), against the capacities scaled to ``c/rho``, ``rho =
+          sum c / sum m``: every cell has branch-CP ratio `rho`, the CP
+          slack spread uniformly.
+        * 'nw-exact-desc', 'nw-exact-asc': the north-west corner against
+          the capacities themselves; a capacity never reached stays out.
+
+    Returns
+    -------
+    list[tuple] or None
+        Cells ``(d, c, load)``: a branch of demand ``d`` of CP ``load``
+        faces a branch of capacity ``c``; a demand's loads add up to its CP
+        and a capacity's to at most its CP (`_cut_fractions` gives the
+        branch fractions). None if the rule finds no such branches, and
+        always if ``sum c < sum m`` (then none exist).
+    """
+    if not dem:
+        return []
+    if not _fits(math.fsum(c for _, c in cap), math.fsum(m for _, m in dem)):
+        return None
+    if rule in ('partner', 'demand'):
+        return _cut_match(dem, cap, rule == 'partner')
+    if rule == 'mincell':
+        return _mincell(dem, cap)
+    desc = rule.endswith('-desc')
+
+    def order(items):
+        return sorted(items, key=lambda t: -t[1] if desc else t[1])
+    return _north_west(order(dem), order(cap), rule.startswith('nw-rho'))
+
+
+def _cut_match(dem, cap, partner):
+    """The 'partner' (`partner`) and 'demand' rules of `_cut_transport`.
+    Ties go to the lower index."""
+    free = sorted(cap, key=lambda t: t[1])
+    cells, rest = [], []
+    for d, m in sorted(dem, key=lambda t: -t[1]):
+        n = next((n for n, (_, c) in enumerate(free) if _fits(c, m)), None)
+        if n is None:
+            rest.append((d, m))
+            continue
+        cells.append((d, free.pop(n)[0], m))
+    if partner:
+        room = dict(cap)
+        for d, k, m in cells:
+            room[k] -= m
+        for d, m in rest:
+            k = max(room, key=room.get)
+            if not _fits(room[k], m):
+                return None
+            room[k] -= m
+            cells.append((d, k, m))
+        return cells
+    free.sort(key=lambda t: -t[1])
+    for d, m in rest:
+        take, tot = [], 0.
+        while free and not _fits(tot, m):
+            take.append(free.pop(0))
+            tot += take[-1][1]
+        if not _fits(tot, m):
+            return None
+        cells += [(d, k, m * c / tot) for k, c in take]
+    return cells
+
+
+def _north_west(dem, cap, inflate):
+    """
+    North-west corner: the demands, in order, fill the capacities, in
+    order. With `inflate`, the capacities are scaled to ``c/rho`` (``rho =
+    sum c / sum m``) and end with the demands; otherwise a capacity never
+    reached stays out, whole. Each cell is the overlap of a demand and a
+    capacity interval on the prefix sums, so no subtraction chain carries
+    round-off; breakpoints within ``_SPLIT_ULP`` of the total coincide.
+    """
+    D = list(accumulate(m for _, m in dem))
+    C = list(accumulate(c for _, c in cap))
+    total = D[-1]
+    if inflate:
+        s = total / C[-1]
+        C = [x * s for x in C]
+        C[-1] = total
+    ulp = _SPLIT_ULP * total
+    cells, x, n, k = [], 0., 0, 0
+    while n < len(D) and k < len(C):
+        e = min(D[n], C[k])
+        if e - x > ulp:
+            cells.append((dem[n][0], cap[k][0], e - x))
+        x = max(x, e)
+        done_d, done_c = D[n] <= e + ulp, C[k] <= e + ulp
+        n += done_d
+        k += done_c
+    return cells
+
+
+def _merge_sets(n, k):
+    """Families of disjoint subsets of ``range(n)``, each of two or more,
+    with ``sum(|S| - 1) == k``; each family once, its sets in increasing
+    order."""
+    def rec(rem, avail, acc):
+        if rem == 0:
+            yield list(acc)
+            return
+        for size in range(rem + 1, 1, -1):
+            for S in combinations(avail, size):
+                if acc and S < acc[-1]:
+                    continue
+                yield from rec(rem - size + 1,
+                               [x for x in avail if x not in S], acc + [S])
+    return rec(k, list(range(n)), [])
+
+
+def _pack(ms, size, work):
+    """
+    Exact bin packing by branch and bound: the demands `ms` (CP
+    descending) into bins of CP `size`. The score, maximized, is (bins
+    used, the smallest bin CP over its load): more groups mean fewer cells,
+    and a larger ratio more CP slack. Capacity pruning, identical-bin
+    symmetry breaking and the bound (the bins still reachable, the current
+    smallest ratio: a load only grows); at most `_MINCELL_WORK` nodes in
+    all (`work`, shared). Returns ``(score, bin of every demand)`` or None.
+    """
+    n, nb = len(ms), len(size)
+    loads = [0.] * nb
+    assign = [0] * n
+    best = None
+
+    def rec(k, used):
+        nonlocal best
+        if work[0] >= _MINCELL_WORK:
+            return
+        work[0] += 1
+        ratio = min((size[t] / loads[t] for t in range(nb) if loads[t] > 0.),
+                    default=math.inf)
+        if k == n:
+            if best is None or (used, ratio) > best[0]:
+                best = ((used, ratio), list(assign))
+            return
+        if best is not None and (min(nb, used + n - k), ratio) <= best[0]:
+            return
+        m = ms[k]
+        seen = set()
+        for t in range(nb):
+            old = loads[t]
+            if (old, size[t]) in seen or not _fits(size[t], old + m):
+                continue
+            seen.add((old, size[t]))
+            loads[t] = old + m
+            assign[k] = t
+            rec(k + 1, used + (old == 0.))
+            loads[t] = old
+    rec(0, 0)
+    return best
+
+
+def _mincell(dem, cap):
+    """
+    The 'mincell' rule of `_cut_transport`: Linnhoff and Hindmarsh's
+    minimum-cell pinch design. For k = 0..3, disjoint sets of capacities
+    merge into super-bins with ``sum(|S| - 1) = k`` and the demands are
+    packed into the bins (`_pack`); the best packing at the smallest
+    feasible k gives the groups, and each group is served by the uniform-rho
+    north-west corner (CP descending). k = 0 is the number-rule fix (each
+    group has one capacity, the demands stay whole) and each unit of k one
+    demand split (the CP-rule fix). At the smallest feasible k every merged
+    set is used: a packing that left one empty would be feasible at a
+    smaller k, which was searched in full. Without a structure (or when the
+    work, `_MINCELL_WORK` nodes and families in all, runs out before one is
+    found) all of the cut is one group.
+    """
+    ms = sorted(dem, key=lambda t: -t[1])
+    work = [0]
+    best = None
+    for k in range(4):
+        for sets in _merge_sets(len(cap), k):
+            work[0] += 1
+            merged = {n for S in sets for n in S}
+            bins = sets + [(n,) for n in range(len(cap)) if n not in merged]
+            size = [math.fsum(cap[n][1] for n in S) for S in bins]
+            r = _pack([m for _, m in ms], size, work)
+            if r is not None and (best is None or r[0] > best[0]):
+                best = (r[0], bins, r[1])
+            if work[0] >= _MINCELL_WORK:
+                break
+        if best is not None or work[0] >= _MINCELL_WORK:
+            break
+    if best is None:
+        return _north_west(ms, sorted(cap, key=lambda t: -t[1]), True)
+    _, bins, assign = best
+    cells = []
+    for t in dict.fromkeys(assign):   # the groups, by their largest demand
+        group = [ms[n] for n in range(len(ms)) if assign[n] == t]
+        caps = sorted((cap[n] for n in bins[t]), key=lambda u: -u[1])
+        cells += _north_west(group, caps, True)
+    return cells
+
+
+def _cut_fractions(cells):
+    """
+    Branch fractions ``(f, g)`` of every cell of a cut transport: the
+    cell's load over the sum of the loads of its demand (capacity). A
+    demand's loads add up to its CP, so ``f = load / m``; a capacity is
+    split whole, with no bypass, so its branch has CP ``g c >= load``. An
+    item with one cell has fraction 1 (no split).
+    """
+    by_d, by_c = defaultdict(list), defaultdict(list)
+    for d, c, x in cells:
+        by_d[d].append(x)
+        by_c[c].append(x)
+    sd = {d: math.fsum(v) for d, v in by_d.items()}
+    sc = {c: math.fsum(v) for c, v in by_c.items()}
+    return [(x / sd[d], x / sc[c]) for d, c, x in cells]
+
+
+def _split_items(items, M, split):
+    """
+    The items (`_pinch_split`) after one cut: every item in `split`
+    (``(role, local index) -> branch fractions``) becomes branches of its
+    fraction times those. A branch below `_SPLIT_MIN_FRACTION` of its
+    parent merges into its largest sibling (MF9), and a parent left with
+    one branch is a trunk again. Keys are ``('S', parent, n)``, numbered per
+    parent in item order.
+    """
+    parent, frac = [], []
+    for n, (role, p, f, _) in enumerate(items):
+        for g in split.get((role, n if role == 'must' else n - M), (1.,)):
+            parent.append((role, p))
+            frac.append(f * g)
+    alive = [True] * len(frac)
+    siblings = defaultdict(list)
+    for n, rp in enumerate(parent):
+        siblings[rp].append(n)
+    for sib in siblings.values():
+        while len(sib) > 1:
+            s = min(sib, key=frac.__getitem__)
+            if frac[s] >= _SPLIT_MIN_FRACTION:
+                break
+            sib.remove(s)
+            frac[max(sib, key=frac.__getitem__)] += frac[s]
+            alive[s] = False
+    count = Counter(rp for rp, live in zip(parent, alive) if live)
+    seen = Counter()
+    out = []
+    for (role, p), f, live in zip(parent, frac, alive):
+        if not live:
+            continue
+        if count[role, p] == 1:
+            out.append((role, p, 1., None))
+            continue
+        out.append((role, p, f, ('S', p, seen[role, p])))
+        seen[role, p] += 1
+    return out
+
+
+def _branched_side(side, items, a0):
+    """
+    The side of `items` (`_pinch_split`), and its pre-leaked root: a must
+    branch of fraction ``f`` of parent ``i`` starts at branch heat ``f
+    a0_i`` (Lemma B), a flex branch at 0.
+    """
+    musts, flexes, a = [], [], []
+    for role, p, f, _ in items:
+        if role == 'must':
+            c = side.musts[p]
+            musts.append(c if f == 1. else _branch_curve(c, f, 'must'))
+            a.append(f * a0[p])
+        else:
+            c = side.flexes[p]
+            flexes.append(c if f == 1. else _branch_curve(c, f, 'flex'))
+    return _Side(side.name, musts, flexes, side.tolQ, side.tolP), a
+
+
+def _pinch_split(side, a0, proof, rule):
+    """
+    The branched side of one Stage S rule (design 2.3.3).
+
+    The rule's transport (`_cut_transport`) at the proof's cut splits the
+    demands and capacities there into whole-side branches. By Lemma R the
+    branched side keeps the parent's cascade, so one exact screen at its
+    pre-leaked root decides the split: its slack of (R) must be the
+    parent's, and `rules_violation` there checks the pinch rules at every
+    tight cut. If a cut still violates them (a double pinch), the same rule
+    is applied there, to the branches as items (a branch of a branch is a
+    branch of the parent with the product fraction), at most `_SPLIT_CUTS`
+    cuts in all.
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    a0 : sequence[float]
+        Its pre-leaked root (`_preleak_root`).
+    proof : dict
+        The root proof: an 'outward' or 'inward' violation.
+    rule : str
+        One of `_SPLIT_RULES`.
+
+    Returns
+    -------
+    items : list[tuple]
+        ``(role, parent, fraction, key)`` of every curve of the branched
+        side (`_branched_side`), the musts ('must') first, then the flexes
+        ('flex'). A trunk has fraction 1 and key None, a branch a fraction
+        of at least `_SPLIT_MIN_FRACTION` and key ``('S', parent, n)``.
+    extra : int
+        The extra branches, ``sum(branches - 1)`` over the split parents.
+    None
+        If the rule finds no transport at a cut, the split changes nothing,
+        or a violation is left after `_SPLIT_CUTS` cuts.
+
+    Raises
+    ------
+    _SplitInvariantError
+        If the slack of (R) at the branched root differs from the side's by
+        more than ``10 tolQ`` (Lemma R broken).
+    """
+    M, F = side.M, side.F
+    slack0 = side.analyse(list(a0), [0.] * F).slack
+    items = ([('must', i, 1., None) for i in range(M)]
+             + [('flex', j, 1., None) for j in range(F)])
+    bside, a, v = side, list(a0), proof
+    for _ in range(_SPLIT_CUTS):
+        sets = _cut_sets(bside, a, [0.] * bside.F, v['level'], v['cut'],
+                         v['rule'])
+        cells = None if sets is None else _cut_transport(*sets, rule)
+        if cells is None:
+            return None
+        dem, cap = ('must', 'flex') if v['rule'] == 'outward' else (
+            'flex', 'must')
+        split = defaultdict(list)
+        for (d, c, _), (f, g) in zip(cells, _cut_fractions(cells)):
+            split[dem, d].append(f)
+            split[cap, c].append(g)
+        new = _split_items(items, bside.M, split)
+        if new == items:
+            return None
+        items = new
+        bside, a = _branched_side(side, items, a0)
+        d = bside.analyse(a, [0.] * bside.F)
+        if abs(d.slack - slack0) > 10. * side.tolQ:
+            raise _SplitInvariantError(
+                f'S:{rule}: the branched root has slack {d.slack!r}, the '
+                f'side {slack0!r}')
+        v = bside.rules_violation(a, [0.] * bside.F, d)
+        if v is None:
+            return items, sum(n - 1 for n in Counter(
+                it[:2] for it in items).values())
+    return None
 
 
 # %% Portfolio and selection

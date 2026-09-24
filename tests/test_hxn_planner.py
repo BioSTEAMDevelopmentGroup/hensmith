@@ -23,6 +23,7 @@ from numpy.testing import assert_allclose
 
 from hensmith import _planner as P
 from hensmith import _splitting as SP
+from hxn_mer_cases import SPLIT as CORPUS_SPLIT, Q_UNITS, T_UNITS
 
 
 # %% Independent helpers
@@ -2091,3 +2092,290 @@ def test_fuzz_splitting_always_reaches_mer(monkeypatch):
                 (e.H_hot_in, e.H_cold_in) for e in off['plan'].exchangers]
             n_same += 1
     assert n_split >= 110 and n_same >= 150
+
+
+# %% 18. Stage S cut transports (hensmith._splitting)
+
+CUT_RULES = ('partner', 'demand', 'mincell', 'nw-rho-desc', 'nw-rho-asc',
+             'nw-exact-desc', 'nw-exact-asc')
+TWO_HOT_ONE_COLD = (10., [  # the number rule: two hot streams, one cold
+    ('H1', 'h', 200, 100, 1.), ('H2', 'h', 200, 100, 1.),
+    ('C1', 'c', 90, 190, 3.)])
+ONE_HOT_TWO_COLD = (10., [  # the CP rule: no cold stream is large enough
+    ('H1', 'h', 200, 100, 3.), ('C1', 'c', 90, 190, 2.),
+    ('C2', 'c', 90, 190, 2.)])
+TINY_BRANCH = (10., [  # the cold branch for H2 would carry 1e-4 of it
+    ('H1', 'h', 200, 100, 1.), ('H2', 'h', 200, 100, 1e-4),
+    ('C1', 'c', 90, 190, 3.)])
+
+
+def corpus_problem(name):
+    """(dT, rows) of a constant-CP corpus case (`hxn_mer_cases`), in K and
+    kW."""
+    case = next(c for c in CORPUS_SPLIT if c['name'] == name)
+    sc, off = T_UNITS[case['T_unit']]
+    kw = Q_UNITS[case['Q_unit']]
+    return case['dTmin'] * sc, [
+        (n, kind[0], (Ti + off) * sc, (To + off) * sc, cp * kw / sc)
+        for n, kind, Ti, To, cp in case['streams']]
+
+
+def root_of(dT, rows, name='above'):
+    """A side of a constant-CP problem, its pre-leaked root and its root
+    proof."""
+    side = sides_from(rows, dT)[name]
+    z_m, z_f = [0.] * side.M, [0.] * side.F
+    proof = side.rules_violation(z_m, z_f, side.analyse(z_m, z_f))
+    return side, SP._preleak_root(side)[1], proof
+
+
+def cut_sets(side, a0, proof):
+    return SP._cut_sets(side, a0, [0.] * side.F, proof['level'],
+                        proof['cut'], proof['rule'])
+
+
+def cps(curves):
+    """CP of every constant-CP curve."""
+    return [1. / P._slope1(c) for c in curves]
+
+
+def check_cut_transport(dem, cap, rule, cells):
+    """Independent check of the cells of a cut transport: every demand
+    served in full, no capacity loaded beyond its CP, fractions in (0, 1]
+    summing to 1 per item, branch CP ratio ``g c / (f m) >= 1`` in every
+    cell (uniform, ``rho = sum c / sum m``, for the rho rules), a forest,
+    and each rule's shape."""
+    m, c = dict(dem), dict(cap)
+    fr = SP._cut_fractions(cells)
+    assert len(fr) == len(cells)
+    for d in m:
+        loads = [x for k, _, x in cells if k == d]
+        assert loads and math.fsum(loads) == pytest.approx(m[d], rel=1e-12)
+    for k in c:
+        assert math.fsum(x for _, j, x in cells if j == k) <= c[k] * (
+            1. + 1e-12)
+    ratio = []
+    for (d, k, x), (f, g) in zip(cells, fr):
+        assert x > 0. and 0. < f <= 1. and 0. < g <= 1.
+        ratio.append(g * c[k] / (f * m[d]))
+    assert min(ratio) >= 1. - 1e-12
+    for role in (0, 1):
+        for item in {cell[role] for cell in cells}:
+            assert abs(math.fsum(f[role] for cell, f in zip(cells, fr)
+                                 if cell[role] == item) - 1.) <= 1e-12
+    assert is_forest([(d, k) for d, k, _ in cells])
+    if rule.startswith('nw-rho'):
+        rho = math.fsum(c.values()) / math.fsum(m.values())
+        assert_allclose(ratio, rho, rtol=1e-12)
+    if rule == 'partner':   # the demands stay whole
+        assert len(cells) == len(m)
+    if rule == 'demand':    # the capacities stay whole
+        assert len({k for _, k, _ in cells}) == len(cells)
+
+
+def check_items(side, a0, items, extra):
+    """The branched side of `items` keeps the cascade, satisfies the pinch
+    rules at its pre-leaked root, and its branches are well formed."""
+    bside, a = SP._branched_side(side, items, a0)
+    roles = [it[0] for it in items]
+    assert roles == sorted(roles, key=lambda r: r != 'must')
+    for curve, (role, p, f, _) in zip(bside.musts + bside.flexes, items):
+        parent = (side.musts if role == 'must' else side.flexes)[p]
+        assert curve.y == parent.y and curve.q == [f * q for q in parent.q]
+    assert a == [f * a0[p] for role, p, f, _ in items if role == 'must']
+    z = [0.] * bside.F
+    d = bside.analyse(a, z)
+    assert bside.rules_violation(a, z, d) is None
+    assert abs(d.slack - side.analyse(a0, [0.] * side.F).slack) <= (
+        10. * side.tolQ)
+    parents = {}
+    for role, p, f, key in items:
+        parents.setdefault((role, p), []).append((f, key))
+    assert sorted(parents) == sorted(
+        [('must', i) for i in range(side.M)]
+        + [('flex', j) for j in range(side.F)])
+    for (role, p), br in parents.items():
+        if len(br) == 1:
+            assert br == [(1., None)]
+            continue
+        assert abs(math.fsum(f for f, _ in br) - 1.) <= 1e-12
+        assert all(f >= SP._SPLIT_MIN_FRACTION for f, _ in br)
+        assert [k for _, k in br] == [('S', p, n) for n in range(len(br))]
+    assert extra == sum(len(br) - 1 for br in parents.values())
+    return bside
+
+
+@pytest.mark.parametrize('rule', CUT_RULES)
+def test_cut_transport_rules(rule):
+    assert SP._SPLIT_RULES == CUT_RULES
+    # the number rule (2h1c): the cold stream hosts both hot streams, +1
+    side, a0, proof = root_of(*TWO_HOT_ONE_COLD)
+    assert proof['rule'] == 'outward'
+    dem, cap = cut_sets(side, a0, proof)
+    assert [d for d, _ in dem] == [0, 1] and [k for k, _ in cap] == [0]
+    assert_allclose([m for _, m in dem] + [c for _, c in cap], [1., 1., 3.],
+                    rtol=1e-12)
+    out = SP._pinch_split(side, a0, proof, rule)
+    if rule == 'demand':   # the cold stream is matched: none is left
+        assert out is None and SP._cut_transport(dem, cap, rule) is None
+    else:
+        items, extra = out
+        check_items(side, a0, items, extra)
+        assert extra == 1
+        assert [it[:2] for it in items] == [
+            ('must', 0), ('must', 1), ('flex', 0), ('flex', 0)]
+        assert_allclose([it[2] for it in items[2:]], [.5, .5], rtol=1e-12)
+    # the CP rule (1h2c): the hot stream splits over both cold streams, +1
+    side, a0, proof = root_of(*ONE_HOT_TWO_COLD)
+    out = SP._pinch_split(side, a0, proof, rule)
+    if rule == 'partner':   # no cold stream has room for the hot one
+        assert out is None
+    else:
+        items, extra = out
+        check_items(side, a0, items, extra)
+        assert extra == 1 and [it[0] for it in items] == [
+            'must', 'must', 'flex', 'flex']
+        assert_allclose([it[2] for it in items[:2]],
+                        [2 / 3, 1 / 3] if rule.startswith('nw-exact')
+                        else [.5, .5], rtol=1e-12)
+    # zero CP slack (smith2005_ex18_4 below: the cold stream's CP 300 on
+    # the hot CPs 200 and 100): every branch has its partner's CP
+    side, a0, proof = root_of(*corpus_problem('smith2005_ex18_4_split'),
+                              name='below')
+    out = SP._pinch_split(side, a0, proof, rule)
+    if rule == 'partner':
+        assert out is None
+    else:
+        bside = check_items(side, a0, *out)
+        assert out[1] == 1
+        assert_allclose(sorted(cps(bside.flexes)), sorted(cps(bside.musts)),
+                        rtol=1e-12)
+    # cornell above: CP 40 and 30 on CP 60 and 20; no whole demand or
+    # capacity rule, and the minimum is 3 cells (k = 1: one super-bin)
+    side, a0, proof = root_of(
+        *corpus_problem('cornell_processdesign_four_stream_split'))
+    dem, cap = cut_sets(side, a0, proof)
+    assert_allclose([m for _, m in dem], [40., 30.], rtol=1e-12)
+    assert_allclose([c for _, c in cap], [60., 20.], rtol=1e-12)
+    cells = SP._cut_transport(dem, cap, rule)
+    if rule in ('partner', 'demand'):
+        assert cells is None
+    else:
+        check_cut_transport(dem, cap, rule, cells)
+        assert len(cells) == 3
+        if rule == 'mincell':
+            assert cells == SP._cut_transport(dem, cap, 'nw-rho-desc')
+    # random cut sets, on scales from 1e-3 to 1e3; half of them tight (the
+    # capacities scaled to the demands' CP sum, or up to 30 % above it)
+    rng = random.Random(CUT_RULES.index(rule))
+    grid = [.5, 1., 1.5, 2., 3., 4., 7.]
+
+    def cp(hi):
+        return rng.choice(grid) if rng.random() < .7 else rng.uniform(.1, hi)
+    n_ok = n_whole = 0
+    for _ in range(300):
+        s = rng.choice([1e-3, 1., 1e3])
+        dem = [(n, s * cp(5.)) for n in range(rng.randint(1, 4))]
+        cap = [(n, s * cp(8.)) for n in range(rng.randint(1, 4))]
+        if rng.random() < .5:
+            k = (math.fsum(m for _, m in dem) / math.fsum(c for _, c in cap)
+                 * rng.choice([1., rng.uniform(1., 1.3)]))
+            cap = [(n, c * k) for n, c in cap]
+        cells = SP._cut_transport(dem, cap, rule)
+        if math.fsum(c for _, c in cap) < math.fsum(m for _, m in dem) * (
+                1. - 1e-12):
+            assert cells is None
+            continue
+        if rule not in ('partner', 'demand'):   # these never fail then
+            assert cells is not None
+        if cells is not None:
+            check_cut_transport(dem, cap, rule, cells)
+            n_ok += 1
+        # the matching is maximum: where the rule holds whole, the number
+        # and CP rules and mincell split nothing
+        if rule in ('partner', 'demand', 'mincell') and _matching(
+                [m for _, m in dem], [c for _, c in cap],
+                lambda m, c: c >= m * (1. - 1e-12)):
+            assert len(cells) == len(dem) == len({k for _, k, _ in cells})
+            n_whole += 1
+    assert n_ok >= 100 and (n_whole >= 40 or rule.startswith('nw-'))
+
+
+def test_mincell_prefers_fewer_cells():
+    # k = 0 packs the demands whole: CP 2 and 1 into CP 3 and 1, 2 cells
+    dem, cap = [(0, 2.), (1, 1.)], [(0, 3.), (1, 1.)]
+    cells = SP._cut_transport(dem, cap, 'mincell')
+    check_cut_transport(dem, cap, 'mincell', cells)
+    assert sorted((d, k) for d, k, _ in cells) == [(0, 0), (1, 1)]
+    assert len(SP._cut_transport(dem, cap, 'nw-rho-desc')) == 3
+    # CP 1.2 bins hold one demand each: only k = 4 packs all six, so the
+    # rule falls back to one group
+    dem = [(n, 1.) for n in range(6)]
+    cap = [(n, 1.2) for n in range(5)]
+    assert SP._cut_transport(dem, cap, 'mincell') == SP._cut_transport(
+        dem, cap, 'nw-rho-desc')
+
+
+def test_pinch_split_screens_the_branched_root(monkeypatch):
+    # a branch below _SPLIT_MIN_FRACTION merges into its sibling, which
+    # undoes the split: the rule fails
+    side, a0, proof = root_of(*TINY_BRANCH)
+    assert SP._pinch_split(side, a0, proof, 'partner') is None
+    with monkeypatch.context() as mp:
+        mp.setattr(SP, '_SPLIT_MIN_FRACTION', 0.)
+        items, extra = SP._pinch_split(side, a0, proof, 'partner')
+        assert extra == 1 and min(it[2] for it in items) < 1e-3
+    # a cut with a flat demand: splitting cannot serve it
+    flat = P._LevelCurve([0., 5., 10.], [100., 100., 120.], 0)
+    slope = P._LevelCurve([0., 10.], [100., 110.], 1)
+    fs = P._Side('above', [flat, slope], [slope], 1e-9, 1e-9)
+    assert SP._cut_sets(fs, [0., 0.], [0.], 100., '-', 'outward') is None
+    # Lemma R broken (a branch that is not the scaled parent): raises
+    side, a0, proof = root_of(*TWO_HOT_ONE_COLD)
+    branch = SP._branch_curve
+    monkeypatch.setattr(SP, '_branch_curve', lambda c, f, role='must': (
+        branch(c, .5 * f, role)))
+    with pytest.raises(SP._SplitInvariantError):
+        SP._pinch_split(side, a0, proof, 'partner')
+
+
+def test_pinch_split_on_the_corpus(monkeypatch):
+    """Every constant-CP SPLIT side with a rules proof: the branched side of
+    every rule that succeeds keeps the cascade and satisfies the pinch rules
+    at its pre-leaked root, and some rule succeeds. On a double pinch a
+    split can move the violation to the other tight cut."""
+    n_sides = 0
+    for case in CORPUS_SPLIT:
+        if case['kind'] != 'constant_cp':
+            continue
+        dT, rows = corpus_problem(case['name'])
+        for name, side in sides_from(rows, dT).items():
+            z_m, z_f = [0.] * side.M, [0.] * side.F
+            proof = side.rules_violation(z_m, z_f, side.analyse(z_m, z_f))
+            if proof is None:
+                continue
+            a0 = SP._preleak_root(side)[1]
+            ok = []
+            for rule in CUT_RULES:
+                out = SP._pinch_split(side, a0, proof, rule)
+                if out is not None:
+                    check_items(side, a0, *out)
+                    ok.append(rule)
+            assert ok, (case['name'], name)
+            n_sides += 1
+    assert n_sides == 32
+    # nptel_t5_3 below: the outward split at the pinch breaks the inward
+    # rule at the second tight cut, and the rho rules and mincell never
+    # satisfy both; nw-exact-desc does at once, nw-exact-asc in three cuts
+    side, a0, proof = root_of(
+        *corpus_problem('nptel_t5_3_four_stream_split'), name='below')
+    assert [rule for rule in CUT_RULES if SP._pinch_split(
+        side, a0, proof, rule) is not None] == [
+            'nw-exact-desc', 'nw-exact-asc']
+    # the same with CP2 = 6 - 1.58e-11: the pre-leaked root is branched too
+    side, a0, proof = root_of(*NEAR_DOUBLE_PINCH, name='below')
+    assert max(a0) > 0. and proof['rule'] == 'outward'
+    check_items(side, a0, *SP._pinch_split(side, a0, proof, 'nw-exact-asc'))
+    monkeypatch.setattr(SP, '_SPLIT_CUTS', 2)
+    assert SP._pinch_split(side, a0, proof, 'nw-exact-asc') is None
+    assert SP._pinch_split(side, a0, proof, 'nw-exact-desc')[1] == 2
