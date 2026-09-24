@@ -50,35 +50,46 @@ before synthesis, so the network's IDs neither collide with the original
 flowsheet's nor accumulate across repeated simulations.
 
 ``HXN.HXN_sys`` is the ``bst.System`` built from the synthesized units. It is
-constructed from a network of those units and named after the flowsheet,
-``sys_HXN``, in whose system registry it is registered -- so
-``HXN.HXN_flowsheet.system.sys_HXN`` resolves to it, just as the exchangers
-resolve through ``HXN.HXN_flowsheet.unit``. It is an ordinary ``System``
-holding the nine units listed on the third line. They are listed in the order the system
-simulates them, which is derived from the rewired stream connections rather
-than from the order synthesis created them: a hot-side exchanger is synthesized
-before the cold-side exchangers that feed it, so synthesis order would leave it
-with stale inlets. Recycle loops in the network are converged by the system's
-own fixed-point solver.
+named after the flowsheet, ``sys_HXN``, in whose system registry it is
+registered -- so ``HXN.HXN_flowsheet.system.sys_HXN`` resolves to it, just as
+the exchangers resolve through ``HXN.HXN_flowsheet.unit``. It is an ordinary
+``System`` holding the nine units listed on the third line. They are listed in
+the order the system simulates them, which follows the streams: after
+synthesis every stream's stages are rewired in series, each stage feeding the
+next, and the path is a topological order of those connections, ties broken
+by the order in which the synthesis returned the exchangers -- the process
+exchangers in plan order, then the utility exchangers, hot streams first.
+``HX_0_2_hs`` therefore runs first: it is the first stage of both of its
+streams, while ``HX_1_2_hs`` has to wait for stream 2 to leave it. Where the
+stages of a network form a loop -- a pair of streams matched on both sides of
+the pinch, or two streams matched repeatedly in alternation -- the loop is
+torn at a recycle stream and converged by the system's own fixed-point
+solver.
 
 The IDs carry the whole topology. A process exchanger is an ``HXprocess`` named
-``HX_<cold>_<hot>_hs`` when the match was made in the hot-side pass and
-``HX_<hot>_<cold>_cs`` when it was made in the cold-side pass -- note that the
-two orders differ: a cold-side exchanger names its hot stream first, a hot-side
-one its cold stream first. A utility
-exchanger is an ``HXutility`` named ``Util_<index>_hs`` for a cold stream,
-which is finished by a hot utility above the pinch, and ``Util_<index>_cs`` for
-a hot stream, which is finished by a cold utility below it. The indices are
-stream indices: positions in the rearranged utility list of
+``HX_<cold>_<hot>_hs`` when it lies above the pinch, in the hot-side design, and
+``HX_<hot>_<cold>_cs`` when it lies below the pinch, in the cold-side design --
+note that the two orders differ: a cold-side exchanger names its hot stream
+first, a hot-side one its cold stream first, and in both the first number is
+the stream at port 0. When the same two streams are matched more than once on
+the same side, the second and later exchangers carry a suffix, ``_2``,
+``_3``, ..., in the order the hot stream meets them (``HX_3_2_cs_2``, say). A
+utility exchanger is an ``HXutility`` named ``Util_<index>_hs`` for a cold
+stream, which is finished by a hot utility above the pinch, and
+``Util_<index>_cs`` for a hot stream, which is finished by a cold utility below
+it. The indices are stream indices: positions in the rearranged utility list of
 :func:`~hensmith.synthesize_network`, cold streams first and then hot ones, as
 described in :doc:`02_pinch_analysis`. The stream copies are named after the
 exchanger they touch, ``s_<index>__<exchanger>`` on the way in and
 ``<exchanger>__s_<index>`` on the way out.
 
-All four process exchangers of this network end in ``_hs``: every match was
-made in the hot-side pass, which is the same fact as the pinch diagram of
+All four process exchangers of this network end in ``_hs``: every match lies
+above the pinch, which is the same fact as the pinch diagram of
 :doc:`01_quickstart` showing all four connectors to the right of the pinch
-line.
+line. Below the pinch there is nothing to design: no cold stream needs heat
+there (stream 1 enters exactly at the pinch temperature and stream 0 above
+it, as the pinch temperatures below show), so the only stream below it, hot
+stream 2, is finished by its cooler.
 
 .. code-block:: python
 
@@ -87,7 +98,7 @@ line.
 .. figure:: /_static/images/examples/tutorial_03_hxn_flowsheet_light.png
    :figclass: only-light
    :width: 720
-   :alt: Flowsheet of the synthesized quickstart network: nine units, the four process heat exchangers HX_1_4_hs, HX_0_2_hs, HX_1_2_hs and HX_1_3_hs drawn as two-inlet nodes feeding the utility exchangers Util_0_hs and Util_1_hs (heating), Util_2_cs (cooling), and the grey zero-duty nodes Util_3_cs and Util_4_cs.
+   :alt: Flowsheet of the synthesized quickstart network: nine units, the four process heat exchangers HX_0_2_hs, HX_1_2_hs, HX_1_4_hs and HX_1_3_hs drawn as two-inlet nodes in a chain feeding the utility exchangers Util_0_hs and Util_1_hs (heating), Util_2_cs (cooling), and the grey zero-duty nodes Util_3_cs and Util_4_cs.
 
    The synthesized network as its own flowsheet, ``sys_HXN``. The four
    two-inlet nodes are the process exchangers; each takes one cold and one hot
@@ -97,13 +108,13 @@ line.
    drawn grey because they carry no utility at all -- their inlet and outlet
    enthalpies are equal, 2.47e+06 and 7.18e+05 kJ/hr, so streams 3 and 4 are
    brought to their outlet states by process heat exchange alone. The stream
-   names show the wiring: ``s_1__HX_1_4_hs`` enters ``HX_1_4_hs`` carrying
-   stream 1, and ``HX_1_4_hs__s_1`` leaves it and enters ``HX_1_2_hs``.
+   names show the wiring: ``s_1__HX_1_2_hs`` enters ``HX_1_2_hs`` carrying
+   stream 1, and ``HX_1_2_hs__s_1`` leaves it and enters ``HX_1_4_hs``.
 
 .. figure:: /_static/images/examples/tutorial_03_hxn_flowsheet_dark.png
    :figclass: only-dark
    :width: 720
-   :alt: Flowsheet of the synthesized quickstart network: nine units, the four process heat exchangers HX_1_4_hs, HX_0_2_hs, HX_1_2_hs and HX_1_3_hs drawn as two-inlet nodes feeding the utility exchangers Util_0_hs and Util_1_hs (heating), Util_2_cs (cooling), and the grey zero-duty nodes Util_3_cs and Util_4_cs.
+   :alt: Flowsheet of the synthesized quickstart network: nine units, the four process heat exchangers HX_0_2_hs, HX_1_2_hs, HX_1_4_hs and HX_1_3_hs drawn as two-inlet nodes in a chain feeding the utility exchangers Util_0_hs and Util_1_hs (heating), Util_2_cs (cooling), and the grey zero-duty nodes Util_3_cs and Util_4_cs.
 
    The synthesized network as its own flowsheet, ``sys_HXN``. The four
    two-inlet nodes are the process exchangers; each takes one cold and one hot
@@ -113,8 +124,8 @@ line.
    drawn grey because they carry no utility at all -- their inlet and outlet
    enthalpies are equal, 2.47e+06 and 7.18e+05 kJ/hr, so streams 3 and 4 are
    brought to their outlet states by process heat exchange alone. The stream
-   names show the wiring: ``s_1__HX_1_4_hs`` enters ``HX_1_4_hs`` carrying
-   stream 1, and ``HX_1_4_hs__s_1`` leaves it and enters ``HX_1_2_hs``.
+   names show the wiring: ``s_1__HX_1_2_hs`` enters ``HX_1_2_hs`` carrying
+   stream 1, and ``HX_1_2_hs__s_1`` leaves it and enters ``HX_1_4_hs``.
 
 Stream life cycles
 ------------------
@@ -136,18 +147,26 @@ The facility builds one per stream after synthesis, aligned with
 
 A life cycle has the attributes ``index``, the stream's index; ``name``,
 ``s_<index>``; ``cold``, ``True`` for a heated stream and ``False`` for a cooled
-one; and ``life_cycle``, the list of stages. It is recovered from IDs alone --
-the exchangers whose ID contains ``_<index>_``, keeping those whose inlet at the
-matching position has an ID containing ``s_<index>_``. The
-stages are then sorted by inlet enthalpy, ascending for a cold stream and
-descending for a hot one, which is flow direction in both cases since a cold
-stream gains enthalpy as it goes and a hot stream loses it.
+one; and ``life_cycle``, the list of stages. It is recovered from IDs alone:
+each exchanger ID is parsed -- ``HX_<a>_<b>_<hs|cs>``, with an optional
+``_<n>`` suffix, or ``Util_<a>_<hs|cs>`` -- the first number being the stream
+at port 0 and the second the stream at port 1, so a stream index is matched
+exactly and never as a substring of another index. The stages are then sorted
+by inlet enthalpy, ascending for a cold stream and descending for a hot one,
+which is flow direction in both cases since a cold stream gains enthalpy as it
+goes and a hot stream loses it (ties, which only stages without duty can
+produce, put the stream's first side of the pinch first and its utility
+last).
 
-Read stream 1, the longest life cycle here: it passes ``HX_1_4_hs``,
-``HX_1_2_hs`` and ``HX_1_3_hs`` and then its utility exchanger ``Util_1_hs``,
-its enthalpy rising 0, 3.34e+04, 5.06e+06, 2.3e+07 and finally 2.79e+08 kJ/hr.
-Stream 2 runs the other way, 4.52e+07 to 8.12e+06 to 3.1e+06 kJ/hr through two
-process exchangers and then to 1.14e+06 kJ/hr through ``Util_2_cs``. Each
+Read stream 1, the longest life cycle here: it passes ``HX_1_2_hs``,
+``HX_1_4_hs`` and ``HX_1_3_hs`` and then its utility exchanger ``Util_1_hs``,
+its enthalpy rising 0, 5.05e+06, 5.08e+06, 2.3e+07 and finally 2.79e+08 kJ/hr.
+Its first exchanger is the match the pinch design method asks for: stream 1
+enters exactly at the pinch temperature, and ``HX_1_2_hs`` pairs it there with
+stream 2, the only hot stream that reaches the pinch, from which the planner
+builds the hot-side design outward. Stream 2 runs the other way, 4.52e+07 to
+8.12e+06 to 3.07e+06 kJ/hr through two process exchangers and then to
+1.14e+06 kJ/hr through ``Util_2_cs``. Each
 stage's outlet enthalpy is the next stage's inlet enthalpy because the facility
 rewires the units after synthesis, making each stage's outlet stream the inlet
 of the following stage. Streams 3 and 4 end on a stage whose inlet and outlet
@@ -173,7 +192,7 @@ process exchanger is constructed with its cold stream first. ``s_in`` and
 ``s_out`` are ``unit.ins[index]`` and ``unit.outs[index]``, and ``H_in`` and
 ``H_out`` are their enthalpies, so a life cycle always reflects the current
 state of the network rather than a snapshot taken at synthesis. This stage
-takes stream 1 from 0 to 3.338e+04 kJ/hr.
+takes stream 1 from 0 to 5.051e+06 kJ/hr.
 
 Per-stream pinch temperatures
 -----------------------------
@@ -182,8 +201,11 @@ The pinch analysis produces three arrays indexed like the life cycles, which
 the facility stores as ``HXN.inlet_Ts``, ``HXN.outlet_Ts`` and
 ``HXN.pinch_Ts``. The first two are each stream's inlet temperature and its
 quenched outlet temperature (:doc:`02_pinch_analysis`). The third is the
-temperature at which a stream is handed from the cold-side design to the
-hot-side design -- the point at which the synthesizer splits it in two.
+temperature at which a stream crosses the process pinch on its own scale,
+where it passes from the cold-side design into the hot-side design. It is
+reported for information: the synthesizer cuts every stream at the pinch on
+the stream's temperature-enthalpy curve itself, and ``pinch_Ts`` summarizes
+where that cut lies.
 
 .. literalinclude:: /../_demo_src/examples/ch03_network_anatomy.py
    :language: python
@@ -199,16 +221,16 @@ The process pinch of this system is a single shifted temperature, 298.15 K
 streams and, ``T_min_app`` higher, 30.0 °C for hot streams. Each stream is then
 classified against the pinch temperature of its own kind.
 
-- A stream that reaches the pinch is split there, and its ``pinch_T`` is the
+- A stream that reaches the pinch is cut there, and its ``pinch_T`` is the
   pinch temperature of its kind. Stream 2 crosses it, 98.2 to 26.8 °C, and
-  stream 1 enters exactly at it, 25.0 °C; they are split at 30.0 and 25.0 °C
+  stream 1 enters exactly at it, 25.0 °C; they are cut at 30.0 and 25.0 °C
   respectively.
 - A stream whose outlet stops short of the pinch never reaches it, and its
   ``pinch_T`` is its own *outlet* temperature: it lies wholly on one side, and
-  the split is a formality at its far end. Streams 3 and 4 are hot streams that
+  the cut is a formality at its far end. Streams 3 and 4 are hot streams that
   cool only to 64.9 and 64.8 °C, far above the 30.0 °C hot-stream pinch, and
   those outlet temperatures are exactly what ``pinch_Ts`` reports for them.
-- A stream whose *inlet* is already past the pinch is likewise not split, and
+- A stream whose *inlet* is already past the pinch is likewise not cut, and
   its ``pinch_T`` is its inlet temperature. Stream 0 is a cold stream entering
   at 33.2 °C, above the 25.0 °C cold-stream pinch, so its ``pinch_T`` is
   33.2 °C.
@@ -216,9 +238,12 @@ classified against the pinch temperature of its own kind.
 That last clause also catches isothermal and non-monotone streams -- a stream
 whose outlet lies on the wrong side of its inlet for the sign of its duty, such
 as a cold stream whose equilibrium outlet ends up cooler than it entered.
-Rather than spread a point load across the cascade, these get
-``pinch_T = T_in`` too, which assigns the whole of their duty to a single side
-of the design: the hot side for a cold stream, the cold side for a hot one.
+These get ``pinch_T = T_in`` too, but only as a label. The synthesis treats
+them as the problem table does, as a point load: their whole duty sits at their
+outlet temperature, on whichever side of the pinch that temperature lies (and,
+exactly at the pinch, on the side the problem table's cascade assigns the
+point loads there), and such a stream enters its first process exchanger in
+the equilibrium state at its inlet enthalpy.
 
 Reading the pinch diagram
 -------------------------
@@ -273,19 +298,20 @@ diagram:
    the ``Cold side`` and ``Hot side`` captions. The columns read off the life
    cycles above: stream 1 enters at 25.0 °C with 0.00E0 kJ/hr and leaves at
    95.9 °C with 2.79E8 kJ/hr, and the first connector it meets carries the
-   3.34E4 kJ/hr of its first stage. The four duties are the same four as in
+   5.05E6 kJ/hr of its first stage. The four duties are the same four as in
    :doc:`01_quickstart`.
 
 Exchanger columns are ordered independently on each side of the pinch, by
 ``_order_exchanger_columns``. Every stream's stage order is a chain of
 precedence constraints between the exchangers it meets -- reversed for hot
 streams, which are drawn right to left -- and a topological sort of that graph
-(Kahn's algorithm, ties broken by the order the exchangers were synthesized in)
-lays them out so that every stream meets its exchangers in flow direction. That
-is why stream 1 reads its three connectors left to right in exactly the order
-of its life cycle. Constraints that contradict each other, which would require
-some stream to flow backwards, cannot be satisfied by any ordering; the
-synthesis order is then used unchanged.
+(Kahn's algorithm, ties broken by the order in which the synthesis returned the
+exchangers, the plan order from the pinch outward) lays them out so that every
+stream meets its exchangers in flow direction. That is why stream 1 reads its
+three connectors left to right in exactly the order of its life cycle.
+Constraints that contradict each other, which would require some stream to
+flow backwards, cannot be satisfied by any ordering; the given order is then
+used unchanged.
 
 Energy balance and cost accounting
 ----------------------------------
@@ -322,13 +348,13 @@ is set to ``True``.
 The costs are differences, clipped at zero. ``original_purchase_costs`` is the
 purchase cost of each *original* exchanger, one entry per stream, 3.365e+05 USD
 in total here; ``new_purchase_costs_HXp`` and ``new_purchase_costs_HXu`` are
-the same for the synthesized process and utility exchangers, 4.73e+05 and
-2.096e+05 USD. The facility's own ``purchase_costs['Heat exchangers']`` -- and
+the same for the synthesized process and utility exchangers, 4.734e+05 and
+2.095e+05 USD. The facility's own ``purchase_costs['Heat exchangers']`` -- and
 its identical ``baseline_purchase_costs`` entry -- is ``max(0, new - original)``
-over those three sums, 4.73e+05 + 2.096e+05 - 3.365e+05 = 3.461e+05 USD. Its
+over those three sums, 4.734e+05 + 2.095e+05 - 3.365e+05 = 3.464e+05 USD. Its
 ``installed_costs['Heat exchangers']`` is formed exactly the same way from the
 installed costs of the same exchangers rather than their purchase costs, and
-is the larger figure here, 1.114e+06 USD. Clipping at zero means a network
+is the larger figure here, 1.112e+06 USD. Clipping at zero means a network
 whose exchangers happen to be cheaper than the ones they replace is reported as
 adding nothing rather than as a capital credit; and if the synthesis produced
 no process exchangers at all, both entries are set to zero and the facility
@@ -339,11 +365,11 @@ original heat utilities summed by agent -- reversed in sign, since they are the
 very objects that were negated to form the difference -- and
 ``new_utility_costs`` holds the new utility exchangers' utilities summed by
 agent. ``HXN.heat_utilities`` is the sum of the two, that is new - original,
-which is why every cost printed above is negative: -388.6 USD/hr of low
-pressure steam, -210.6 USD/hr of chilled water and -5.976 USD/hr of cooling
+which is why every cost printed above is negative: -388.8 USD/hr of low
+pressure steam, -210.7 USD/hr of chilled water and -5.976 USD/hr of cooling
 water are savings. The duties carry the sign convention of their agent, so the
-steam duty is negative, -6.321e+07 kJ/hr, while the chilled and cooling water
-duties are positive, 4.212e+07 and 1.794e+07 kJ/hr, because cooling duties are
+steam duty is negative, -6.324e+07 kJ/hr, while the chilled and cooling water
+duties are positive, 4.214e+07 and 1.794e+07 kJ/hr, because cooling duties are
 negative to begin with and a positive difference again means less of them.
 Setting ``replace_unit_heat_utilities=True`` moves this reporting onto the
 process units instead, as :doc:`04_configuring` describes.
@@ -353,6 +379,6 @@ Where to next
 
 - :doc:`04_configuring` -- the constructor options of the facility, what
   ``T_min_app`` and ``ignored`` change, and a ten-stream network.
-- :doc:`../concepts` -- the pinch concepts, the synthesis heuristics, and what
+- :doc:`../concepts` -- the pinch concepts, the MER planner, and what
   a synthesized network is and is not guaranteed to be.
 - :doc:`../API/api` -- the full API reference.

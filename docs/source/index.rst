@@ -38,8 +38,10 @@ hensmith (**H**\ eat **E**\ xchanger **N**\ etwork **S**\ ynthesis,
 is the automated heat exchanger network synthesis facility for BioSTEAM
 systems: :class:`HeatExchangerNetwork` is a BioSTEAM ``Facility`` that
 performs a pinch analysis on every heating and cooling utility in a system,
-synthesizes a network of process exchangers, and reports the utility savings
-and added capital cost as part of the system's techno-economic analysis.
+synthesizes a network of process exchangers that reaches the minimum energy
+requirement (MER) whenever it finds one without stream splits, and reports the
+utility savings and added capital cost as part of the system's
+techno-economic analysis.
 Watch it run in the `Quickstart`_ demo below.
 
 Quickstart
@@ -49,8 +51,9 @@ The canonical example is a small methanol/water system: a shortcut
 distillation column whose condenser and reboiler are auxiliary exchangers, a
 cooler on each of the column's two products, and a flash whose feed is heated
 by its own auxiliary exchanger. Adding a :class:`HeatExchangerNetwork` to that
-system cuts its heating utility by 17.5 % and its cooling utility by 96.8 %
-with 4 process exchangers, and the network's installed cost joins the
+system cuts its heating utility by 17.5 % and its cooling utility by 96.9 %
+with 4 process exchangers -- a network at the MER targets of its pinch
+analysis -- and the network's installed cost joins the
 system's techno-economic analysis like any other unit's. The interactive demo
 below runs it end to end: build the flowsheet, add the network, simulate, and
 inspect the synthesized exchangers and the pinch diagram.
@@ -114,7 +117,7 @@ how to configure the network for a larger system.
           :class: only-light
           :align: center
 
-       Pinch analysis and the synthesis heuristics
+       Pinch analysis and MER network synthesis
 
 
     .. grid-item-card:: API Reference

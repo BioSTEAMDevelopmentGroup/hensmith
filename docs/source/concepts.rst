@@ -8,8 +8,10 @@ temperature is, how the problem table turns a set of process streams into
 utility targets and a pinch, how :func:`~hensmith.synthesize_network` turns
 those targets into a network of exchangers, and what the result is and is not
 guaranteed to be. Everything below describes the behavior of the code in
-``hensmith/hxn_synthesis.py`` and ``hensmith/_heat_exchanger_network.py``; the
-:doc:`tutorial/index` shows the same concepts on a running system.
+``hensmith/hxn_synthesis.py`` and ``hensmith/_heat_exchanger_network.py``, and
+of their two private helpers, ``hensmith/_curves.py`` (the stream curves) and
+``hensmith/_planner.py`` (the network planner); the :doc:`tutorial/index`
+shows the same concepts on a running system.
 
 Heat integration and the minimum approach temperature
 -----------------------------------------------------
@@ -27,19 +29,20 @@ streams are in temperature, the more area is needed for the same duty, since
 the area of a counter-current exchanger scales as
 :math:`Q / (U \Delta T_{lm})`. hensmith expresses that limit as a single
 number, the minimum approach temperature ``T_min_app`` (in K, default ``5.``),
-required between the streams of every candidate match, enforced on every
-synthesized exchanger, and used to shift hot streams in the problem table:
+used to shift hot streams in the problem table and required between the
+streams everywhere inside every synthesized exchanger:
 
 - in :func:`~hensmith.problem_table`, where every hot stream's temperature is
   shifted *down* by ``T_min_app`` before the streams are compared, so that two
   streams which meet on the shifted scale are really ``T_min_app`` apart;
-- in every matching pass of :func:`~hensmith.synthesize_network`, where it
-  sets which candidates are eligible (a hot stream is only paired with a cold
-  stream more than ``T_min_app`` below it) and enters the driving-force
-  ranking that orders them; and
-- on every synthesized process exchanger, which is a ``biosteam.HXprocess``
-  constructed with ``dT=T_min_app`` and therefore stops transferring heat when
-  its outlet temperatures come that close.
+- in the planner of :func:`~hensmith.synthesize_network`, which admits a
+  match only if the two streams stay at least ``T_min_app`` apart at every
+  breakpoint of their temperature-enthalpy curves along the whole exchanger,
+  not only at its two ends; and
+- on every synthesized process exchanger, whose approach is verified on the
+  exact states of its two streams, again along its whole length. The
+  exchanger itself is a ``biosteam.HXprocess`` constructed with
+  ``dT=T_min_app - 1e-6``, a guard against rounding only.
 
 Lowering ``T_min_app`` lowers the utility targets and raises exchanger area;
 raising it does the reverse. It is the parameter in hensmith that sets the
@@ -56,42 +59,65 @@ of a set of streams, given each stream's inlet, its outlet quenched to
 equilibrium at its own enthalpy, a flag saying whether it is cooled, and
 ``T_min_app``. Its result is a :class:`~hensmith.ProblemTable`.
 
+**Stream curves.** Each stream is first described by a piecewise-linear
+temperature-enthalpy curve over its own enthalpy range, built once from a
+handful of flashes and evaluated afterwards without flashing. Its breakpoints
+are the stream's two end temperatures and every phase boundary inside its
+range (a pure component's saturation temperature, a mixture's bubble and dew
+points); a pure component's latent heat is a flat (isothermal) segment
+between its saturated-liquid and saturated-vapor enthalpies; a mixture's
+two-phase glide is sampled, and so is every curved single-phase stretch
+(temperature-dependent heat capacity), densely enough that linear
+interpolation stays within 0.002 K of the true curve. Inside its range the
+stream is taken at equilibrium with its enthalpy clipped to
+:math:`[H_{lo}, H_{hi}]`, so a stream copy at an interior temperature can
+never carry more enthalpy than the real stream ever has (a non-equilibrium
+outlet, for instance); what a non-equilibrium end state departs from
+equilibrium at its own end temperature becomes a flat there.
+
 **The shifted grid.** Hot streams are shifted down by ``T_min_app``; cold
-streams are not. The grid ``Ts`` is the sorted (descending) set of shifted end
-temperatures of all streams, so the intervals between consecutive grid
-temperatures are exactly the intervals over which the population of streams
-does not change.
+streams are not. The grid ``Ts`` is the sorted (descending) union of the
+shifted breakpoints of all curves, temperatures closer than 1e-9 K being one
+grid point. Every temperature at which any stream's curve bends or jumps is
+therefore a grid point, and between two consecutive grid points every stream
+is linear to within 0.002 K. A grid of the stream end temperatures alone
+would average a boiling point, a dew or bubble point, or the curvature of a
+glide that falls strictly inside an interval over that interval, which can
+hide a pinch and make the hot utility target too low.
 
-**Per-stream contributions.** For a monotone stream -- one whose outlet moves
-in the direction its duty implies -- the heat contributed to the interval
-between grid temperatures :math:`T_k` and :math:`T_{k+1}` is
-
-.. math::
-
-   \mathrm{interval\_H}[j,k] = s_j \left( H_j(T_k) - H_j(T_{k+1}) \right),
-   \qquad s_j = +1 \; \text{(hot)}, \; -1 \; \text{(cold)},
-
-where :math:`H_j` is obtained by flashing a copy of the stream at the *real*
-temperature :math:`T + \mathrm{shift}` and clipping the result to
-:math:`[H_{in}, H_{out}]`. The stream's own two end points are assigned
-:math:`H_{in}` and :math:`H_{out}` by position rather than by a float
-comparison, so the sum over intervals telescopes exactly:
+**Per-stream contributions.** Write :math:`H_j^-(T)` and :math:`H_j^+(T)` for
+the low- and high-enthalpy limits of stream :math:`j`'s curve at the *real*
+temperature :math:`T + \mathrm{shift}_j`; they differ only where the curve has
+a flat at that temperature, and they are :math:`H_{hi}` above and
+:math:`H_{lo}` below the stream's range. The heat a stream contributes to the
+open interval between grid temperatures :math:`T_k` and :math:`T_{k+1}`, and
+at the grid temperature :math:`T_k` itself, are
 
 .. math::
 
-   \sum_k \mathrm{interval\_H}[j,k] = s_j \left| H_{out} - H_{in} \right|,
+   \mathrm{interval\_H}[j,k] = s_j \left( H_j^-(T_k) - H_j^+(T_{k+1}) \right),
+   \qquad
+   \mathrm{point\_H}[j,k] = s_j \left( H_j^+(T_k) - H_j^-(T_k) \right),
 
-that is, to the stream's duty. The clipping matters: a stream copy flashed at
-an interior temperature may carry more enthalpy than the real stream ever has
-(a non-equilibrium outlet, for instance), and without it that stream would
-inflate an interval and break the identity above.
+with :math:`s_j = +1` for a hot stream and :math:`-1` for a cold one. The
+stream's own end points are grid points selected by position rather than by
+a float comparison, so the contributions telescope exactly:
 
-**Point loads.** Isothermal streams, and streams whose outlet temperature
-moves *against* their duty -- a heated stream that leaves cooler than it
-entered, such as a reboiler outlet quenched to equilibrium -- have no interval
-to occupy. They enter the table as a point load
-:math:`s_j |H_{out} - H_{in}|` at their shifted outlet temperature, in
-``point_H``.
+.. math::
+
+   \sum_k \mathrm{interval\_H}[j,k] + \sum_k \mathrm{point\_H}[j,k]
+       = s_j \left| H_{out} - H_{in} \right|,
+
+that is, to the stream's duty.
+
+**Point loads.** ``point_H`` is nonzero only where a curve is flat: at a pure
+component's (shifted) saturation temperature, which receives its latent heat;
+at an end temperature where a non-equilibrium end state departs from
+equilibrium; and at the shifted outlet temperature of a *point-load stream*
+-- an isothermal stream, or one whose outlet temperature moves *against* its
+duty (a heated stream that leaves cooler than it entered, such as a reboiler
+outlet quenched to equilibrium) -- which has no interval to occupy and puts
+its whole duty :math:`s_j |H_{out} - H_{in}|` there.
 
 **The cascade.** Starting from zero hot utility, the heat leaving grid
 boundary :math:`T_k` (after that boundary's point loads) is
@@ -118,17 +144,25 @@ flows; the most negative value is the deficit hot utility must make up,
    \mathrm{hot\_util\_load} = -\min_k \min(\mathrm{residual}[k],
                                            \mathrm{arriving}[k]),
 
-its location is the pinch, and the heat left at the bottom of the cascade is
-the cold utility,
+its first location is the pinch, and the heat left at the bottom of the
+cascade is the cold utility,
 :math:`\mathrm{cold\_util\_load} = \mathrm{residual}[-1] +
-\mathrm{hot\_util\_load}`.
+\mathrm{hot\_util\_load}`. Whether that minimum is the arriving or the leaving
+flow at the pinch fixes the side of the pinch that the point loads *at* the
+pinch temperature belong to, the pinch *cut*.
+
+Because every stream is linear to within 0.002 K between grid points, the
+grid minimum of the cascade is the true one to within 0.002 K times the sum of
+the heat capacity flow rates; equivalently, the targets lie between the exact
+targets at ``T_min_app`` minus and plus 0.004 K (approximately: the 0.002 K
+tolerance is established by midpoint tests). For streams of constant heat
+capacity the curves are exact.
 
 **Threshold problems.** When that minimum is not negative -- or negative by no
-more than a tiny fraction of the total stream duty -- no hot utility is needed
-at all. The table then reports zero hot
-utility and places the pinch at the top of the grid, ``Ts[0]``. A cold utility
-that comes out slightly negative through rounding is absorbed back into the
-hot utility so that the identity
+more than 1e-9 of the total stream duty -- no hot utility is needed at all.
+The table then reports zero hot utility and places the pinch at the top of the
+grid, ``Ts[0]``. A cold utility that comes out slightly negative through
+rounding is absorbed back into the hot utility so that the identity
 
 .. math::
 
@@ -161,7 +195,7 @@ and by construction they approach no closer than ``T_min_app``.
 .. figure:: /_static/images/examples/tutorial_02_composite_curves.png
    :class: white-bg
    :width: 720
-   :alt: Composite curves of the quickstart system: a red hot composite curve above a blue cold composite curve, on axes of temperature in degrees Celsius against enthalpy in GJ/hr, with a shaded band marking the recovered heat, a cold utility arrow of 1.936e+06 kJ/hr at the cold end and a hot utility arrow of 2.828e+08 kJ/hr at the warm end.
+   :alt: Composite curves of the quickstart system: a red hot composite curve above a blue cold composite curve, on axes of temperature in degrees Celsius against enthalpy in GJ/hr, with a shaded band marking the recovered heat, a cold utility bracket labelled 1.94e+06 kJ/hr at the cold end and a hot utility arrow labelled 2.83e+08 kJ/hr at the warm end.
 
    Composite curves of the quickstart system at ``T_min_app = 5`` K. The
    shaded band is the heat the two curves can exchange with each other; the
@@ -184,126 +218,188 @@ pinch**, **no cold utility may be used above it**, and **no hot utility below
 it**. Violating any one of them makes the network use more of both utilities
 than the targets require, by the amount transferred across the pinch.
 
-From targets to a network: hensmith's synthesis heuristics
-----------------------------------------------------------
+From targets to a network: the pinch-outward MER planner
+--------------------------------------------------------
 
 :func:`~hensmith.synthesize_network` takes the heat utilities of the process,
-runs the pinch analysis above, and then places exchangers. Streams are
-numbered in a rearranged order -- heated streams first, then cooled streams --
-and every array, exchanger ID and life cycle uses that index.
+runs the problem table above, plans a network *without stream splits* that
+reaches the MER targets whenever its search finds one, and realizes the plan
+as BioSTEAM exchangers. Streams are numbered in a rearranged order -- heated
+streams first, then cooled streams -- and every array, exchanger ID and life
+cycle uses that index. The order only breaks ties in the planner's search: the
+facility hands the utilities over sorted by signed duty, and
+``sort_hus_by_T`` sorts them by inlet temperature instead.
 
-Each stream gets a **pinch temperature** of its own: the process pinch on the
-stream's own scale (the table's ``pinch_T`` for a cold stream, that plus
-``T_min_app`` for a hot one) when the stream crosses it; its inlet temperature
-when the stream already starts past the pinch, or is isothermal or
-non-monotone; its outlet temperature when the stream ends before reaching the
-pinch. That temperature splits the stream's duty into a hot-side (above-pinch)
-part and a cold-side (below-pinch) part, and the state of the stream there --
-computed by ``pinch_state``, with enthalpy clipped to the stream's real range
--- is the state in which it enters the design on the far side of the pinch.
-Each design works with its own **transient stream** per stream index, advanced
-every time a match is made, so a candidate is always evaluated at the state
-the stream has actually reached rather than at its original inlet. The passes
-walk the streams by index, so the stream order is the matching priority. The
-facility hands the utilities over sorted by signed duty, so by default the cold
-stream with the smallest heating duty and the hot stream with the largest
-cooling duty are tried first; ``sort_hus_by_T`` replaces that with inlet
-temperature.
+**The planner's model.** Each stream enters the planner as its knots on the
+problem-table grid: its enthalpy at every grid temperature inside its range,
+with two knots where its curve has a flat. Every breakpoint of every curve is
+a grid point and the table is linear between grid points, so the planner's own
+cascade reproduces the table exactly -- the same targets, the same pinch and
+the same pinch cut. Each stream is cut at the pinch into an above-pinch part
+and a below-pinch part (a stream lying wholly on one side has an empty part on
+the other), and the two sides are planned as two independent problems.
 
-Matching then proceeds in four passes, each creating ``HXprocess`` units that
-exchange as much heat as the approach temperature (``dT``), the outlet
-enthalpy of one stream (``H_lim0``) and a temperature limit on the other
-(``T_lim1``) allow:
+**Must and flex streams.** Above the pinch no cold utility may be used, so
+every hot stream there is a **must**: process matches have to cool it
+completely. The cold streams above the pinch are **flex** streams: whatever
+their matches leave over is supplied by one hot utility at their far (hot)
+end. Below the pinch the roles swap: no hot utility may be used, so every cold
+stream is a must, and the hot streams are flex streams finished by one cooler
+at their cold end. Putting a flex stream's utility at its far end loses
+nothing: moving a stream's later matches toward its inlet never reduces the
+approach of any match on it, because every stream's curve is monotone.
 
-1. **Cold-side design.** For each hot stream, the eligible cold streams are
-   those with a heat-capacity flow rate no greater than the hot stream's
-   (:math:`C_{hot} \ge C_{cold}`) and a current temperature more than
-   ``T_min_app`` below it. They are tried in decreasing order of
+**Building each side from the pinch outward.** A depth-first search builds
+each side one match at a time, starting at the pinch, where the driving forces
+are smallest, and moving outward. A match of duty :math:`x` between a must and
+a flex stream is feasible only if the two streams keep ``T_min_app`` at every
+knot along it, so internal pinches -- a condensing vapor against a boiling
+mixture, say -- are respected, not just the exchanger's terminals. Every step
+also keeps the problem table of the *remaining* problem feasible (remaining
+problem analysis): the largest duty that does so has a closed form, so no step
+can make MER unreachable by its own table. Wherever that remaining table is
+tight -- a pinch of the remaining problem -- the pinch design rules of Linnhoff
+and Hindmarsh must hold:
 
-   .. math::
+- above the pinch, every hot stream at the pinch needs its own cold stream at
+  the pinch, with :math:`C_{hot} \le C_{cold}` (the number rule
+  :math:`N_{hot} \le N_{cold}` and the heat-capacity-flow rule);
+- below the pinch, every cold stream at the pinch needs its own hot stream at
+  the pinch, with :math:`C_{hot} \ge C_{cold}`.
 
-      \min(C_{hot}, C_{cold}) \cdot (T_{hot} - T_{cold} - T_{min,app}),
+Both rules are generalized to isothermal segments: a flat -- a pure component
+boiling or condensing exactly at the pinch -- has unlimited series capacity
+and can serve several partners in turn. At the process pinch itself a
+violation of these rules *proves* that MER needs stream splitting.
 
-   a rough measure of how much heat the match can move, with ``H_lim0`` the
-   hot stream's outlet enthalpy and ``T_lim1`` the cold stream's pinch
-   temperature; the loop ends as soon as the hot stream reaches its outlet
-   enthalpy. Streams lying entirely above the pinch are skipped, and so are
-   isothermal and non-monotone streams, whose pinch temperature equals their
-   inlet temperature and therefore marks them unavailable on both sides.
+The candidate duties of a match are the largest feasible one and a finite set
+of events: a stream is ticked off, a partner is saved for another stream, a
+stream switches partner or returns to an earlier one. The search is budgeted
+in deterministic work units rather than seconds, so its result does not depend
+on the speed of the machine. Once a MER plan is found, a branch and bound on
+the number of exchangers looks for a smaller one; consecutive pieces of the
+same match are merged into one exchanger.
 
-2. **Hot-side design.** The mirror image, run per cold stream, with the
-   heat-capacity inequality reversed (:math:`C_{cold} \ge C_{hot}`), the same
-   ranking, ``H_lim0`` the cold stream's outlet enthalpy and ``T_lim1`` the
-   hot stream's pinch temperature; streams lying entirely below the pinch are
-   skipped.
+**Repeated pairs.** The same hot and cold stream may be matched more than
+once on the same side: alternating two partners in series emulates a split,
+and some unsplit MER networks need it. Process exchangers are named
+``HX_<cold>_<hot>_hs`` above the pinch (the hot-side design) and
+``HX_<hot>_<cold>_cs`` below it (the cold-side design), the first number being
+the stream at port 0; the *n*-th exchanger of the same pair on the same side,
+counted in the order the hot stream meets them, gets the suffix ``_<n>`` for
+:math:`n \ge 2` (for example ``HX_3_2_cs_2``). Utility exchangers are
+``Util_<index>_hs`` for a cold stream and ``Util_<index>_cs`` for a hot one.
+``avoid_recycle=True`` forbids matching any pair twice anywhere -- on one side
+or across the two -- so that no two exchangers connect the same pair of
+streams, at the cost of the MER networks that need a repeated pair.
 
-   The two inequalities are the feasibility criteria of the pinch design
-   method: immediately below the pinch a match can only keep the approach
-   temperature over its whole length if the hot stream's heat-capacity flow
-   rate is at least the cold stream's, and immediately above it the reverse.
+**Best effort when splitting is needed.** A side whose pinch rules prove that
+MER needs a split, or whose search runs out of budget, gets a best-effort plan
+instead. Heat that a must stream cannot place (a *gap*) is moved to the
+stream's pinch end, where it crosses the pinch at the cost of an equal amount
+of extra hot and cold utility, the *penalty*; greedy dives and a bisection of
+the gaps keep that penalty small, though not minimal in general. Such a
+network reports ``'best_effort'``.
 
-3. **Offset passes.** Two clean-up passes, one for the heating still owed on
-   the cold side and one for the cooling still owed on the hot side, walk the
-   streams in index order and match any pair that still has opposite demands
-   on that side and is at least ``T_min_app`` apart. These passes drop the
-   heat-capacity inequality and use the limited stream's own *outlet*
-   temperature instead of its pinch temperature as ``T_lim1``; in the
-   hot-side pass the cold stream is taken in whichever of its two transient
-   states carries the most enthalpy.
+**Small matches.** A planned exchanger with a duty below ``Qmin`` (default
+``1e-3`` kJ/hr) is dropped and its duty left to the utilities. Removing a
+match never reduces the approach of another, so the rest of the plan stays
+feasible; a large ``Qmin`` can, however, cost MER.
 
-4. **Utility exchangers.** One rigorous ``HXutility`` per stream finishes the
-   job, taking the stream from its furthest transient state to its required
-   outlet enthalpy. The result is asserted against the stream's quenched
-   outlet enthalpy and temperature, so a network that would not actually
-   deliver the specified outlets fails loudly rather than silently.
+**Realization.** Each stream is walked in flow order from its inlet: a hot
+stream through its above-pinch matches (from its inlet end), then its
+below-pinch matches, then its cooler; a cold stream through its below-pinch
+matches, then its above-pinch matches, then its heater. Each match becomes one
+plain ``HXprocess`` whose two enthalpy limits, ``H_lim0`` and ``H_lim1``, are
+the planned outlet enthalpies of its two streams, so that its duty reproduces
+the plan. A planned outlet whose equilibrium state is not past the stream's
+state at the exchanger inlet cannot be a limit (``HXprocess`` rejects it): one
+strictly inside a non-equilibrium end jump, or a state of a point-load stream
+on the wrong side of its inlet. That stream's limit is left out, and the other
+stream's sets the duty. A stream's first exchanger receives its real inlet --
+except a point-load stream, which enters at equilibrium at its inlet enthalpy,
+on the side of its outlet temperature where the plan put its duty -- and every
+later exchanger receives the stream's exact state at the planned enthalpy.
+Each exchanger is simulated once; one whose duty differs from the plan is
+reported, and one that cannot be simulated at all is dropped, its duty going
+to the utilities. Finally one rigorous ``HXutility`` per stream takes it to its outlet
+enthalpy, and an ``AssertionError`` is raised if that does not reproduce the
+quenched outlet enthalpy and temperature, so a network that would not deliver
+the specified outlets fails loudly rather than silently.
 
-Three settings guard the passes. ``Qmin`` (default ``1e-3`` kJ/hr) discards
-any candidate exchanger whose duty comes out below it. A match whose
-``HXprocess`` cannot be simulated is discarded too, and because each candidate
-is keyed by its exchanger ID -- ``HX_<hot>_<cold>_cs`` on the cold side,
-``HX_<cold>_<hot>_hs`` on the hot side -- **a given ordered pair is attempted
-at most once per side**, across the design pass and the offset pass that share
-that ID namespace. Finally, ``avoid_recycle=True`` refuses any pair already
-matched anywhere in the four passes, so that no two exchangers connect the
-same pair of streams -- a second exchanger between the same two streams can
-form a recycle loop in the network.
+**Exact approach verification.** The knots are exact at grid points but are
+chords in between, up to 0.002 K off inside glides and curved single-phase
+stretches. Every planned exchanger is therefore checked on the exact states of
+its two streams wherever its planned approach is within that margin of
+``T_min_app``: at its ends, at every breakpoint inside it and, where the exact
+approach is not linear between two positions, by a search for a dip in
+between. ``HXprocess`` itself checks only its two terminals, which would miss
+an internal pinch at a phase change. Where a MER plan falls short by more than
+1e-6 K, the exact states are inserted as knots and the network is planned
+again, for at most three rounds. A best-effort plan, or a MER plan still short
+after the last round, instead has each violating match shrunk to the largest
+duty that keeps the approach, the rest going to the utilities: with its inlets
+fixed, a smaller duty can only raise a match's approach, and the later stages
+of both streams move toward their inlets, which never reduces another match's
+approach. Streams of constant heat capacity never need either step.
 
-The passes are what make the result a *heuristic* network: every match is
-committed as soon as it is made, and no pass revisits an earlier decision.
+**The report.** ``synthesize_network(..., info={})`` fills the dictionary it is
+given, and :class:`~hensmith.HeatExchangerNetwork` keeps it as
+``synthesis_info``. ``'status'`` is ``'mer'`` only if the utilities of the
+*realized* network, computed from the simulated exchanger duties, equal the
+targets (to 1e-6 of the total stream duty), and ``'best_effort'`` otherwise.
+Next to it are the targets (``'Q_hot_target'``, ``'Q_cold_target'``), the
+planned and the realized utilities, the ``'penalty'``, per side of the pinch
+(``'sides'``) the search method, its work, any proof that a split is needed
+and the gaps, the planner's own targets and pinch, the number of refinement
+rounds, the smallest approach inside any process exchanger, the matches that
+were shrunk (``'repaired'``), dropped (``'qmin_dropped'``, ``'dropped'``) or
+deviated from their plan (``'deviations'``), and the point-load streams. The
+full list is under the ``info`` keyword of
+:func:`~hensmith.synthesize_network`.
 
 Rigor and phase change
 ----------------------
 
 Process streams in a biorefinery boil, condense and change composition, so
 hensmith never assumes a constant heat capacity. Every enthalpy it uses comes
-from a thermosteam flash:
+from thermosteam:
 
 - **Quenched outlets.** Before any analysis, each stream's outlet copy is
   re-flashed at its own enthalpy (``s.vle(H=s.H, P=s.P)``). An upstream
   ``HXutility`` that was not solved rigorously can leave an outlet in a
   non-equilibrium state; quenching puts that heat at the temperature the
   equilibrium model says it is available at.
-- **Interval enthalpies.** Within the problem table a single stream copy is
-  walked down the grid, so each flash is warm-started from the previous
-  boundary, and every result is clipped to the stream's own enthalpy range. If
-  a flash fails, hensmith warns and interpolates that boundary's enthalpy
-  linearly in temperature rather than abandoning the table.
-- **Pinch states.** ``pinch_state`` flashes the inlet copy at the stream's
-  pinch temperature and accepts the result only when its enthalpy lies inside
-  the stream's real range; otherwise the stream never passes through that
-  equilibrium state, and the equilibrium state at the nearer *end* enthalpy is
-  used instead. Either way the hot-side and cold-side loads split
-  :math:`|H_{in} - H_{out}|` exactly, and the transient stream used for
-  matching never carries heat the real stream does not have.
-- **Point loads.** A condenser or reboiler stream that changes phase at one
-  temperature contributes its whole duty at that temperature instead of being
-  smeared over an interval, which is what keeps the cascade -- and the pinch
-  it locates -- correct for latent duties.
+- **Curves instead of flashes on the grid.** Flashing every stream at every
+  grid temperature has three defects that the stream curves avoid. A phase
+  boundary or a curvature inside a grid interval is averaged away (see *The
+  shifted grid* above). A ``vle(T=T_sat)`` of a single chemical keeps
+  whatever phase split the stream had, so the enthalpy exactly at a
+  saturation temperature depends on history; the curve takes a pure
+  component's latent heat as a flat between V-specified saturated states and
+  evaluates single-phase stretches with their phases fixed, so a grid point
+  on a saturation temperature is never ambiguous. And thermosteam's
+  two-phase flashes of some mixtures (water and ethanol with 20-50 % ethanol,
+  for instance) silently return non-converged states; the curve traces a
+  binary glide along its bubble-point curve and sanity-checks the flashes of
+  other mixtures.
+- **Point loads.** A pure component's latent heat contributes at its
+  saturation temperature as a point load, and so does the whole duty of an
+  isothermal or non-monotone stream at its outlet temperature, instead of
+  being smeared over an interval; that is what keeps the cascade -- and the
+  pinch it locates -- correct for latent duties.
+- **Pinch states.** ``pinch_state`` returns the state of a stream at a pinch
+  temperature from its curve, deterministically: a pinch on the stream's own
+  saturation temperature is resolved by the side of the pinch cut, never by
+  whatever phase split a previous flash left, and the enthalpy is clipped to
+  the stream's real range, so the state never carries heat the real stream
+  does not have. It is a standalone analysis helper; the synthesis plans on
+  the curves themselves.
 - **Rigorous exchangers.** Every synthesized process exchanger is an
-  ``HXprocess`` solved rigorously against its ``dT``, ``H_lim0`` and
-  ``T_lim1`` limits, and every synthesized utility exchanger is an
-  ``HXutility`` with ``rigorous=True``, specified by enthalpy rather than by
-  temperature.
+  ``HXprocess`` simulated from exact inlet states with both enthalpy limits
+  at its planned outlets and its approach verified on exact states, and every
+  synthesized utility exchanger is an ``HXutility`` with ``rigorous=True``,
+  specified by enthalpy rather than by temperature.
 
 The network as a BioSTEAM system
 --------------------------------
@@ -330,16 +426,26 @@ anything listed in ``ignored``, and anything with zero duty, and sorts what is
 left by duty. Auxiliary exchangers -- a column's condenser and reboiler, a
 flash's feed heater -- are included like any other.
 
-**Convergence.** The new exchangers are assembled into a network with
-``Network.from_units(..., interaction=False)``, whose path follows the rewired
-stream connections rather than the order in which the exchangers were
-synthesized. That ordering matters because a hot-side exchanger is created
-before the cold-side ones that feed it, and a single pass in synthesis order
-would run it on stale inlets; if the path cannot be fully ordered, hensmith
-warns and leaves convergence to settle the loop. The resulting ``HXN_sys`` has
-its tolerance set with ``method='fixedpoint'`` on itself and its subsystems
-and is converged with ``System.converge()``; should convergence raise, every
-unit is run once and a ``RuntimeWarning`` is issued.
+**Convergence.** After synthesis each stream's stages are rewired in series,
+and the new exchangers are assembled into a ``System``, ``HXN_sys``, whose
+path follows the streams: every stage links to the next stage of the same
+stream, and the path is a topological order of that graph (Kahn's algorithm,
+ties broken by the order of the exchangers). Where the graph has a cycle --
+a pair of streams matched both above and below the pinch, or repeated matches
+in alternating order -- the unit with the fewest unplaced predecessors comes
+next and its inlets from later units become recycle streams. Every exchanger
+starts at its planned state, so the loops are at their fixed point after one
+pass; the system is converged by fixed-point iteration to tight tolerances
+(a temperature change of 1e-8 K), which closes the energy balance to about
+1e-10 %. Should convergence raise, every unit is run once and a
+``RuntimeWarning`` is issued.
+
+**Streams served by process exchange alone.** A stream that its process
+exchangers bring to its outlet (to within 1e-9 of its duty, the residual of
+the enthalpy flashes) leaves its utility exchanger in exactly the state it
+enters it, so that exchanger has no duty and no cost -- rather than a spurious
+duty of a few 1e-9 kJ/hr from re-flashing the stream, which biosteam would
+design and cost as a minimum-size exchanger.
 
 **Where it sits among the facilities.** ``network_priority = -2`` is lower
 than that of any other standard BioSTEAM facility, and facilities are
@@ -354,24 +460,37 @@ replaces is reported as adding nothing rather than as a credit. Its heat
 utilities are the new utilities summed by agent with the *reversed* original
 ones -- new minus original -- so a negative utility cost on the facility is a
 saving. Setting ``replace_unit_heat_utilities=True`` instead overwrites each
-original unit's heat utility with the new one and leaves the facility itself
-carrying none. If no process match was made at all, the facility reports zero
+original unit's heat utility with that of its own stream's utility exchanger,
+reloads the utility costs of the unit and of its owner, and leaves the
+facility itself carrying none; the original data are given back before the
+network is costed again, so the next network is synthesized from the units'
+own utilities. If no process match was made at all, the facility reports zero
 capital and no utilities.
 
 **Reusing a network.** With ``cache_network=True`` a later simulation checks
 whether the set of units behind the heat utilities is unchanged; if it is, the
-same network configuration is reused with updated inlet states and enthalpy
-limits instead of being synthesized again. If the reused network then fails
-its outlet checks, hensmith warns, discards the cache and re-synthesizes from
-scratch. If it fails its energy balance instead, the cache is discarded and
-the network re-synthesized silently; a warning is issued only if the freshly
-synthesized network fails the same check.
+same network configuration is reused instead of being synthesized again. Each
+life cycle's first inlet is copied from the current stream, and each process
+exchanger keeps, as the enthalpy limit of its *must* stream (the hot stream
+above the pinch, the cold stream below it), the fraction of that stream's
+duty at which its limit sat at synthesis, so a changed feed rescales every
+stage instead of letting the first one take the whole duty. Its partner, the
+flex stream, transfers what that sets, but never past its own outlet, and
+takes the rest to its utility exchanger; a port that had no limit at
+synthesis gets none. The utility exchangers bring every stream to its new
+outlet enthalpy. A reused network is not planned again, so it need not be at
+MER for the new duties, and ``synthesis_info`` still describes the synthesis
+that produced it. If the reused network then fails its outlet checks,
+hensmith warns, discards the cache and re-synthesizes from scratch. If it fails
+its energy balance instead, the cache is discarded and the network
+re-synthesized silently; a warning is issued only if the freshly synthesized
+network fails the same check.
 
 Validation
 ----------
 
-Nothing about a heuristic network is self-evidently right, so hensmith checks
-it in four ways.
+hensmith checks every network it synthesizes, and its test suite checks the
+synthesizer against independent references.
 
 **The energy balance.** After convergence, every process exchanger duty is
 counted twice -- it satisfies a cooling demand and a heating demand at once --
@@ -397,37 +516,86 @@ as the original exchanger's outlet: composition, pressure and enthalpy are
 asserted stream by stream. The utility exchangers created during synthesis are
 checked the same way, against the quenched outlet enthalpy and temperature.
 
-**The MER bound.** The targets of the problem table are a lower bound the
-network cannot beat. ``tests/test_hxn_regression.py`` builds ten synthetic
+**The approach inside every exchanger.** The synthesis verifies every process
+exchanger on the exact states of its streams (see *Exact approach
+verification* above) and records the smallest approach it found in
+``synthesis_info['min_approach']``; the tests re-check it with temperatures
+computed independently of the code under test.
+
+**MER identification and achievement.** ``tests/test_hxn_mer.py`` synthesizes
+a corpus of 78 problems through the public facility. For 40 of them -- 24
+constant heat capacity problems from the literature and 16
+real-thermodynamics problems with condensers and boilers at the pinch,
+desuperheating and subcooling, and binary glides; 11 with more than ten
+streams -- an unsplit MER network exists, proven inside the suite by a
+certificate network that is re-checked there (by plain arithmetic for
+constant heat capacity); the synthesized network must reach the targets and
+report ``'mer'``. For the other 38 (25 from the literature and 13 with real
+thermodynamics; 13 with more than ten streams) the pinch design rules prove
+that MER needs stream splitting, a proof re-derived in the test module; the
+network must never beat the targets and must report ``'best_effort'``. In both sets the targets must equal an independent
+reference -- a closed-form constant heat capacity cascade and the published
+values, or a dense-grid calculator for real thermodynamics -- and every
+material and energy balance and the exact internal approach of every
+exchanger are checked.
+
+**Regression cases.** ``tests/test_hxn_regression.py`` builds ten synthetic
 systems of increasing complexity -- all with phase-changing streams from the
 third on -- and for each one requires that the synthesized network (i) closes
 its energy balance without raising ``RuntimeWarning``, (ii) never uses less
 hot or cold utility than the MER targets computed on the same streams, and
-(iii) recovers at least as much heat as a load recorded in the test file. A
-network that improves leaves slack in (iii); those recorded numbers are
-lowered deliberately by a maintainer, never raised to make a failing test
-pass.
+reports ``'mer'`` exactly when it reaches them, (iii) keeps ``T_min_app``
+inside every process exchanger on exact states, (iv) is planned on the
+problem table's own cascade, and (v) recovers at least as much heat as a load
+recorded in the test file. A network that improves leaves slack in (v); those
+recorded numbers are lowered deliberately by a maintainer, never raised to
+make a failing test pass.
 
 **Doctests.** The examples in the docstrings are executed as part of the test
 suite, so the numbers printed in the API reference are numbers the code
 currently produces.
 
-Limitations
------------
+Guarantees and limitations
+--------------------------
 
-hensmith implements the classical pinch design method with a specific set of
-heuristics. Four consequences are worth stating plainly.
+What the synthesized network is guaranteed to be:
 
-- **The network is heuristic, not optimal.** Matches are committed in sequence
-  and never revisited; there is no search over the space of networks and no
-  optimization of area, capital or number of units. The result depends on the
-  order of the streams and on the driving-force ranking, and it is not
-  guaranteed to reach the MER targets -- only never to beat them.
+- **Never better than MER.** Its utilities are never below the targets of the
+  problem table, and ``'mer'`` is reported only if the realized network
+  reaches them.
+- **Feasible everywhere inside.** Every process exchanger keeps
+  ``T_min_app - 1e-6`` K on the exact stream states at its ends and at every
+  checked position inside it, and the heat balance closes on every stream.
+- **Deterministic.** The search is budgeted in work units, not seconds, so
+  the same streams give the same network however fast the machine is.
+
+What it is not:
+
+- **MER is reached whenever the planner finds an unsplit network -- which is
+  an empirical, not a proven, property.** Every pruning test of the search is
+  a necessary condition, so a missed MER network can only come from the
+  finite set of candidate duties, the caps on repeated pairs or the work
+  budgets. The planner reached MER on every problem of a certified benchmark
+  of about 1,700 problems with 2 to 40 streams for which an unsplit MER
+  network exists, and it does so on all 40 no-split problems of the test
+  suite, but no proof covers every problem.
 - **Streams are not split.** Every stream stays a single branch through the
-  network. Where the pinch design method would split a stream to satisfy the
-  heat-capacity flow rate inequality, hensmith simply does not make that match
-  in the design pass; the duty is picked up later by an offset pass or by a
-  utility exchanger.
+  network. Where the pinch design rules prove that MER needs a split, the
+  network is a best-effort one whose penalty is small but not minimal in
+  general; repeated matches between the same two streams, alternating in
+  series, can approach a split only in the limit.
+- **Energy first, then units; no cost optimization.** MER always takes
+  precedence over the number of exchangers, and an unsplit MER network can
+  need many of them. The branch and bound reduces the number of exchangers
+  among MER plans, but nothing optimizes area, capital or total cost.
+- **Some networks cannot be represented.** Networks whose match order is
+  cyclic are outside the planner's model. A side that needs a split without a
+  pinch-rule proof spends its whole MER search budget before the best-effort
+  step, which costs time rather than quality.
+- **Flash failures inside some glides.** Thermosteam's TP flashes fail
+  silently inside the glides of some mixtures (water and ethanol with 20-50 %
+  ethanol, for instance); an exchanger simulated there can deviate from its
+  plan, and is then reported in ``synthesis_info['deviations']``.
 - **Only streams behind existing utility exchangers are integrated.** The
   facility sees a process stream only through a heat utility attached to a
   unit of the system. A duty carried some other way is invisible to it;
@@ -445,12 +613,13 @@ References
 
 - Linnhoff, B., & Hindmarsh, E. (1983). The pinch design method for heat
   exchanger networks. *Chemical Engineering Science*, 38(5), 745-763.
-- Seider, W. D., Lewin, D. R., Seader, J. D., Widagdo, S., Gani, R., & Ng,
-  M. K. (2017). *Product and Process Design Principles*. Wiley. Heat Exchanger
-  Networks (Chapter 9).
+- Smith, R. (2005). *Chemical Process Design and Integration*. Wiley.
 - Kemp, I. C. (2007). *Pinch Analysis and Process Integration: A User Guide on
   Process Integration for the Efficient Use of Energy* (2nd ed.).
   Butterworth-Heinemann.
+- Seider, W. D., Lewin, D. R., Seader, J. D., Widagdo, S., Gani, R., & Ng,
+  M. K. (2017). *Product and Process Design Principles*. Wiley. Heat Exchanger
+  Networks (Chapter 9).
 - Cortes-Pena, Y., Kumar, D., Singh, V., & Guest, J. S. (2020). BioSTEAM: A
   fast and flexible platform for the design, simulation, and techno-economic
   analysis of biorefineries under uncertainty. *ACS Sustainable Chemistry &

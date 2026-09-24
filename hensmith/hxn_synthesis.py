@@ -1,23 +1,48 @@
 # -*- coding: utf-8 -*-
-# HXN: The automated Heat Exchanger Network design package.
-# Copyright (C) 2020-, Sarang Bhagwat <sarangb2@illinois.edu>
-# 
-# This module is under the UIUC open-source license. See 
+# hensmith: Heat Exchanger Network Synthesis, Modeling, Integration,
+# Thermodynamics, and Heuristics
+# Copyright (C) 2020-, Sarang Bhagwat <sarangbhagwat.developer@gmail.com>
+#
+# This module is under the UIUC open-source license. See
 # github.com/BioSTEAMDevelopmentGroup/hensmith/blob/master/LICENSE.txt
 # for license details.
 """
-Created on Sat May  2 16:44:24 2020
-
-@author: sarangbhagwat
+Pinch analysis and heat exchanger network synthesis: the problem table
+(`problem_table`), the synthesis of an unsplit network at minimum energy
+requirement (`synthesize_network`, on the planner of `hensmith._planner`),
+stream life cycles (`StreamLifeCycle`) and pinch diagrams
+(`plot_pinch_diagram`).
 """
 from collections import namedtuple
 import heapq
+import re
 import numpy as np
 import biosteam as bst
 from warnings import warn
+from ._curves import (StreamCurve, stream_curves, _end_state, _T_EQ, _T_SIDE,
+                      _copy, _point_load_inlet)
+from ._planner import plan_network
 
 __all__ = ('StreamLifeCycle', 'ProblemTable', 'problem_table',
            'synthesize_network', 'plot_pinch_diagram')
+
+#: IDs of the synthesized exchangers: process exchangers above the pinch
+#: ``HX_<cold>_<hot>_hs`` and below it ``HX_<hot>_<cold>_cs`` (the first
+#: number is the stream at port 0), with ``_<n>`` for the n-th exchanger of a
+#: repeated pair; utility exchangers ``Util_<index>_hs|cs``.
+_PROCESS_ID = re.compile(r'^HX_(\d+)_(\d+)_(hs|cs)(?:_\d+)?$')
+_UTILITY_ID = re.compile(r'^Util_(\d+)_(hs|cs)$')
+
+def _stream_ports(unit):
+    """Stream index at each inlet port of a synthesized exchanger, parsed
+    from its ID (``(a, b)`` for ``HX_<a>_<b>_...``, ``(a,)`` for
+    ``Util_<a>_...``), or None if the ID is not one of the synthesizer's."""
+    ID = unit.ID
+    match = _PROCESS_ID.match(ID)
+    if match: return int(match.group(1)), int(match.group(2))
+    match = _UTILITY_ID.match(ID)
+    if match: return (int(match.group(1)),)
+    return None
 
 class LifeStage:
     """
@@ -87,8 +112,12 @@ class StreamLifeCycle:
     network's stream copies and exchanger IDs embed that index
     (``s_<index>__<exchanger ID>`` for the inlet streams of the exchangers,
     ``HX_<hot>_<cold>_cs`` / ``HX_<cold>_<hot>_hs`` for process exchangers,
+    with a suffix ``_<n>`` for the n-th exchanger of a repeated pair,
     ``Util_<index>_cs`` / ``Util_<index>_hs`` for utility exchangers), which
-    is how the life cycle is recovered from the exchangers.
+    is how the life cycle is recovered from the exchangers: the IDs are
+    parsed (the first number is the stream at port 0, the second the stream
+    at port 1), so the stream indices are matched exactly and never as
+    substrings of other indices or of rewired stream IDs.
 
     Parameters
     ----------
@@ -124,9 +153,18 @@ class StreamLifeCycle:
         self.life_cycle = None
         
     def get_relevant_units(self, index, new_HXs, new_HX_utils):
-        """Return the process and utility exchangers (two lists) whose ID contains ``_<index>_``."""
-        new_HXs_relevant = [hx for hx in new_HXs if '_%s_'%index in hx.ID]
-        new_HX_utils_relevant = [hx for hx in new_HX_utils if '_%s_'%index in hx.ID]
+        """
+        Return the process and utility exchangers (two lists) that carry
+        stream `index`: those whose parsed ID (``HX_<a>_<b>_<hs|cs>[_<n>]``
+        or ``Util_<a>_<hs|cs>``) names it; for any other ID, those whose ID
+        contains ``_<index>_``.
+        """
+        def relevant(hx):
+            ports = _stream_ports(hx)
+            if ports is None: return '_%s_'%index in hx.ID
+            return index in ports
+        new_HXs_relevant = [hx for hx in new_HXs if relevant(hx)]
+        new_HX_utils_relevant = [hx for hx in new_HX_utils if relevant(hx)]
         return new_HXs_relevant, new_HX_utils_relevant
         
     def get_life_cycle(self, new_HXs, new_HX_utils):
@@ -143,12 +181,16 @@ class StreamLifeCycle:
         Returns
         -------
         list[LifeStage]
-            One stage per exchanger whose ID contains ``_<index>_`` and whose
-            inlet at the matching position (0 or 1 for a process exchanger,
-            0 for a utility exchanger) carries this stream, i.e. has an ID
-            containing ``'s_<index>_'``; sorted by inlet enthalpy, ascending
-            for a cold stream and descending for a hot one, i.e. in flow
-            direction. Also stored as `life_cycle`.
+            One stage per port that carries this stream: for an exchanger
+            ID of the synthesizer (see the class notes) the port its ID
+            assigns to `index` (0 or 1 for a process exchanger, 0 for a
+            utility exchanger); for any other ID, every port among 0 and 1
+            (0 for a utility) whose inlet ID contains ``'s_<index>_'``.
+            Sorted in flow direction: by inlet enthalpy, ascending for a
+            cold stream and descending for a hot one; ties (zero-duty
+            stages only) put the stream's first side of the pinch first
+            (cold-side stages for a cold stream, hot-side stages for a hot
+            one) and the utility last. Also stored as `life_cycle`.
 
         """
         index = self.index
@@ -156,12 +198,24 @@ class StreamLifeCycle:
         cold = self.cold
         new_HXs_relevant, new_HX_utils_relevant =\
             self.get_relevant_units(index, new_HXs, new_HX_utils)
-        life_cycle = (
-            [LifeStage(unit, 0) for unit in new_HXs_relevant if name + '_' in unit.ins[0].ID]
-            + [LifeStage(unit, 1) for unit in new_HXs_relevant if name + '_' in unit.ins[1].ID]
-            + [LifeStage(unit, 0) for unit in new_HX_utils_relevant if name + '_' in unit.ins[0].ID]
-        )
-        life_cycle.sort(key = lambda pt: pt.H_in, reverse = not cold)
+        life_cycle = []
+        for units, N_ports in ((new_HXs_relevant, 2), (new_HX_utils_relevant, 1)):
+            for unit in units:
+                ports = _stream_ports(unit)
+                if ports is None:
+                    life_cycle.extend([LifeStage(unit, k) for k in range(N_ports)
+                                       if name + '_' in unit.ins[k].ID])
+                else:
+                    life_cycle.extend([LifeStage(unit, k) for k, i in enumerate(ports)
+                                       if i == index])
+        sign = 1. if cold else -1.
+        first_side = '_cs' if cold else '_hs'
+        def flow_order(stage):
+            ID = stage.unit.ID
+            if isinstance(stage.unit, bst.HXutility): rank = 2
+            else: rank = 0 if first_side in ID else 1
+            return (sign * stage.H_in, rank)
+        life_cycle.sort(key=flow_order)
         self.life_cycle = life_cycle
         return life_cycle
         
@@ -204,19 +258,27 @@ by the minimum approach temperature, cold streams unshifted).
 Attributes
 ----------
 Ts : numpy.ndarray
-    Shifted grid temperatures [K], descending: the shifted end temperatures
-    of every monotone stream and the shifted outlet temperature of every
-    point-load stream (see `point_H`).
+    Shifted grid temperatures [K], descending: every shifted breakpoint of
+    every stream's temperature-enthalpy curve, i.e. its end temperatures,
+    the phase boundaries inside its range (a pure component's saturation
+    temperature, a mixture's bubble and dew points), the samples of its
+    two-phase glides and of its curved single-phase stretches
+    (temperature-dependent heat capacity), and the outlet temperature of
+    every point-load stream (see `point_H`). Temperatures closer than
+    1e-9 K are one grid point.
 interval_H : numpy.ndarray
     (N streams x n-1 intervals) heat contributed by each stream to each
-    interval (Ts[k], Ts[k+1]) [kJ/hr]: positive for hot streams (heat
+    open interval (Ts[k], Ts[k+1]) [kJ/hr]: positive for hot streams (heat
     released), negative for cold streams (heat required); zero outside the
     stream's own temperature range.
 point_H : numpy.ndarray
     (N x n) heat contributed *at* each grid temperature [kJ/hr], with the
-    same sign convention, by the streams treated as point loads at their
-    shifted outlet temperature: isothermal streams and streams whose outlet
-    temperature moves against their duty (non-monotone streams).
+    same sign convention: the jump of the stream's curve there, i.e. a pure
+    component's latent heat at its (shifted) saturation temperature, the
+    enthalpy by which a non-equilibrium end state departs from equilibrium
+    at its own end temperature, and the whole duty of a point-load stream
+    at its shifted outlet temperature (isothermal streams and streams whose
+    outlet temperature moves against their duty).
 residual : numpy.ndarray
     (n,) heat cascaded *leaving* each grid temperature, after its point
     loads, when no hot utility is supplied [kJ/hr]; negative where that
@@ -236,53 +298,8 @@ problem_table : builds the table and documents the cascade.
 
 """
 
-def _stream_H_at_boundaries(stream_in, H_in, H_out, T_lo, T_hi, Ts, shift,
-                            stream_label):
-    """
-    Enthalpies [kJ/hr] of one monotone stream at the grid boundaries
-    `Ts` (shifted scale, descending, all within [T_lo, T_hi]).
-
-    Exact at the stream's own end points (H_in/H_out as given) by
-    *position*: `Ts[0]` and `Ts[-1]` are the stream's own T_hi/T_lo (every
-    monotone stream has `T_hi > T_lo` strictly, so `Ts` always has at least
-    these two entries) and are assigned H_in/H_out directly, without a float
-    comparison. In between, the inlet copy is flashed at the *real*
-    temperature `T + shift` and the result is clipped to
-    [min(H_in, H_out), max(H_in, H_out)] so that a non-equilibrium outlet
-    (e.g. a column reboiler/condenser product) can never inflate an
-    interval. A single copy is walked down the grid so each VLE is
-    warm-started from the previous boundary; `stream_label` (the inlet
-    stream's own ID) identifies the stream in the VLE-failure warning.
-    """
-    assert Ts.size >= 2, (
-        "boundary grid for a monotone stream must include both its own "
-        "end points"
-    )
-    H_lo, H_hi = sorted((H_in, H_out))
-    H_top, H_bottom = (H_in, H_out) if H_in > H_out else (H_out, H_in)
-    Hs = np.empty(Ts.size)
-    Hs[0] = H_top
-    Hs[-1] = H_bottom
-    stream = stream_in.copy()
-    for k in range(1, Ts.size - 1):
-        T = Ts[k]
-        T_real = T + shift
-        try:
-            stream.vle(T=T_real, P=stream.P)
-            H = stream.H
-        except Exception as error:
-            warn(f"could not solve VLE for stream {stream_label!r} at "
-                 f"{T_real:.2f} K ({error!r}); interpolating enthalpy "
-                 "linearly in temperature for the problem table",
-                 RuntimeWarning)
-            # restart the warm start from a clean copy so the failed flash
-            # does not leave `stream` in a bad state for the next boundary
-            stream = stream_in.copy()
-            H = H_lo + (H_hi - H_lo) * (T - T_lo) / (T_hi - T_lo)
-        Hs[k] = min(max(H, H_lo), H_hi)
-    return Hs
-
-def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
+def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
+                  curves=None):
     """
     Energy-consistent problem table (temperature-interval heat cascade).
 
@@ -296,6 +313,10 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
         True where the stream is cooled.
     T_min_app : float
         Minimum approach temperature [K].
+    curves : list, optional
+        Prebuilt temperature-enthalpy curves of the same streams, in the
+        same order (e.g. shared with the network synthesis); built here if
+        not given.
 
     Returns
     -------
@@ -308,29 +329,54 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
 
     Notes
     -----
-    Hot streams are shifted down by `T_min_app`; cold streams are not. For
-    monotone streams the contribution to interval (Ts[k], Ts[k+1]) is
-    sign * (H(Ts[k]) - H(Ts[k+1])) with H evaluated at the real temperature
-    and clipped to [H_in, H_out], so every stream's contributions telescope
-    exactly to ``sign * |H_out - H_in|``. Isothermal streams, and streams
-    whose outlet temperature moves against their duty (a heated stream that
-    exits colder than it entered, e.g. a reboiler outlet at VLE), are point
-    loads at their outlet temperature. The cascade starting from zero hot
-    utility is residual[k] = sum(point_H[:, :k+1]) + sum(interval_H[:, :k]),
-    the heat *leaving* boundary Ts[k]. Feasibility must also hold for the
-    heat *arriving* at Ts[k] before its point loads are applied,
-    arriving[k] = residual[k] - sum(point_H[:, k]), because a source at
-    Ts[k] cannot serve a sink above Ts[k]. The minimum over both flows,
-    min(residual, arriving), fixes the hot utility target,
-    `residual[-1] + hot_util_load` the cold one, and its location the
-    pinch. With the per-stream identity above, hot_util_load -
-    cold_util_load equals the net heating demand.
+    Each stream is described by a piecewise-linear temperature-enthalpy
+    curve built once from a handful of flashes: breakpoints at its end
+    temperatures and at every phase boundary inside its range (a pure
+    component's saturation temperature, a mixture's bubble and dew points);
+    a flat (isothermal) segment for a pure component's latent heat, between
+    its saturated-liquid and saturated-vapor enthalpies; samples of each
+    mixture glide (binaries traced along their bubble-point curve); and
+    interior breakpoints of each curved single-phase stretch
+    (temperature-dependent Cp), dense enough that linear interpolation is
+    within 0.002 K of the true curve. Single-phase stretches are evaluated
+    with their phases fixed (no flash), so a grid point exactly at a
+    saturation temperature is never ambiguous. Hot streams are shifted down
+    by `T_min_app`; cold streams are not. The grid is the union of all
+    shifted breakpoints, so every point at which any stream's curve bends
+    or jumps is a grid point, every stream is within 0.002 K of linear
+    between grid points, and the grid minimum of the cascade is the true
+    one to within ``0.002 K * sum(CP)``.
+
+    At a grid temperature a stream contributes the jump of its curve there
+    as a point load (`point_H`), and between two grid temperatures the heat
+    of its curve in that open interval (`interval_H`). Inside its own
+    temperature range a stream is taken at equilibrium with its enthalpy
+    clipped to its real range, so a non-equilibrium end state (e.g. a
+    superheated liquid from a non-rigorous HXutility) can never inflate the
+    duty; what it departs from equilibrium at its own end temperature is a
+    point load there. Every stream's contributions therefore telescope
+    exactly to ``sign * |H_out - H_in|``. Streams whose outlet temperature
+    does not move with their duty (isothermal, or a heated stream that
+    exits colder than it entered, e.g. a reboiler outlet at VLE) are point
+    loads at their outlet temperature.
+
+    The cascade starting from zero hot utility is residual[k] =
+    sum(point_H[:, :k+1]) + sum(interval_H[:, :k]), the heat *leaving*
+    boundary Ts[k]. Feasibility must also hold for the heat *arriving* at
+    Ts[k] before its point loads are applied, arriving[k] = residual[k] -
+    sum(point_H[:, k]), because a source at Ts[k] cannot serve a sink above
+    Ts[k]. The minimum over both flows, min(residual, arriving), fixes the
+    hot utility target, `residual[-1] + hot_util_load` the cold one, and its
+    first location the pinch. With the per-stream identity above,
+    hot_util_load - cold_util_load equals the net heating demand.
 
     Examples
     --------
     A threshold problem: 1000 kmol/hr of water cooled 400 -> 300 K supplies
     every interval of 900 kmol/hr of water heated 300 -> 390 K, so no hot
-    utility is needed and the surplus leaves as cold utility.
+    utility is needed and the surplus leaves as cold utility. (The grid
+    between the ends holds the breakpoints that follow the curvature of
+    liquid water's enthalpy.)
 
     >>> import biosteam as bst
     >>> from hensmith.hxn_synthesis import problem_table
@@ -341,8 +387,8 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
     >>> cold_out = cold_in.copy(); cold_out.vle(T=390., P=5e5)
     >>> table = problem_table([hot_in, cold_in], [hot_out, cold_out],
     ...                       [True, False], 5.)
-    >>> table.Ts
-    array([395., 390., 300., 295.])
+    >>> table.Ts[[0, -1]]  # shifted grid ends (hot streams 5 K down)
+    array([395., 295.])
     >>> round(table.hot_util_load, 3)
     0.0
     >>> round(table.cold_util_load, -1)
@@ -350,31 +396,68 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
     >>> table.pinch_T
     395.0
     """
+    return _problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
+                          curves)[0]
+
+def _problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
+                   curves=None):
+    """
+    Return the `ProblemTable` of `problem_table` together with the stream
+    curves it was built from and its grid enthalpies, as ``(table, curves,
+    grid)``.
+
+    `grid` is a dict with
+
+    * 'Ts': the table's shifted grid temperatures (descending, n);
+    * 'shift': each stream's shift (`T_min_app` for hot streams, 0 for
+      cold ones; N), so stream j's real temperature at grid index k is
+      ``Ts[k] + shift[j]``;
+    * 'Hl', 'Hr': (N x n) each stream's enthalpy at every grid temperature,
+      left (low-enthalpy) and right (high-enthalpy) limit; they differ only
+      where the stream's curve has a flat (point load) at that grid
+      temperature, and are H_hi above and H_lo below the stream's range;
+    * 'k_hi', 'k_lo': (N,) grid indices of each stream's own T_hi and T_lo
+      breakpoints (``k_hi <= k_lo``; equal for a point-load stream), so its
+      range is selected by position, not by comparing shifted floats.
+
+    The table is exactly ``point_H = sign * (Hr - Hl)`` and ``interval_H =
+    sign * (Hl[:, :-1] - Hr[:, 1:])`` (sign +1 hot, -1 cold): piecewise-
+    linear curves through the knots (Ts[k] + shift[j], Hl[j, k]) and
+    (Ts[k] + shift[j], Hr[j, k]) reproduce the table's cascade exactly.
+    """
     N = len(streams_inlet)
     is_hot = np.asarray(is_hot, dtype=bool)
     sign = np.where(is_hot, 1., -1.)
     shift = np.where(is_hot, T_min_app, 0.)
-    T_in = np.array([s.T for s in streams_inlet])
-    T_out = np.array([s.T for s in streams_quenched])
-    H_in = np.array([s.H for s in streams_inlet])
-    H_out = np.array([s.H for s in streams_quenched])
-    monotone = (sign * (T_in - T_out)) > 0.
-    T_hi = np.where(monotone, np.maximum(T_in, T_out), T_out) - shift
-    T_lo = np.where(monotone, np.minimum(T_in, T_out), T_out) - shift
-    Ts = np.unique(np.concatenate([T_hi, T_lo]))[::-1]
-    n = Ts.size
-    interval_H = np.zeros((N, n - 1))
-    point_H = np.zeros((N, n))
-    for j in range(N):
-        if monotone[j]:
-            idx = np.flatnonzero((Ts <= T_hi[j]) & (Ts >= T_lo[j]))
-            Hs = _stream_H_at_boundaries(streams_inlet[j], H_in[j], H_out[j],
-                                         T_lo[j], T_hi[j], Ts[idx], shift[j],
-                                         streams_inlet[j].ID)
-            interval_H[j, idx[:-1]] = sign[j] * (Hs[:-1] - Hs[1:])
-        else:
-            k = np.searchsorted(-Ts, -T_hi[j])
-            point_H[j, k] = sign[j] * abs(H_out[j] - H_in[j])
+    if curves is None:
+        curves = stream_curves(streams_inlet, streams_quenched, is_hot)
+    elif len(curves) != N:
+        raise ValueError(f'{len(curves)} curves given for {N} streams')
+    H_in = np.array([c.H_in for c in curves])
+    H_out = np.array([c.H_out for c in curves])
+    shifted = [c.T - shift[j] for j, c in enumerate(curves)]
+    sizes = [x.size for x in shifted]
+    values, inverse = np.unique(np.concatenate(shifted), return_inverse=True)
+    # merge grid temperatures closer than 1e-9 K (ascending clusters)
+    cluster = np.concatenate([[0], np.cumsum(np.diff(values) > _T_EQ)])
+    n = int(cluster[-1]) + 1
+    # the highest member of each cluster represents it (selected explicitly:
+    # NumPy does not specify which value a repeated fancy index keeps)
+    top = values[np.flatnonzero(np.append(np.diff(cluster) > 0, True))]
+    Ts = top[::-1].copy()
+    position = (n - 1) - cluster[inverse]  # descending grid index of each breakpoint
+    offsets = np.concatenate([[0], np.cumsum(sizes)])
+    Hl = np.empty((N, n))
+    Hr = np.empty((N, n))
+    k_hi = np.empty(N, dtype=int)
+    k_lo = np.empty(N, dtype=int)
+    for j, c in enumerate(curves):
+        index = position[offsets[j]:offsets[j + 1]]
+        Hl[j], Hr[j] = c.grid_limits(Ts, shift[j], index)
+        k_hi[j] = index[-1]
+        k_lo[j] = index[0]
+    point_H = sign[:, None] * (Hr - Hl)
+    interval_H = sign[:, None] * (Hl[:, :-1] - Hr[:, 1:])
     point_total = point_H.sum(axis=0)
     residual = np.cumsum(
         point_total + np.concatenate([[0.], interval_H.sum(axis=0)])
@@ -398,13 +481,41 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app):
         # hot_util_load - cold_util_load == sum(unit_duty) stays exact
         hot_util_load -= cold_util_load
         cold_util_load = 0.
-    return ProblemTable(Ts, interval_H, point_H, residual,
-                        hot_util_load, cold_util_load, Ts[k_pinch])
+    table = ProblemTable(Ts, interval_H, point_H, residual,
+                         hot_util_load, cold_util_load, Ts[k_pinch])
+    grid = dict(Ts=Ts, shift=shift, Hl=Hl, Hr=Hr, k_hi=k_hi, k_lo=k_lo)
+    return table, curves, grid
 
-def temperature_interval_pinch_analysis(hus,
-                                        T_min_app=10,
-                                        force_ideal_thermo=False,
-                                        sort_hus_by_T=False):
+def _pinch_cut(table):
+    """
+    Return which side of the pinch the point loads *at* the pinch
+    temperature belong to: 'below' if the zero-heat-flow cut is the flow
+    arriving at `pinch_T` (before its point loads), 'above' if it is the
+    flow leaving it (after them); always 'below' for a threshold problem
+    (no hot utility: everything lies below the pinch at ``Ts[0]``). Split
+    every stream with ``side = 'right' if cut == 'below' else 'left'``
+    (see `pinch_state`) to agree with the table: the heat above the split
+    is then exactly the hot utility target and the heat below it the cold
+    one. (`synthesize_network` does not split streams: the planner finds
+    the same cut in its own cascade, ``plan.cut``, which reproduces the
+    table's.)
+    """
+    if table.hot_util_load == 0.: return 'below'
+    k = int(np.flatnonzero(table.Ts == table.pinch_T)[0])
+    point_total = table.point_H.sum(axis=0)
+    arriving = table.residual - point_total
+    return 'below' if arriving[k] <= table.residual[k] else 'above'
+
+def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
+                    sort_hus_by_T=False):
+    """
+    The first step of `synthesize_network`: prepare the process streams
+    behind `hus` and run the problem table on them. Returns the 12 values
+    of `temperature_interval_pinch_analysis` (which wraps this function)
+    and then the table's ``table, curves, grid`` (see `_problem_table`),
+    on which the network is planned, so that the curves are built only
+    once.
+    """
     hx_utils = hus
     hus_heating = [hu for hu in hx_utils if hu.duty > 0]
     hus_cooling = [hu for hu in hx_utils if hu.duty < 0]
@@ -413,14 +524,14 @@ def temperature_interval_pinch_analysis(hus,
         hus_cooling.sort(key=lambda i: i.unit.ins[0].T)
     hx_utils_rearranged = hus_heating + hus_cooling
     hxs = [hu.unit for hu in hx_utils_rearranged]
+    # unregistered copies (see `hensmith._curves._copy`); the inlets are
+    # registered under their own IDs below
     if force_ideal_thermo:
-        streams_inlet = [hx.ins[0] for hx in hxs]
-        streams_quenched = [i.outs[0] for i in hxs]
-        streams_inlet = [i.copy(thermo=i.thermo.ideal()) for i in streams_inlet]
-        streams_quenched = [i.copy(thermo=i.thermo.ideal()) for i in streams_quenched]
+        streams_inlet = [_copy(hx.ins[0], hx.ins[0].thermo.ideal()) for hx in hxs]
+        streams_quenched = [_copy(hx.outs[0], hx.outs[0].thermo.ideal()) for hx in hxs]
     else:
-        streams_inlet = [hx.ins[0].copy() for hx in hxs]
-        streams_quenched = [i.outs[0].copy() for i in hxs]
+        streams_inlet = [_copy(hx.ins[0]) for hx in hxs]
+        streams_quenched = [_copy(hx.outs[0]) for hx in hxs]
     for i in streams_quenched: i.vle(H=i.H, P=i.P)
     for i in range(len(streams_inlet)):
         stream = streams_inlet[i]
@@ -434,22 +545,23 @@ def temperature_interval_pinch_analysis(hus,
     T_out_arr = np.array([i.T for i in streams_quenched])
     is_hot = np.zeros(len(hxs), dtype=bool)
     is_hot[hot_indices] = True
-    table = problem_table(streams_inlet, streams_quenched, is_hot, T_min_app)
+    table, curves, grid = _problem_table(streams_inlet, streams_quenched,
+                                         is_hot, T_min_app)
     hot_util_load = table.hot_util_load
     cold_util_load = table.cold_util_load
     pinch_cold_stream_T = table.pinch_T
     pinch_hot_stream_T = pinch_cold_stream_T + T_min_app
-    # Per-stream pinch temperature: where each stream is split between the
-    # hot-side and cold-side network designs. A stream already entirely on
-    # one side of the process pinch (T_in past pinch_cold_stream_T for a
-    # cold stream, or past pinch_hot_stream_T for a hot stream) is not
-    # split; its pinch_T is its own T_in. This clause also catches
-    # non-monotone streams (T_out on the wrong side of T_in for their duty,
-    # e.g. a cold stream whose VLE outlet ends up cooler than it entered):
-    # rather than split their problem_table point-load duty across the
-    # cascade, they get pinch_T = T_in too, so load_duties assigns their
-    # whole duty to a single side (Q_hot_side for a cold stream,
-    # Q_cold_side for a hot one).
+    # Per-stream pinch temperature, for information only (returned as
+    # `HeatExchangerNetwork.pinch_Ts`; `load_duties` splits a stream there):
+    # the network is planned on the curves (see `synthesize_network`), not
+    # on these temperatures. A stream already entirely on one side of the
+    # process pinch (T_in past pinch_cold_stream_T for a cold stream, or
+    # past pinch_hot_stream_T for a hot stream) is not split; its pinch_T is
+    # its own T_in. So is a non-monotone stream (T_out on the wrong side of
+    # T_in for its duty, e.g. a cold stream whose VLE outlet ends up cooler
+    # than it entered: a point load at T_out), whose whole duty
+    # `load_duties` then puts on a single side (hot side for a cold stream,
+    # cold side for a hot one).
     pinch_T_arr = []
     for i in cold_indices:
         if T_in_arr[i] > pinch_cold_stream_T or T_in_arr[i] > T_out_arr[i]:
@@ -468,71 +580,121 @@ def temperature_interval_pinch_analysis(hus,
     pinch_T_arr = np.array(pinch_T_arr)
     return pinch_T_arr, hot_util_load, cold_util_load, T_in_arr, T_out_arr,\
            hxs, hot_indices, cold_indices, indices, streams_inlet, hx_utils_rearranged, \
-           streams_quenched
-            
-        
-def _end_state(stream_end, T_lo, T_hi):
-    """
-    Return a copy of `stream_end` at equilibrium at its own enthalpy, or the
-    stream as given if that equilibrium state lies outside the stream's own
-    temperature range [T_lo, T_hi] (e.g. a non-condensable mislabelled as a
-    liquid, whose equilibrium state at the same enthalpy is a gas at an
-    absurd temperature). Either way the enthalpy is exactly `stream_end.H`.
-    """
-    stream = stream_end.copy()
-    try:
-        stream.vle(H=stream_end.H, P=stream.P)
-    except Exception:
-        return stream_end.copy()
-    if T_lo <= stream.T <= T_hi: return stream
-    return stream_end.copy()
+           streams_quenched, table, curves, grid
 
-def pinch_state(stream_in, stream_out, T_pinch):
+def temperature_interval_pinch_analysis(hus,
+                                        T_min_app=10,
+                                        force_ideal_thermo=False,
+                                        sort_hus_by_T=False):
+    """
+    Prepare the process streams behind `hus` and run the problem table on
+    them, as `synthesize_network` does first; a standalone pinch analysis
+    (the network itself is planned on the table's stream curves, which this
+    function does not return).
+
+    Heating utilities (``hu.duty > 0``, cold streams) come first, then
+    cooling utilities; zero-duty utilities are dropped. Each stream is a
+    copy of its exchanger's inlet (renamed ``s_<index>__Util_<index>``) and
+    of its outlet re-flashed at its own enthalpy.
+
+    Returns
+    -------
+    pinch_T_arr : numpy.ndarray
+        Per-stream pinch temperature (see `synthesize_network`).
+    hot_util_load, cold_util_load : float
+        MER targets of `problem_table` [kJ/hr].
+    T_in_arr, T_out_arr : numpy.ndarray
+        Inlet and quenched outlet temperatures [K].
+    hxs : list[Unit]
+        The original heat exchangers, in stream order.
+    hot_indices, cold_indices, indices : list[int]
+        Stream indices of the hot streams, the cold streams, and all
+        (cold first).
+    streams_inlet, hx_utils_rearranged, streams_quenched : list
+        Inlet copies, heat utilities and quenched outlet copies, in stream
+        order.
+
+    """
+    return _pinch_analysis(hus, T_min_app, force_ideal_thermo,
+                           sort_hus_by_T)[:12]
+
+def pinch_state(stream_in, stream_out, T_pinch, side=None, curve=None):
     """
     Return a copy of the stream in the state it has when it crosses the
     pinch, with enthalpy guaranteed to lie within [min(H_in, H_out),
     max(H_in, H_out)].
 
-    `stream_in` and `stream_out` are the stream's real end states (the
-    outlet quenched to equilibrium at its own enthalpy). For an interior
-    pinch the inlet copy is flashed at `T_pinch`; the result is used as is
-    when its enthalpy lies within the stream's own range. Otherwise the
-    stream never passes through that equilibrium state: a non-equilibrium
-    inlet (e.g. a superheated liquid from a non-rigorous HXutility) has
-    less enthalpy than the equilibrium fluid at the pinch, and the state
-    returned is instead the equilibrium state at the nearer end enthalpy.
-    The same end state is returned when `T_pinch` coincides with an end
-    temperature, because flashing a non-equilibrium inlet at its own
-    temperature does not reproduce `H_in` (and the result may even lie
-    inside the range). Using the *equilibrium* state at the end enthalpy,
+    Parameters
+    ----------
+    stream_in, stream_out : Stream
+        The stream's real end states (the outlet quenched to equilibrium at
+        its own enthalpy).
+    T_pinch : float
+        The stream's (real, unshifted) pinch temperature [K].
+    side : str, optional
+        Branch of a flat (isothermal) segment of the stream at `T_pinch`
+        (latent heat or a non-equilibrium end jump): 'right' takes its
+        high-enthalpy end (the load at the pinch goes below the pinch),
+        'left' its low-enthalpy end (the load goes above). Pass ``side =
+        'right' if cut == 'below' else 'left'``, with ``cut`` the pinch cut
+        of the table (`_pinch_cut`), to split every stream consistently
+        with the targets. If not given, an end temperature returns that
+        end's state (below) and elsewhere hot streams take 'right' and cold
+        streams 'left'.
+    curve : StreamCurve, optional
+        Prebuilt curve of the stream (e.g. from `_problem_table`); built
+        here if needed and not given.
+
+    Notes
+    -----
+    The state comes from the stream's temperature-enthalpy curve (see
+    `problem_table`), so it is deterministic: a pinch at the stream's own
+    saturation temperature is resolved by `side`, never by whatever phase
+    split a previous flash left, and a pinch inside a glide gets the
+    table's enthalpy. Inside the stream's temperature range the enthalpy is
+    clipped to its real range, as in the table: a non-equilibrium inlet
+    (e.g. a superheated liquid from a non-rigorous HXutility) has less
+    enthalpy than the equilibrium fluid at the pinch, so the state returned
+    is instead the equilibrium state at the nearer end enthalpy. Without
+    `side`, `T_pinch` equal to an end temperature returns that end's state
+    (the equilibrium state at the end enthalpy, see `_end_state`), because
+    flashing a non-equilibrium inlet at its own temperature does not
+    reproduce `H_in`. Using the *equilibrium* state at the end enthalpy,
     rather than the stream as given, keeps the synthesizer consistent with
     the problem table: the heat is offered at the temperature the
-    equilibrium model says it is available, not at a fictitious one; see
-    `_end_state` for the fallback when that state is unphysical.
+    equilibrium model says it is available, not at a fictitious one.
 
     Either way the hot-side and cold-side loads split `|H_in - H_out|`
-    exactly and the transient stream used for matching never carries heat
-    the real stream does not have. This is the synthesizer's counterpart of
-    the clipping done by `_stream_H_at_boundaries` for the problem table.
-    """
-    T_lo, T_hi = sorted((stream_in.T, stream_out.T))
-    if T_pinch == stream_in.T: return _end_state(stream_in, T_lo, T_hi)
-    if T_pinch == stream_out.T: return _end_state(stream_out, T_lo, T_hi)
-    stream = stream_in.copy()
-    stream.vle(T=T_pinch, P=stream.P)
-    H_in = stream_in.H
-    H_out = stream_out.H
-    H_lo, H_hi = sorted((H_in, H_out))
-    H = stream.H
-    if H_lo <= H <= H_hi: return stream
-    H_clipped = H_lo if H < H_lo else H_hi
-    return _end_state(stream_in if H_clipped == H_in else stream_out, T_lo, T_hi)
+    exactly, and the state never carries heat the real stream does not
+    have.
 
-def load_duties(streams, streams_quenched, pinch_T_arr, T_out_arr, indices, is_cold, Q_hot_side, Q_cold_side):
+    A standalone analysis helper (see also `load_duties`): the network
+    synthesis does not split streams at a pinch temperature, it plans on
+    the curves themselves (see `synthesize_network`).
+    """
+    if side is None:
+        T_lo, T_hi = sorted((stream_in.T, stream_out.T))
+        if T_pinch == stream_in.T: return _end_state(stream_in, T_lo, T_hi)
+        if T_pinch == stream_out.T: return _end_state(stream_out, T_lo, T_hi)
+    if curve is None: curve = StreamCurve(stream_in, stream_out)
+    if side is None: side = 'right' if curve.is_hot else 'left'
+    return curve.state_at_T(T_pinch, side)
+
+def load_duties(streams, streams_quenched, pinch_T_arr, T_out_arr, indices,
+                is_cold, Q_hot_side, Q_cold_side):
+    """
+    Fill `Q_hot_side` and `Q_cold_side` with each stream's duty above and
+    below its pinch temperature, ``[kind, duty]`` with kind 'heat' (cold
+    streams) or 'cool' (hot streams) and duties below 0.01 kJ/hr set to 0,
+    from the stream's `pinch_state` at ``pinch_T_arr[index]`` (e.g. from
+    `temperature_interval_pinch_analysis`). A standalone analysis helper,
+    like `pinch_state`: `synthesize_network` does not use it.
+    """
     for index in indices:
         H_in = streams[index].H
         H_out = streams_quenched[index].H
-        H_pinch = pinch_state(streams[index], streams_quenched[index], pinch_T_arr[index]).H
+        H_pinch = pinch_state(streams[index], streams_quenched[index],
+                              pinch_T_arr[index]).H
         if not is_cold(index):
             dH1 = H_in - H_pinch
             dH2 = H_pinch - H_out
@@ -547,20 +709,427 @@ def load_duties(streams, streams_quenched, pinch_T_arr, T_out_arr, indices, is_c
             if abs(dH2)<0.01: dH2 = 0
             Q_hot_side[index] = ['heat', dH1]
             Q_cold_side[index] = ['heat', dH2]
-            
-            
-def get_T_transient(pinch_T_arr, indices, T_in_arr):
-    T_transient = pinch_T_arr.copy()
-    T_transient[indices] = T_in_arr[indices]
-    return T_transient
+
+
+# %% Network synthesis
+
+#: Exact-state approach acceptance [K]. Synthesized process exchangers get
+#: ``HXprocess(dT=T_min_app - _APPROACH_TOL)`` as a guard only: the planner
+#: and the exactness check enforce `T_min_app` on the exact states.
+_APPROACH_TOL = 1e-6
+#: A simulated process-exchanger duty that differs from the planned one by
+#: more than this times the two streams' total duties is a deviation.
+_DUTY_TOL = 1e-6
+#: Status 'mer' needs the utilities of the realized network (from the
+#: simulated duties) within this times the total stream duty of the targets:
+#: the accuracy of the enthalpy flashes that realize the plan (the plan
+#: itself reaches the targets within `hensmith._planner._MER_TOL`).
+_ACHIEVED_TOL = 1e-6
+#: Rounds of exact-state verification and local knot refinement.
+_MAX_REFINE = 3
+
+def _grid_knots(curves, grid):
+    """
+    Knots ``(T, H - H_lo)`` of every stream on the problem-table grid, the
+    planner's model of the stream: at every grid temperature inside the
+    stream's own range, its left and right enthalpy limits there (two knots
+    where the curve has a flat). Every breakpoint of every curve is a grid
+    point and the table is linear between grid points, so the planner's
+    cascade on these knots is exactly the table's. Enthalpies are relative
+    to the stream's H_lo, so that large absolute enthalpies cost the planner
+    no precision.
+    """
+    Ts, shift, Hl, Hr = grid['Ts'], grid['shift'], grid['Hl'], grid['Hr']
+    knots = []
+    for j, curve in enumerate(curves):
+        k = np.arange(grid['k_lo'][j], grid['k_hi'][j] - 1, -1) # ascending T
+        T = np.repeat(Ts[k] + shift[j], 2)
+        H = np.column_stack((Hl[j, k], Hr[j, k])).ravel() - curve.H_lo
+        keep = np.ones(T.size, dtype=bool)
+        keep[1::2] = Hr[j, k] != Hl[j, k]
+        knots.append((T[keep], H[keep]))
+    return knots
+
+def _knot_T(knots, H, hot):
+    """
+    Temperature of a knot curve at enthalpies `H`, linear between knots; a
+    vertical stretch (a clipped non-equilibrium end) counts at its lowest
+    temperature for a hot stream and at its highest for a cold one, as in
+    the planner.
+    """
+    T, Hk = knots
+    rises = np.diff(Hk) > 0.
+    if hot: keep = np.concatenate(([True], rises))
+    else: keep = np.concatenate((rises, [True]))
+    return np.interp(H, Hk[keep], T[keep])
+
+def _curve_tol_T(curve):
+    """Largest distance [K] between a stream's linearized curve (and so its
+    grid knots) and its exact states."""
+    if not curve.monotone: return 0.
+    return max(curve.tol_T, curve.glide_error)
+
+def _interval_min(f, a, fa, b, fb):
+    """
+    Minimum of a smooth function `f` on [a, b], given its end values.
+
+    A minimum inside the interval shows at an end as a slope that points
+    into it (f falls from `a`, or rises into `b`); both one-sided slopes are
+    taken from a step of 1e-6 of the interval. Without such a slope the
+    minimum is an end (the smooth pieces of temperature-enthalpy curves
+    bend one way over a knot interval). Otherwise a scan of the interval
+    brackets the dip and golden-section search narrows it to 1e-7 of the
+    interval. Returns the smallest value found.
+    """
+    eps = 1e-6 * (b - a)
+    fa_ = f(a + eps)
+    fb_ = f(b - eps)
+    if fa_ >= fa and fb_ >= fb: return min(fa, fb)
+    xs = [a, a + eps, *np.linspace(a, b, 9)[1:-1].tolist(), b - eps, b]
+    fs = [fa, fa_, *[f(x) for x in xs[2:-2]], fb_, fb]
+    k = int(np.argmin(fs))
+    if k in (0, len(xs) - 1): return fs[k]
+    lo, x, hi, fx = xs[k - 1], xs[k], xs[k + 1], fs[k]
+    g = 0.5 * (3. - 5.**0.5)  # golden section
+    xtol = 1e-7 * (b - a)
+    while hi - lo > xtol:
+        u = x + g * (hi - x) if hi - x > x - lo else x - g * (x - lo)
+        fu = f(u)
+        if fu < fx:
+            if u > x: lo = x
+            else: hi = x
+            x, fx = u, fu
+        elif u > x: hi = u
+        else: lo = u
+    return fx
+
+def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
+                        T_min_app):
+    """
+    Exact-state check of one counter-current exchanger of duty `Q` in which
+    stream `h` enters hot at `H_hot_in` and stream `c` enters cold at
+    `H_cold_in` (enthalpies relative to each stream's H_lo).
+
+    The positions are the ends and every knot and curve breakpoint inside
+    the exchanger. Between two consecutive positions both knot curves are
+    linear, so the planned approach (on the knots) is too, and each stream's
+    exact states are within `_curve_tol_T` of its knots: an interval whose
+    two ends have a planned approach of at least `T_min_app` plus that
+    margin is feasible on the exact states. Every other interval is
+    checked with `StreamCurve.T_exact` at its ends and midpoint and, where
+    the exact approach is not linear (curved single-phase stretches and
+    glides), searched for a minimum inside it (`_interval_min`).
+
+    Returns the smallest approach found [K] (exact where evaluated) and the
+    exact states ``(T_hot, H_hot, T_cold, H_cold)`` wherever the exact
+    approach is below ``T_min_app - _APPROACH_TOL``. With ``T_min_app =
+    inf`` every interval is checked, so the approach returned is the exact
+    minimum over the exchanger and the states are all those evaluated.
+    This is the only exact internal-approach check of the synthesis (the
+    exchangers themselves, `HXprocess`, check their two terminals only,
+    which misses an internal pinch at a phase change).
+    """
+    hot, cold = curves[h], curves[c]
+    H_hot_out, H_cold_out = H_hot_in - Q, H_cold_in + Q
+    qs = [0., Q]
+    for H in (knots[h][1], hot.H - hot.H_lo):
+        qs.extend(H_hot_in - H[(H > H_hot_out) & (H < H_hot_in)])
+    for H in (knots[c][1], cold.H - cold.H_lo):
+        qs.extend(H_cold_out - H[(H > H_cold_in) & (H < H_cold_out)])
+    qs = np.unique(np.clip(qs, 0., Q))
+    planned = (_knot_T(knots[h], H_hot_in - qs, True)
+               - _knot_T(knots[c], H_cold_out - qs, False))
+    near = planned < T_min_app + _curve_tol_T(hot) + _curve_tol_T(cold) + 1e-9
+    limit = T_min_app - _APPROACH_TOL
+    points = []
+    states = {}
+
+    def exact(q):
+        if q not in states:
+            T_hot = hot.T_exact(hot.H_lo + H_hot_in - q, 'low')
+            T_cold = cold.T_exact(cold.H_lo + H_cold_out - q, 'high')
+            states[q] = dT = T_hot - T_cold
+            if dT < limit:
+                points.append((T_hot, H_hot_in - q, T_cold, H_cold_out - q))
+        return states[q]
+
+    worst = float(planned[~near].min()) if not near.all() else np.inf
+    if qs.size == 1:
+        if near[0]: worst = min(worst, exact(qs[0]))
+        return worst, points
+    for k in np.flatnonzero(near[:-1] | near[1:]):
+        a, b = qs[k], qs[k + 1]
+        fa, fm, fb = exact(a), exact(0.5 * (a + b)), exact(b)
+        worst = min(worst, fa, fm, fb)
+        if abs(fa + fb - 2. * fm) > 1e-9: # not linear: look for a dip
+            worst = min(worst, _interval_min(exact, a, fa, b, fb))
+    return worst, points
+
+def _exact_approach(plan, duties, ends, curves, knots, T_min_app):
+    """
+    `_exchanger_approach` of every exchanger in `duties` (duty by index into
+    ``plan.exchangers``) at the enthalpies of the walk `ends` (see `_walk`).
+    Returns the smallest approach [K], the violating exact states by stream,
+    ``{stream: [(T_exact, H - H_lo), ...]}``, and the violating exchangers.
+    """
+    worst = np.inf
+    violations = {}
+    bad = []
+    for n, Q in duties.items():
+        e = plan.exchangers[n]
+        h, c = e.hot, e.cold
+        approach, points = _exchanger_approach(
+            curves, knots, h, c, ends[n, h][0], ends[n, c][0], Q, T_min_app
+        )
+        worst = min(worst, approach)
+        if points: bad.append(n)
+        for T_hot, H_hot, T_cold, H_cold in points:
+            violations.setdefault(h, []).append((T_hot, H_hot))
+            violations.setdefault(c, []).append((T_cold, H_cold))
+    return worst, violations, bad
+
+def _shrink(curves, knots, h, c, H_hot_in, H_cold_in, Q, T_min_app):
+    """
+    Largest duty ``Q' <= Q`` (to 1e-9 of Q) at which the exchanger of
+    `_exchanger_approach` keeps ``T_min_app - _APPROACH_TOL`` on the exact
+    states. With both inlets fixed, a smaller duty lowers the cold stream's
+    enthalpy (so its temperature) at every position and shortens the
+    exchanger, so the approach can only grow: the feasible duties form an
+    interval [0, Q'] and bisection finds its end.
+    """
+    def ok(x):
+        return not _exchanger_approach(curves, knots, h, c, H_hot_in,
+                                       H_cold_in, x, T_min_app)[1]
+    lo, hi = 0., Q
+    # a first guess from the local heat capacity flow rates saves most of
+    # the bisection: the violations are within the chord error of the knots
+    approach, _ = _exchanger_approach(curves, knots, h, c, H_hot_in,
+                                      H_cold_in, Q, T_min_app)
+    CP = 0.
+    for j in (h, c):
+        T, H = knots[j]
+        dT = np.diff(T)
+        dH = np.diff(H)
+        slopes = dH[dT > 0.] / dT[dT > 0.]
+        if slopes.size: CP = max(CP, float(slopes.max()))
+    guess = Q - 2. * (T_min_app - approach) * CP
+    if 0. < guess < Q and ok(guess): lo = guess
+    while hi - lo > 1e-9 * Q:
+        mid = 0.5 * (lo + hi)
+        if ok(mid): lo = mid
+        else: hi = mid
+    return lo
+
+def _repair(plan, duties, knots, is_hot, curves, T_min_app):
+    """
+    Shrink every exchanger that falls short of ``T_min_app - _APPROACH_TOL``
+    on the exact states to its largest feasible duty (`_shrink`); the rest of
+    its duty goes to the utilities. Shrinking a match moves the later stages
+    of both its streams toward their inlets, which never reduces another
+    exchanger's approach (the curves are monotone), so one pass suffices;
+    the loop only guards against rounding. Returns the new duties and the
+    changes, ``[(n, Q_before, Q_after)]``.
+    """
+    duties = dict(duties)
+    changes = []
+    for _ in range(len(duties) + 1):
+        ends = _walk(plan, duties, knots, is_hot)[0]
+        bad = _exact_approach(plan, duties, ends, curves, knots, T_min_app)[2]
+        if not bad: break
+        for n in bad:
+            e = plan.exchangers[n]
+            ends = _walk(plan, duties, knots, is_hot)[0]
+            Q = _shrink(curves, knots, e.hot, e.cold, ends[n, e.hot][0],
+                        ends[n, e.cold][0], duties[n], T_min_app)
+            changes.append((n, duties[n], Q))
+            duties[n] = Q
+    return duties, changes
+
+def _refine_knots(knots, violations):
+    """
+    Return `knots` with the exact states of `violations` inserted (or, at an
+    existing knot, i.e. a chord point inside a glide, corrected), clamped
+    between the neighbouring knot temperatures so that every curve stays
+    monotone.
+    """
+    knots = list(knots)
+    for j, points in violations.items():
+        T, H = knots[j]
+        T, H = T.tolist(), H.tolist()
+        for T_new, H_new in sorted(points, key=lambda p: p[1]):
+            i = int(np.searchsorted(H, H_new))
+            if i < len(H) and H[i] == H_new:
+                lo = T[i - 1] if i > 0 else T_new
+                hi = T[i + 1] if i + 1 < len(T) else T_new
+                T[i] = min(max(T_new, lo), hi)
+            else:
+                lo = T[i - 1] if i > 0 else T_new
+                hi = T[i] if i < len(T) else T_new
+                T.insert(i, min(max(T_new, lo), hi))
+                H.insert(i, H_new)
+        knots[j] = (np.array(T), np.array(H))
+    return knots
+
+def _enthalpy_limit(curve, s_in, H, hot):
+    """
+    `H` if `HXprocess` can take it as the enthalpy limit of the stream of
+    `curve` entering an exchanger in state `s_in`, else None (the other
+    stream's limit then sets the duty).
+
+    `HXprocess` flashes the stream to the limit and rejects an equilibrium
+    state on the wrong side of the inlet temperature (a heated stream
+    colder than its inlet). On a monotone curve that happens only strictly
+    inside a non-equilibrium end jump (see `StreamCurve.jumps`). A
+    point-load stream's (non-monotone curve's) equilibrium states are not
+    ordered with its real inlet temperature: e.g. a liquid fed above its
+    bubble point and boiled to its dew point, colder than its feed, has
+    every state past its real inlet on the wrong side, its outlet included.
+    It enters its first exchanger at equilibrium at its inlet enthalpy
+    instead (see `_first_inlet`), from which its states are ordered, unless
+    that flash failed. So the equilibrium state at `H` is compared with the
+    inlet directly.
+    """
+    if curve.monotone:
+        tol = curve.tol_H
+        inside = any(H_a + tol < H < H_b - tol for H_a, H_b in curve.jumps)
+        return None if inside else H
+    try:
+        T = curve.state_at_H(H).T
+    except Exception:
+        return None
+    past = T <= s_in.T + _T_SIDE if hot else T >= s_in.T - _T_SIDE
+    return H if past else None
+
+def _first_inlet(stream, point_load, T_point, hot):
+    """
+    Bring `stream`, a copy of a process stream's real inlet, in place to
+    the state in which the stream enters its first process exchanger: the
+    real inlet, except that a point-load stream (non-monotone
+    `StreamCurve`, whose whole duty is planned at its outlet temperature
+    `T_point`; `hot` if it is cooled) enters at equilibrium at its inlet
+    enthalpy and pressure, which lies on the plan's side of `T_point`
+    (see `hensmith._curves._point_load_inlet`; kept as given if that flash
+    fails). The enthalpy is the same either way, so no balance changes.
+
+    `HXprocess` judges a match by the inlet temperatures (the hotter inlet
+    is the hot stream, no heat moves unless they are more than `dT` apart,
+    and the partner's outlet is capped at the inlet temperature -/+ `dT`),
+    so a point-load stream's real inlet, on the wrong side of `T_point` by
+    definition, would make it refuse or cut short a match that the plan
+    keeps `T_min_app` for at `T_point`. E.g. a reboiler fed as a liquid
+    above its boiling point enters as the vapor-liquid mixture it flashes
+    to, and a vapor fed below its dew point (e.g. the ideal-thermo copy of
+    a saturated vapor whose ideal dew point is higher) as the mixture it
+    partially condenses to, hotter than its feed.
+    """
+    if point_load: stream.copy_like(_point_load_inlet(stream, T_point, hot))
+
+class _RealizationError(Exception):
+    """An exchanger of the plan could not be simulated."""
+    def __init__(self, n, ID, error):
+        super().__init__(n, ID, error)
+        self.n, self.ID, self.error = n, ID, error
+
+def _walk(plan, duties, knots, is_hot):
+    """
+    Enthalpies (relative to each stream's H_lo) at which every stream enters
+    and leaves each of its exchangers in `duties` (duty by index into
+    ``plan.exchangers``), walking it in flow order from its inlet
+    (``plan.stages``), and at which it enters its utility; plus the pair
+    index of every exchanger (its rank among the exchangers of the same
+    (side, hot, cold) pair, in the order the hot stream meets them). A
+    smaller duty (a dropped or shrunk match) shifts the later stages of both
+    streams toward their inlets.
+    """
+    ends = {}
+    last = []
+    for j, hot in enumerate(is_hot):
+        H = knots[j][1][-1] if hot else 0.
+        for n in plan.stages[j]:
+            if n not in duties: continue
+            Q = duties[n]
+            H_next = H - Q if hot else H + Q
+            ends[n, j] = (H, H_next)
+            H = H_next
+        last.append(H)
+    count = {}
+    pair_index = {}
+    for j, hot in enumerate(is_hot):
+        if not hot: continue
+        for n in plan.stages[j]:
+            if n not in duties: continue
+            e = plan.exchangers[n]
+            key = (e.side, e.hot, e.cold)
+            count[key] = pair_index[n] = count.get(key, 0) + 1
+    return ends, last, pair_index
+
+def _discard(units):
+    """Remove units, and the streams connected to them, from the registry of
+    the active flowsheet (after a failed realization)."""
+    for unit in units:
+        for s in (*unit.ins, *unit.outs): bst.main_flowsheet.stream.discard(s)
+        bst.main_flowsheet.unit.discard(unit)
+
+def _realize(plan, duties, curves, knots, streams_inlet, is_hot, T_min_app):
+    """
+    Build and run one plain `HXprocess` per exchanger in `duties` (duty by
+    index into ``plan.exchangers``), in plan order. Raise
+    `_RealizationError` (after discarding the units built so far) if one of
+    them cannot be simulated. Returns ``(units, first, last)``: the units by
+    exchanger index, each stream's first exchanger (None if it has none)
+    and the enthalpy at which it enters its utility (relative to its H_lo).
+    """
+    ends, last, pair_index = _walk(plan, duties, knots, is_hot)
+    first = [next((n for n in plan.stages[j] if n in duties), None)
+             for j in range(len(is_hot))]
+    units = {}
+    dT = T_min_app - _APPROACH_TOL
+    for n in sorted(duties):
+        e = plan.exchangers[n]
+        h, c = e.hot, e.cold
+        suffix = '' if pair_index[n] == 1 else f'_{pair_index[n]}'
+        if e.side == 'above':
+            ID = f'HX_{c}_{h}_hs{suffix}'
+            ports = (c, h)
+        else:
+            ID = f'HX_{h}_{c}_cs{suffix}'
+            ports = (h, c)
+        ins, outs, H_lims = [], [], []
+        for j in ports:
+            curve = curves[j]
+            H_in, H_out = ends[n, j]
+            if first[j] == n:
+                s = _copy(streams_inlet[j]) # the real inlet state
+                _first_inlet(s, not curve.monotone, curve.T_out, is_hot[j])
+            else:
+                s = curve.state_at_H(curve.H_lo + H_in)
+            s.ID = f's_{j}__{ID}'
+            ins.append(s)
+            outs.append(s.copy(f'{ID}__s_{j}'))
+            # a planned outlet whose equilibrium state is not past the inlet
+            # (inside a non-equilibrium end jump, or a point load's): leave
+            # it to the other stream's limit
+            H_lims.append(_enthalpy_limit(curve, s, curve.H_lo + H_out,
+                                          is_hot[j]))
+        hx = bst.HXprocess(ID=ID, ins=ins, outs=outs, H_lim0=H_lims[0],
+                           H_lim1=H_lims[1], dT=dT, thermo=ins[0].thermo)
+        units[n] = hx
+        try:
+            hx._run()
+        except Exception as error:
+            _discard(units.values())
+            raise _RealizationError(n, ID, error)
+    return units, first, last
 
 def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
-                       avoid_recycle=False, sort_hus_by_T=False):  
+                       avoid_recycle=False, sort_hus_by_T=False, info=None):
     """
-    Synthesize a heat exchanger network for the process streams behind a
-    set of utility heat exchangers, with pinch analysis followed by a
-    sequential, heuristic matching of hot and cold streams on each side of
-    the pinch.
+    Synthesize a heat exchanger network without stream splits for the
+    process streams behind a set of utility heat exchangers: pinch analysis
+    (`problem_table`), then a pinch-outward plan that reaches the minimum
+    energy requirement (MER) targets whenever the search finds an unsplit
+    network that does, realized with one `HXprocess` per match and one
+    rigorous `HXutility` per stream.
 
     Parameters
     ----------
@@ -572,403 +1141,398 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         dropped. Heating utilities are placed before cooling utilities;
         within each group the given order is kept unless `sort_hus_by_T`.
         All returned per-stream arrays and lists are indexed in that
-        rearranged order (the stream index). That order is also the
-        matching priority: the outer loop of each design pass and both
-        loops of each offset pass walk the streams by index.
-        `HeatExchangerNetwork` passes the utilities sorted by signed duty,
-        so by default the cold stream with the smallest heating duty and
-        the hot stream with the largest cooling duty are tried first.
+        rearranged order (the stream index), which also breaks ties in the
+        planner's search.
     T_min_app : float, optional
-        Minimum approach temperature [K]: required between the streams of
-        every candidate match, enforced on every synthesized exchanger
-        (``HXprocess(dT=T_min_app)``) and used to shift hot streams in the
-        problem table. Defaults to 5.
+        Minimum approach temperature [K]: kept on the exact stream states
+        at both ends of and everywhere inside every process exchanger, and
+        used to shift hot streams in the problem table. Defaults to 5.
     Qmin : float, optional
-        Candidate exchangers with a duty below this [kJ/hr] are discarded.
+        Planned exchangers with a duty below this [kJ/hr] are dropped and
+        their duty left to the utilities (a large value can cost MER).
         Defaults to 1e-3.
     force_ideal_thermo : bool, optional
         Analyze copies of the streams with ideal thermodynamics
         (``thermo.ideal()``); the synthesized exchangers inherit that
         thermo. Defaults to False.
     avoid_recycle : bool, optional
-        Never match the same (hot, cold) pair twice across the passes, so no
-        two exchangers connect the same pair of streams (a second exchanger
-        between them can form a recycle loop in the network). Defaults to
-        False.
+        Never match the same (hot, cold) pair twice anywhere, so no two
+        exchangers connect the same pair of streams (a second exchanger
+        between them can form a recycle loop in the network). This
+        forbids the repeated matches that some unsplit MER networks need.
+        Defaults to False.
     sort_hus_by_T : bool, optional
         Sort the heating utilities by inlet temperature, descending, and the
-        cooling utilities ascending, before analysis, so that inlet
-        temperature rather than the given order sets the matching priority.
-        Defaults to False.
+        cooling utilities ascending, before analysis. Defaults to False.
+    info : dict, optional
+        If given, filled with the synthesis report: 'status' ('mer' if the
+        realized network's utilities equal the targets, else
+        'best_effort'), 'Q_hot_target' and 'Q_cold_target' (the problem
+        table's targets), 'Q_hot_plan' and 'Q_cold_plan' (the planned
+        utilities), 'Q_hot' and 'Q_cold' (the utilities of the realized
+        network, from the simulated exchanger duties), 'penalty'
+        (``Q_hot_plan - Q_hot_target``), 'sides' (per side of the pinch:
+        status, method, work, proof of a needed split, gaps, units),
+        'plan_targets' (the planner's own cascade in the first round:
+        Q_hot, Q_cold, pinch_T, cut), 'refine_rounds', 'min_approach' (the
+        smallest approach inside any process exchanger [K]; exact on the
+        stream states wherever it is within the curves' linearization
+        tolerance of `T_min_app`, else from the knots),
+        'deviations' (exchangers whose simulated duty differs from the
+        plan), 'qmin_dropped' (matches dropped by `Qmin`), 'repaired'
+        (matches shrunk to keep `T_min_app` on the exact states, see
+        Notes), 'dropped' (matches that could not be simulated;
+        normally empty) and 'point_loads' (the indices of the streams
+        whose outlet temperature does not move with their duty, e.g. an
+        isothermal condenser or a reboiler fed as a liquid above its
+        boiling point, so that their whole duty is a point load at the
+        outlet temperature; each enters its first process exchanger at
+        equilibrium at its inlet enthalpy, see Notes).
 
     Returns
     -------
     HXs_hot_side : list[HXprocess]
-        Process exchangers of the hot-side (above-pinch) design, IDs
-        ``HX_<cold>_<hot>_hs``; ``ins``/``outs`` [0] is the cold stream and
-        [1] the hot stream.
+        Process exchangers of the hot-side (above-pinch) design, in plan
+        order (from the pinch outward), IDs ``HX_<cold>_<hot>_hs``;
+        ``ins``/``outs`` [0] is the cold stream and [1] the hot stream.
     HXs_cold_side : list[HXprocess]
-        Process exchangers of the cold-side (below-pinch) design, IDs
-        ``HX_<hot>_<cold>_cs``; ``ins``/``outs`` [0] is the hot stream and
-        [1] the cold stream.
+        Process exchangers of the cold-side (below-pinch) design, in plan
+        order, IDs ``HX_<hot>_<cold>_cs``; ``ins``/``outs`` [0] is the hot
+        stream and [1] the cold stream. The n-th exchanger (n >= 2) of the
+        same pair on the same side, counted in the order the hot stream
+        meets them, gets the suffix ``_<n>`` (e.g. ``HX_3_2_cs_2``).
     new_HX_utils : list[HXutility]
-        One rigorous utility exchanger per stream bringing it to its outlet
-        enthalpy, IDs ``Util_<index>_cs`` (hot streams) / ``Util_<index>_hs``
-        (cold streams); listed hot streams first.
+        One rigorous utility exchanger per stream (possibly of zero duty)
+        bringing it from its last process exchanger to its outlet enthalpy,
+        IDs ``Util_<index>_cs`` (hot streams) / ``Util_<index>_hs`` (cold
+        streams); listed hot streams first.
     hxs : list[Unit]
         The original heat exchangers, in stream order.
     T_in_arr, T_out_arr : numpy.ndarray
         Inlet and (quenched) outlet temperatures of each stream [K].
     pinch_T_arr : numpy.ndarray
-        Per-stream pinch temperature [K] at which the stream is split
-        between the hot-side and cold-side designs: the process pinch on
-        the stream's own scale when the stream crosses it
+        Per-stream pinch temperature [K] (informational): the process pinch
+        on the stream's own scale when the stream crosses it
         (`ProblemTable.pinch_T` for a cold stream, that plus `T_min_app` for
         a hot one); the inlet temperature of a stream whose inlet already
         lies past the pinch in its direction of flow, or that is isothermal
-        or non-monotone (its whole duty then falls on one side); the outlet
-        temperature of a stream that ends before reaching the pinch.
+        or non-monotone; the outlet temperature of a stream that ends
+        before reaching the pinch.
     C_flow_vector : numpy.ndarray
-        Heat capacity flow rate of each stream, ``|Q| / |T_in - T_out|``
-        [kJ/hr/K] (the temperature difference is replaced by 1e-12 for an
-        isothermal stream, which therefore ranks as a very large flow rate).
+        Heat capacity flow rate of each process stream, ``|H_out - H_in| /
+        |T_in - T_out|`` [kJ/hr/K] from its inlet and quenched outlet (the
+        temperature difference is replaced by 1e-12 for an isothermal
+        stream, which therefore ranks as a very large flow rate).
     hx_utils_rearranged : list[HeatUtility]
         The heat utilities of `hus` in stream order.
     streams_inlet : list[Stream]
         One copy of each stream's inlet, in stream order, as prepared for
         the analysis (ideal-thermo copies if `force_ideal_thermo`). The
-        synthesis works on further copies, so these keep their inlet state.
+        network works on further copies, so these keep their inlet state.
     stream_HXs_dict : dict[int, list[Unit]]
-        Exchangers (process, then utility) each stream index passes through,
-        in synthesis order (not flow order; see `StreamLifeCycle`).
+        For each stream index, its process exchangers in flow order, then
+        its utility exchanger.
     hot_indices, cold_indices : list[int]
         Stream indices of the hot and cold streams.
 
     Notes
     -----
-    The outlet of every stream is first quenched to equilibrium at its own
-    enthalpy (``s.vle(H=s.H, P=s.P)``) and `problem_table` locates the
-    pinch. Hot streams enter the cold-side design, and cold streams the
-    hot-side design, in the state they have when they cross the pinch
-    (`pinch_state`, with enthalpy clipped to the stream's real range); on
-    the other side each stream enters at its inlet state. The synthesis
-    then proceeds in four passes, of which the first three create
-    `HXprocess` units that exchange as much heat as the approach
-    temperature (`dT`), the outlet enthalpy of one stream (`H_lim0`) and a
-    temperature limit on the other (`T_lim1`) allow:
+    *Curves and targets.* Every stream's outlet is quenched to equilibrium
+    at its own enthalpy and described by a piecewise-linear temperature-
+    enthalpy curve (see `problem_table`), built once. The problem table
+    [Kemp07]_ on the union of all breakpoints gives the targets, the pinch
+    and the side of the pinch that point loads at the pinch temperature
+    belong to. The planner models each stream by its knots on that grid,
+    which reproduces the table's cascade exactly.
 
-    1. *Cold-side design.* For each hot stream, candidate cold streams with
-       heat-capacity flow rate at most that of the hot stream and a current
-       temperature more than `T_min_app` below the hot stream's, ranked by
-       ``min(C_hot, C_cold) * (T_hot - T_cold - T_min_app)``, are matched
-       in that order (`T_lim1` is the cold stream's pinch temperature) until
-       the hot stream reaches its outlet enthalpy. Streams lying entirely
-       above the pinch, and isothermal or non-monotone streams, are
-       excluded.
-    2. *Hot-side design.* The mirror image for each cold stream, with the
-       heat-capacity flow rate inequality reversed (`T_lim1` is the hot
-       stream's pinch temperature), until the cold stream reaches its
-       outlet enthalpy. Streams lying entirely below the pinch, and
-       isothermal or non-monotone streams, are excluded.
-    3. *Offset passes.* Remaining cold-side heating demands, then remaining
-       hot-side cooling demands, are matched in index order with streams
-       that still have the opposite demand on that side and are at least
-       `T_min_app` away, without the flow-rate inequality and with `T_lim1`
-       the other stream's outlet temperature (in the hot-side pass a cold
-       stream is taken at its furthest state across both sides).
-    4. *Utility exchangers* (rigorous `HXutility`) finish every stream from
-       its furthest state to its outlet enthalpy; an `AssertionError` is
-       raised if the result does not reproduce the stream's quenched outlet
-       within tolerance.
+    *Planner.* Each stream is cut at the pinch; above it the hot streams,
+    below it the cold streams must be served completely by process matches
+    ("musts"), while the partners ("flexes") leave any remainder to a
+    utility at their far end. A depth-first search builds each side from
+    the pinch outward, one match at a time. Every match keeps `T_min_app`
+    at every knot (so internal pinches, e.g. a condensing vapor against a
+    boiling mixture, are respected), and every step keeps the problem
+    table of the remaining problem feasible (remaining problem analysis
+    [Smith05]_, as a closed-form bound on the duty). At every level where
+    that table is tight, the pinch design rules [LH83]_ (see also
+    [Seider17]_, Chapter 9; number and heat-capacity-flow rules,
+    generalized to isothermal segments, which can serve several partners
+    in series) must hold; at the pinch itself a violation proves that MER
+    needs stream splitting.
+    Candidate duties are the largest feasible one and a finite set of
+    events (a stream ticked off, a partner saved for another stream, a
+    switch of partner, a return). The same pair may be matched repeatedly,
+    which emulates a split by series alternation. Budgets are counted in
+    deterministic work units, so results do not depend on machine speed.
+    A branch and bound then reduces the number of exchangers. A side that
+    is proven to need splits, or whose search runs out of budget, gets a
+    best-effort plan: heat a must cannot place is moved to its pinch end,
+    where it crosses the pinch at the cost of an equal amount of extra hot
+    and cold utility (the penalty), minimized by greedy dives and a
+    bisection of these gaps. See `hensmith._planner` for the details.
 
-    The heat-capacity flow rate inequalities of passes 1 and 2 are the
-    feasibility criteria of the pinch design method [LH83]_ (see also
-    [Seider17]_, Chapter 9). A match is attempted at most once per exchanger
-    ID and dropped when the exchanger cannot be simulated or its duty is
-    below `Qmin`; each successful match advances the working states of both
-    streams. `HeatExchangerNetwork` calls this function and turns the result
-    into a `System` that it converges and costs.
+    *Realization.* Each stream is walked in flow order from its inlet: a
+    hot stream through its hot-side matches from its inlet end, then its
+    cold-side matches, then its cooler; a cold stream through its
+    cold-side matches, then its hot-side matches, then its heater.
+    Each match becomes a plain `HXprocess` whose two enthalpy limits
+    (`H_lim0`, `H_lim1`) are the planned outlet enthalpies, so that its
+    duty reproduces the plan; its `dT` is ``T_min_app - 1e-6`` K, only a
+    guard against rounding (the approach is enforced by the plan and the
+    check below). A planned outlet whose equilibrium state is not past the
+    stream's state at the exchanger inlet cannot be a limit (`HXprocess`
+    rejects it): one strictly inside a non-equilibrium end jump (see
+    `StreamCurve.jumps`), or on a point-load stream colder (hotter) than
+    its inlet state when heated (cooled). That stream's limit is left out
+    and the other stream's sets the duty; a match in which neither stream
+    can take a limit runs to its `dT` guard (a deviation if its duty
+    differs). A stream's first exchanger gets its real inlet, except a
+    point-load stream (whose outlet temperature does not move with its
+    duty, so the plan places its whole duty there, a temperature its real
+    inlet lies beyond): it enters at equilibrium at its inlet enthalpy,
+    which lies on the plan's side of its outlet temperature (a reboiler
+    fed as a liquid above its boiling point enters as the mixture it
+    flashes to; a vapor fed below its dew point, e.g. under
+    `force_ideal_thermo`, as the mixture it partially condenses to),
+    because `HXprocess` compares the inlet temperatures with `dT` and
+    would refuse or cut short a match planned there. Later exchangers get
+    the stream's exact state at the planned enthalpy.
+    Every exchanger is simulated once; one whose duty differs from the
+    plan is reported in `info`. Each stream ends in one rigorous
+    `HXutility` to its outlet enthalpy; an `AssertionError` is raised if
+    it does not reproduce the quenched outlet within tolerance.
+
+    *Exactness.* The knots are exact at grid points but chords in between
+    (at most 0.002 K off inside glides and curved single-phase stretches).
+    Every planned exchanger is therefore checked on the exact stream states
+    wherever its planned approach is within that margin of `T_min_app`.
+    Where a MER plan falls short by more than 1e-6 K, the exact states are
+    inserted as knots and the network is planned again (at most three
+    rounds). A best-effort plan (or a MER plan still short after the last
+    round) instead has each violating match shrunk to the largest duty that
+    keeps the approach, the rest going to the utilities: with its inlets
+    fixed a smaller duty can only raise a match's approach, and the later
+    stages of both streams move toward their inlets, which never reduces
+    another match's approach. Constant heat capacity streams never need
+    either step.
+
+    *Guarantees and limits.* The utilities are never below the targets.
+    Every process exchanger keeps ``T_min_app - 1e-6`` K on the exact
+    states at its ends and at every checked position inside it, and the
+    heat balance closes on every stream. 'mer' is reported only if the
+    realized network reaches the targets. The result is deterministic.
+    Completeness is empirical, not proven: every pruning test is a
+    necessary condition, so a missed MER network can only come from the
+    finite set of candidate duties, the caps on repeated pairs or the work
+    budgets; the planner reached MER on every unsplit-feasible problem of a
+    certified benchmark of about 1,700 problems with 2-40 streams. Networks
+    whose match order is cyclic cannot be represented. An unsplit MER
+    network can need many exchangers (series alternation approaches a
+    split only in the limit); MER always takes precedence over the number
+    of units. Problems that need stream splits get a best-effort network
+    whose penalty is small but not minimal in general. A side that needs
+    splits without a pinch-rule proof spends its whole MER budget before
+    the best-effort step. Thermosteam's TP flashes fail silently inside
+    the glides of some mixtures (e.g. water-ethanol with 20-50 % ethanol);
+    an exchanger simulated there can deviate from its plan (reported in
+    `info['deviations']`).
+
+    `HeatExchangerNetwork` calls this function, rewires each stream's
+    stages in series, converges the network as a `System` and costs it.
+
+    Examples
+    --------
+    Problem r002: one hot stream against three cold ones (heat capacity
+    flow rates in kW/K, temperatures 300 K above those of the classic
+    problem, T_min_app = 10 K). Its only unsplit MER network matches the
+    hot stream twice with the same cold stream. A constant heat capacity
+    pseudo-component makes 1000 kmol/hr of fluid per kW/K:
+
+    >>> import biosteam as bst, thermosteam as tmo
+    >>> from hensmith.hxn_synthesis import synthesize_network
+    >>> Fluid = tmo.Chemical('Fluid', search_db=False, phase='l', MW=1.,
+    ...                      Cn=3.6, default=True)
+    >>> bst.settings.set_thermo([Fluid], cache=True)
+    >>> def process_stream(ID, T_in, T_out, CP):
+    ...     inlet = bst.Stream(ID + '_in', Fluid=1000. * CP, T=T_in,
+    ...                        units='kmol/hr')
+    ...     hx = bst.HXutility(ID, ins=inlet, T=T_out, rigorous=False)
+    ...     hx.simulate()
+    ...     return hx
+    >>> units = [process_stream('C1', 440., 470., 1.),
+    ...          process_stream('C2', 400., 420., 1.),
+    ...          process_stream('C3', 420., 550., 2.),
+    ...          process_stream('H1', 520., 350., 4.)]
+    >>> hus = [hx.heat_utilities[0] for hx in units]
+    >>> info = {}
+    >>> result = synthesize_network(hus, T_min_app=10., info=info)
+    >>> HXs_hot_side, HXs_cold_side, new_HX_utils = result[:3]
+    >>> for hx in HXs_hot_side + HXs_cold_side:
+    ...     print(hx.ID, round(hx.Q / 3600., 6), 'kW')
+    HX_3_2_cs 160.0 kW
+    HX_3_0_cs 30.0 kW
+    HX_3_2_cs_2 20.0 kW
+    HX_3_1_cs 20.0 kW
+    >>> info['status']
+    'mer'
+
+    The utilities equal the MER targets, 80 kW of heating and 450 kW of
+    cooling:
+
+    >>> duties = [(hx.outs[0].H - hx.ins[0].H) / 3600. for hx in new_HX_utils]
+    >>> round(sum(Q for Q in duties if Q > 0), 6), round(-sum(Q for Q in duties if Q < 0), 6)
+    (80.0, 450.0)
+    >>> round(info['Q_hot_target'] / 3600., 6), round(info['Q_cold_target'] / 3600., 6)
+    (80.0, 450.0)
 
     References
     ----------
     .. [LH83] Linnhoff, B., & Hindmarsh, E. (1983). The pinch design method
         for heat exchanger networks. Chemical Engineering Science, 38(5),
         745-763.
+    .. [Kemp07] Kemp, I. C. (2007). Pinch Analysis and Process Integration
+        (2nd ed.). Butterworth-Heinemann.
+    .. [Smith05] Smith, R. (2005). Chemical Process Design and Integration.
+        Wiley.
     .. [Seider17] Seider, W. D., Lewin, D. R., Seader, J. D., Widagdo, S.,
         Gani, R., & Ng, M. K. (2017). Product and Process Design Principles.
         Wiley. Heat Exchanger Networks (Chapter 9).
 
     """
-    pinch_T_arr, hot_util_load, cold_util_load, T_in_arr, T_out_arr,\
-        hxs, hot_indices, cold_indices, indices, streams_inlet, hx_utils_rearranged, \
-        streams_quenched = temperature_interval_pinch_analysis(hus, T_min_app, force_ideal_thermo,
-                                                               sort_hus_by_T)        
-    H_out_arr = [i.H for i in streams_quenched]
-    duties = np.array([abs(hx.Q)  for hx in hxs])
+    pinch_T_arr, hot_util_load, cold_util_load, T_in_arr, T_out_arr, \
+        hxs, hot_indices, cold_indices, indices, streams_inlet, \
+        hx_utils_rearranged, streams_quenched, table, curves, grid = \
+        _pinch_analysis(hus, T_min_app, force_ideal_thermo, sort_hus_by_T)
+    N = len(hxs)
+    is_hot = [False] * N
+    for i in hot_indices: is_hot[i] = True
+    H_in_arr = np.array([c.H_in for c in curves])
+    H_out_arr = np.array([c.H_out for c in curves])
     dTs = np.abs(T_in_arr - T_out_arr)
-    dTs[dTs == 0.] = 1e-12
-    C_flow_vector = duties/dTs
-    Q_hot_side = {}
-    Q_cold_side = {}
-    stream_HXs_dict = {i:[] for i in indices}
-    is_cold = lambda x: x in cold_indices
-    load_duties(streams_inlet, streams_quenched, pinch_T_arr, T_out_arr, indices, is_cold, Q_hot_side, Q_cold_side)
-    matches_hs = {i: [] for i in cold_indices}
-    matches_cs = {i: [] for i in hot_indices}
-    HXs_hot_side = []
-    HXs_cold_side = []
-    streams_transient_cold_side = [i.copy() for i in streams_inlet]
-    streams_transient_hot_side = [i.copy() for i in streams_inlet]
-    # Hot streams enter the cold-side design at their pinch state and cold
-    # streams enter the hot-side design at theirs; the enthalpy of that
-    # state is clipped to the stream's real range (see `pinch_state`).
-    for i in hot_indices:
-        s = streams_transient_cold_side[i]
-        if s.T != pinch_T_arr[i]:
-            streams_transient_cold_side[i] = pinch_state(s, streams_quenched[i], pinch_T_arr[i])
-    for i in cold_indices:
-        s = streams_transient_hot_side[i]
-        if s.T != pinch_T_arr[i]:
-            streams_transient_hot_side[i] = pinch_state(s, streams_quenched[i], pinch_T_arr[i])
-    
-    def get_stream_at_H_max(cold):
-        s_cs = streams_transient_cold_side[cold]
-        s_hs = streams_transient_hot_side[cold]
-        return s_cs if s_cs.H > s_hs.H else s_hs
-    
-    def get_stream_at_H_min(hot):
-        s_cs = streams_transient_cold_side[hot]
-        s_hs = streams_transient_hot_side[hot]
-        return s_cs if s_cs.H < s_hs.H else s_hs
-    
-    def get_T_transient_cold_side(index):
-        return streams_transient_cold_side[index].T
-    
-    def get_T_transient_hot_side(index):
-        return streams_transient_hot_side[index].T
-    
-    attempts = set()
-    success = set()
-    # ------------- Cold side design ------------- # 
-    unavailables = set([i for i in hot_indices if T_out_arr[i] >= pinch_T_arr[i]])
-    unavailables.update([i for i in cold_indices if T_in_arr[i] >= pinch_T_arr[i]])
-    for hot in hot_indices:
-        stream_quenched = False
-        potential_matches = []
-        for cold in cold_indices:
-            if (C_flow_vector[hot]>= C_flow_vector[cold] and
-                    get_T_transient_cold_side(hot) > get_T_transient_cold_side(cold) + T_min_app and
-                    (hot not in unavailables) and (cold not in unavailables) and
-                    (cold not in matches_cs[hot]) and (cold in cold_indices)): 
-                potential_matches.append(cold)
-        potential_matches = sorted(
-            potential_matches, 
-            key = lambda pot_cold: min(C_flow_vector[hot], C_flow_vector[pot_cold])
-                                    * (get_T_transient_cold_side(hot) 
-                                       - get_T_transient_cold_side(pot_cold)
-                                       - T_min_app),
-            reverse = True
+    C_flow_vector = np.abs(H_out_arr - H_in_arr) / np.maximum(dTs, 1e-12)
+    duty = np.abs(H_out_arr - H_in_arr)
+    scale = float(duty.sum())
+    # Plan on the grid knots and check the plan on the exact states. Where it
+    # falls short, a MER plan is planned again on knots refined with the
+    # exact states (at most _MAX_REFINE rounds); a best-effort plan, or a MER
+    # plan still short after the last round, has its violating matches
+    # shrunk locally instead (a re-plan of a best-effort side repeats its
+    # whole search to recover a duty of the order of the chord error).
+    knots = _grid_knots(curves, grid)
+    for refine_round in range(_MAX_REFINE + 1):
+        plan = plan_network(knots, is_hot, T_min_app,
+                            avoid_recycle=avoid_recycle, Qmin=Qmin)
+        if not refine_round: plan_targets = plan.info['cascade']
+        duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
+        ends = _walk(plan, duties, knots, is_hot)[0]
+        min_approach, violations, bad = _exact_approach(
+            plan, duties, ends, curves, knots, T_min_app
         )
-        for cold in potential_matches:
-            match = (hot, cold)
-            ID = 'HX_%s_%s_cs' % match
-            if ID in attempts or (avoid_recycle and match in success): continue
-            attempts.add(ID)
-            hot_stream = streams_transient_cold_side[hot].copy()
-            cold_stream = streams_transient_cold_side[cold].copy()
-            
-            hot_stream.ID = 's_%s__%s'%(hot,ID)
-            cold_stream.ID = 's_%s__%s'%(cold,ID)
-            hot_out = hot_stream.copy('%s__s_%s'%(ID,hot))
-            cold_out = cold_stream.copy('%s__s_%s'%(ID,cold))
-            H_lim = H_out_arr[hot]
-            new_HX = bst.units.HXprocess(ID = ID, ins = (hot_stream, cold_stream),
-                     outs = (hot_out, cold_out), H_lim0 = H_lim, 
-                     T_lim1 = pinch_T_arr[cold], dT = T_min_app,
-                     thermo = hot_stream.thermo)
-            try: new_HX._run()
-            except: continue
-            if abs(new_HX.Q )< Qmin: continue
-            success.add(match)
-            HXs_cold_side.append(new_HX)
-            stream_HXs_dict[hot].append(new_HX)
-            stream_HXs_dict[cold].append(new_HX)
-            Q_cold_side[hot][1] -= new_HX.Q
-            Q_cold_side[cold][1] -= new_HX.Q
-            streams_transient_cold_side[hot] = new_HX.outs[0]
-            streams_transient_cold_side[cold] = new_HX.outs[1]
-            H_out = new_HX.outs[0].H
-            assert H_out - new_HX.ins[0].H <= 0.
-            stream_quenched = H_out < H_lim or np.allclose(H_out, H_lim)
-            matches_cs[hot].append(cold)
-            if stream_quenched:
-                break
-    
-    # ------------- Hot side design ------------- #                            
-    unavailables = set([i for i in hot_indices if T_in_arr[i] <= pinch_T_arr[i]])
-    unavailables.update([i for i in cold_indices if T_out_arr[i] <= pinch_T_arr[i]])
-    
-    for cold in cold_indices:
-        potential_matches = []
-        for hot in hot_indices:
-            if (C_flow_vector[cold]>= C_flow_vector[hot] and
-                    get_T_transient_hot_side(hot) > get_T_transient_hot_side(cold) + T_min_app and
-                    (hot not in unavailables) and (cold not in unavailables) and
-                    (hot not in matches_hs[cold]) and (hot in hot_indices)):
-                potential_matches.append(hot)
-                
-        potential_matches = sorted(potential_matches, key = lambda x:
-                                    (min(C_flow_vector[cold], C_flow_vector[x])
-                                        * ( get_T_transient_hot_side(x)
-                                          - get_T_transient_hot_side(cold) - T_min_app)),
-                                    reverse = True)
-        stream_quenched = False
-        for hot in potential_matches:
-            match = (hot, cold)
-            ID = 'HX_%s_%s_hs' % (cold, hot)
-            if ID in attempts or (avoid_recycle and match in success): continue
-            attempts.add(ID)
-            hot_stream = streams_transient_hot_side[hot].copy()
-            cold_stream = streams_transient_hot_side[cold].copy()
-            cold_stream.ID = 's_%s__%s'%(cold,ID)
-            hot_stream.ID = 's_%s__%s'%(hot,ID)
-            hot_out = hot_stream.copy('%s__s_%s'%(ID,hot))
-            cold_out = cold_stream.copy('%s__s_%s'%(ID,cold))
-            H_lim = H_out_arr[cold]
-            new_HX = bst.units.HXprocess(ID = ID, ins = (cold_stream, hot_stream),
-                     outs = (cold_out, hot_out), H_lim0 = H_lim,
-                     T_lim1 = pinch_T_arr[hot], dT = T_min_app,
-                     thermo = hot_stream.thermo)
-            try: new_HX._run()
-            except: continue
-            if abs(new_HX.Q)< Qmin: continue
-            success.add(match)
-            HXs_hot_side.append(new_HX)
-            stream_HXs_dict[hot].append(new_HX)
-            stream_HXs_dict[cold].append(new_HX)
-            Q_hot_side[hot][1] -= new_HX.Q
-            Q_hot_side[cold][1] -= new_HX.Q
-            streams_transient_hot_side[cold] = new_HX.outs[0]
-            streams_transient_hot_side[hot] = new_HX.outs[1]
-            H_out = new_HX.outs[0].H
-            assert H_out - new_HX.ins[0].H >= 0.
-            stream_quenched = H_out > H_lim or np.allclose(H_out, H_lim)
-            matches_hs[cold].append(hot)
-            if stream_quenched:
-                break
-    
-    # Offset heating requirement on cold side
-    for cold in cold_indices:
-        if Q_cold_side[cold][0]=='heat' and Q_cold_side[cold][1]>0:
-            for hot in hot_indices:
-                match = (hot, cold)
-                ID = 'HX_%s_%s_cs' % match
-                if ID in attempts or (avoid_recycle and match in success): continue
-                attempts.add(ID)
-                T_cold_in = get_T_transient_cold_side(cold)
-                T_hot_in = get_T_transient_cold_side(hot)
-                if (Q_cold_side[hot][0]=='cool' and Q_cold_side[hot][1]>0 and
-                        T_hot_in - T_cold_in >= T_min_app):
-                    hot_stream = streams_transient_cold_side[hot].copy()
-                    cold_stream = streams_transient_cold_side[cold].copy()
-                    hot_stream.ID = 's_%s__%s'%(hot,ID)
-                    cold_stream.ID = 's_%s__%s'%(cold,ID)
-                    hot_out = hot_stream.copy('%s__s_%s'%(ID,hot))
-                    cold_out = cold_stream.copy('%s__s_%s'%(ID,cold))
-                    new_HX = bst.units.HXprocess(ID = ID, ins = (hot_stream, cold_stream),
-                             outs = (hot_out, cold_out), H_lim0 = H_out_arr[hot],
-                             T_lim1 = T_out_arr[cold], dT = T_min_app,
-                             thermo = hot_stream.thermo)
-                    try: new_HX._run()
-                    except: continue
-                    if abs(new_HX.Q )< Qmin: continue
-                    success.add(match)
-                    HXs_cold_side.append(new_HX)
-                    stream_HXs_dict[hot].append(new_HX)
-                    stream_HXs_dict[cold].append(new_HX)                    
-                    Q_cold_side[hot][1] -= new_HX.Q
-                    Q_cold_side[cold][1] -= new_HX.Q                 
-                    streams_transient_cold_side[hot] = new_HX.outs[0]
-                    streams_transient_cold_side[cold] = new_HX.outs[1]
-                    matches_cs[hot].append(cold)
-                 
-    # Offset cooling requirement on hot side
-    for hot in hot_indices:
-        if Q_hot_side[hot][0]=='cool' and Q_hot_side[hot][1]>0:
-            for cold in cold_indices:
-                match = (hot, cold)
-                ID = 'HX_%s_%s_hs' % (cold, hot)
-                if ID in attempts or (avoid_recycle and match in success): continue
-                attempts.add(ID)
-                original_cold_stream = get_stream_at_H_max(cold)
-                T_cold_in = original_cold_stream.T
-                T_hot_in = get_T_transient_hot_side(hot)
-                if (Q_hot_side[cold][0]=='heat' and Q_hot_side[cold][1]>0 and
-                        T_hot_in - T_cold_in>= T_min_app):    
-                    cold_stream = original_cold_stream
-                    hot_stream = streams_transient_hot_side[hot].copy()
-                    cold_stream.ID = 's_%s__%s'%(cold,ID)
-                    hot_stream.ID = 's_%s__%s'%(hot,ID)
-                    hot_out = hot_stream.copy('%s__s_%s'%(ID,hot))
-                    cold_out = cold_stream.copy('%s__s_%s'%(ID,cold))
-                    H_lim = H_out_arr[cold]
-                    new_HX = bst.units.HXprocess(ID = ID, ins = (cold_stream, hot_stream),
-                             outs = (cold_out, hot_out), H_lim0 = H_lim, 
-                             T_lim1 = T_out_arr[hot], dT = T_min_app,
-                             thermo = hot_stream.thermo)
-                    try: new_HX._run()
-                    except: continue
-                    if abs(new_HX.Q )< Qmin: continue
-                    success.add(match)
-                    HXs_hot_side.append(new_HX)                        
-                    stream_HXs_dict[hot].append(new_HX)
-                    stream_HXs_dict[cold].append(new_HX)                        
-                    Q_hot_side[hot][1] -= new_HX.Q
-                    Q_hot_side[cold][1] -= new_HX.Q       
-                    streams_transient_hot_side[cold] = new_HX.outs[0]
-                    streams_transient_hot_side[hot] = new_HX.outs[1]
-                    H_out = new_HX.outs[0].H
-                    assert H_out - new_HX.ins[0].H >= 0.
-                    matches_hs[cold].append(hot)
-
-    # Add final utility HXs
-    new_HX_utils = []    
-    for hot in hot_indices:
-        hot_stream = get_stream_at_H_min(hot)
-        ID = 'Util_%s_cs'%(hot)
-        hot_stream.ID = 's_%s__%s'%(hot,ID)
-        outlet = hot_stream.copy('%s__s_%s'%(ID,hot))
-        new_HX_util = bst.units.HXutility(ID = ID, ins = hot_stream, outs = outlet,
-                                          H = H_out_arr[hot], rigorous = True,
-                                          thermo = hot_stream.thermo)
-        new_HX_util._run()
-        s_out = new_HX_util-0
-        np.testing.assert_allclose(s_out.H, H_out_arr[hot], rtol=5e-3, atol=1.)
-        atol_T = 5. if 's' in hxs[hot].outs[0].phases else 0.001
-        np.testing.assert_allclose(s_out.T, T_out_arr[hot], rtol=5e-3, atol=atol_T)
-        new_HX_utils.append(new_HX_util)
-        stream_HXs_dict[hot].append(new_HX_util)
-            
-    for cold in cold_indices:
-        cold_stream = get_stream_at_H_max(cold)
-        ID = 'Util_%s_hs'%(cold)
-        cold_stream.ID = 's_%s__%s'%(cold,ID)
-        outlet = cold_stream.copy('%s__s_%s'%(ID,cold))
-        new_HX_util = bst.units.HXutility(ID = ID, ins = cold_stream, outs = outlet,
-                                          H = H_out_arr[cold], rigorous = True,
-                                          thermo = cold_stream.thermo)
+        if (not violations or plan.status != 'mer'
+            or refine_round == _MAX_REFINE): break
+        knots = _refine_knots(knots, violations)
+    repaired = []
+    if bad:
+        duties, changes = _repair(plan, duties, knots, is_hot, curves,
+                                  T_min_app)
+        for n, Q_before, Q_after in changes:
+            e = plan.exchangers[n]
+            repaired.append(dict(side=e.side, hot=e.hot, cold=e.cold,
+                                 Q_plan=Q_before, Q=Q_after))
+            if Q_after < Qmin: del duties[n]
+        ends = _walk(plan, duties, knots, is_hot)[0]
+        min_approach = _exact_approach(plan, duties, ends, curves, knots,
+                                       T_min_app)[0]
+    # Realize; a match that cannot be simulated is dropped (its duty goes to
+    # the utilities: removing a match never reduces another's approach).
+    dropped = []
+    while True:
+        try:
+            units, first, last = _realize(plan, duties, curves, knots,
+                                          streams_inlet, is_hot, T_min_app)
+        except _RealizationError as failure:
+            dropped.append(dict(ID=failure.ID, Q=duties.pop(failure.n),
+                                error=repr(failure.error)))
+        else:
+            break
+    HXs_hot_side = [units[n] for n in sorted(units)
+                    if plan.exchangers[n].side == 'above']
+    HXs_cold_side = [units[n] for n in sorted(units)
+                     if plan.exchangers[n].side == 'below']
+    deviations = []
+    for n, hx in units.items():
+        e = plan.exchangers[n]
+        if abs(hx.Q - duties[n]) > _DUTY_TOL * (duty[e.hot] + duty[e.cold]):
+            deviations.append(dict(ID=hx.ID, Q_plan=duties[n], Q=hx.Q))
+    # One rigorous utility per stream, hot streams first
+    stream_HXs_dict = {i: [units[n] for n in plan.stages[i] if n in units]
+                       for i in indices}
+    new_HX_utils = []
+    for i in hot_indices + cold_indices:
+        hot = is_hot[i]
+        curve = curves[i]
+        ID = 'Util_%s_cs'%i if hot else 'Util_%s_hs'%i
+        if first[i] is None:
+            s = _copy(streams_inlet[i])
+        else:
+            s = curve.state_at_H(curve.H_lo + last[i])
+        s.ID = 's_%s__%s'%(i, ID)
+        outlet = s.copy('%s__s_%s'%(ID, i))
+        new_HX_util = bst.units.HXutility(ID=ID, ins=s, outs=outlet,
+                                          H=H_out_arr[i], rigorous=True,
+                                          thermo=s.thermo)
         new_HX_util._run()
         s_out = new_HX_util.outs[0]
-        np.testing.assert_allclose(s_out.H, H_out_arr[cold], rtol=1e-2, atol=1.)
-        atol_T = 5. if 's' in hxs[cold].outs[0].phases else 0.001
-        np.testing.assert_allclose(s_out.T, T_out_arr[cold], rtol=5e-2, atol=atol_T)
+        atol_T = 5. if 's' in hxs[i].outs[0].phases else 0.001
+        if hot:
+            np.testing.assert_allclose(s_out.H, H_out_arr[i], rtol=5e-3, atol=1.)
+            np.testing.assert_allclose(s_out.T, T_out_arr[i], rtol=5e-3, atol=atol_T)
+        else:
+            np.testing.assert_allclose(s_out.H, H_out_arr[i], rtol=1e-2, atol=1.)
+            np.testing.assert_allclose(s_out.T, T_out_arr[i], rtol=5e-2, atol=atol_T)
         new_HX_utils.append(new_HX_util)
-        stream_HXs_dict[cold].append(new_HX_util)
-    
+        stream_HXs_dict[i].append(new_HX_util)
+    if info is not None:
+        # utilities of the plan and of the realized network: each stream's
+        # duty less what its process exchangers transfer
+        planned = {n: duties[n] for n in units}
+        simulated = {n: hx.Q for n, hx in units.items()}
+        loads = []
+        for Q_of in (planned, simulated):
+            Q_hot = Q_cold = 0.
+            for i in indices:
+                remaining = duty[i] - sum(Q_of[n] for n in plan.stages[i]
+                                          if n in units)
+                if is_hot[i]: Q_cold += remaining
+                else: Q_hot += remaining
+            loads.append((Q_hot, Q_cold))
+        (Q_hot_plan, Q_cold_plan), (Q_hot, Q_cold) = loads
+        tol = _ACHIEVED_TOL * scale
+        mer = (plan.status == 'mer'
+               and abs(Q_hot - table.hot_util_load) <= tol
+               and abs(Q_cold - table.cold_util_load) <= tol)
+        info.update(
+            status='mer' if mer else 'best_effort',
+            Q_hot_target=table.hot_util_load,
+            Q_cold_target=table.cold_util_load,
+            Q_hot_plan=Q_hot_plan, Q_cold_plan=Q_cold_plan,
+            Q_hot=Q_hot, Q_cold=Q_cold,
+            penalty=Q_hot_plan - table.hot_util_load,
+            sides=plan.info['sides'],
+            plan_targets=dict(Q_hot=plan_targets['Qh'],
+                              Q_cold=plan_targets['Qc'],
+                              pinch_T=plan_targets['pinch_T'],
+                              cut=plan_targets['cut']),
+            refine_rounds=refine_round,
+            min_approach=min_approach if duties else None,
+            deviations=deviations,
+            qmin_dropped=plan.info['qmin_dropped'],
+            dropped=dropped, repaired=repaired,
+            point_loads=[i for i in indices if not curves[i].monotone],
+        )
     return HXs_hot_side, HXs_cold_side, new_HX_utils, hxs, T_in_arr,\
            T_out_arr, pinch_T_arr, C_flow_vector, hx_utils_rearranged, streams_inlet, stream_HXs_dict,\
            hot_indices, cold_indices
-
 
 
 # Pinch diagram

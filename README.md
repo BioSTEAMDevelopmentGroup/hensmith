@@ -7,7 +7,12 @@
 facility previously distributed as `biosteam.facilities.hxn`, including
 `HeatExchangerNetwork`, pinch/problem-table analysis, and pinch diagram
 plotting for [BioSTEAM](https://github.com/BioSTEAMDevelopmentGroup/biosteam)
-systems.
+systems. Targets come from a problem table on each stream's temperature-enthalpy
+curve (phase changes included), and a pinch-outward planner synthesizes a
+network without stream splits that reaches those minimum energy requirement
+(MER) targets whenever it finds one, keeping the minimum approach temperature
+everywhere inside every exchanger; where MER provably needs a split, the
+network is a best-effort one close to the targets.
 
 ```python
 import biosteam as bst  # hensmith units plug into BioSTEAM systems

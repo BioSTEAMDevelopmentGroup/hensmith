@@ -10,14 +10,101 @@
 Created on Sat Aug 22 21:58:19 2020
 @author: sarangbhagwat and yoelcp
 """
+import heapq
 import biosteam as bst
-import thermosteam as tmo
 import numpy as np
-from .hxn_synthesis import synthesize_network, StreamLifeCycle, plot_pinch_diagram
+from .hxn_synthesis import (
+    synthesize_network, StreamLifeCycle, plot_pinch_diagram, _first_inlet,
+)
 from warnings import warn
-import warnings
 
 __all__ = ('HeatExchangerNetwork',)
+
+#: A stream whose utility exchanger would transfer at most this fraction of
+#: the stream's duty is already at its outlet: the plan leaves it no utility
+#: duty (the planner resolves duties to 1e-9 of the total), and what is left
+#: is the residual of the enthalpy flashes that realize the plan (at most
+#: 1e-10 of the duty over the test suite, where the smallest utility duty a
+#: network does leave is 3e-7 of the stream's duty).
+_SERVED_RTOL = 1e-9
+
+def _pass_through_served_streams(stream_life_cycles, original_units):
+    """
+    Let every stream that the process exchangers bring to its outlet (to
+    within `_SERVED_RTOL` of its duty) leave its utility exchanger in the
+    state it enters it.
+
+    A rigorous `HXutility` re-flashes its feed at the outlet enthalpy even
+    when the feed already has it; the flash converges from its own previous
+    state, so the phase split can move in the last digits and, with the
+    enthalpies of formation, leave a spurious net duty (~1e-9 kJ/hr) that
+    biosteam designs and costs as a minimum-size exchanger, depending on
+    flash noise (e.g. present in a cached network but not in the fresh one).
+    Passing the feed through gives the exchanger exactly no duty, which
+    biosteam neither designs nor costs; an exchanger with any real duty is
+    left as it is (and costed as always). Utility outlets feed nothing else
+    in the network, so the converged network needs no further pass.
+    """
+    for life_cycle, unit in zip(stream_life_cycles, original_units):
+        util = life_cycle.life_cycle[-1].unit
+        if not isinstance(util, bst.HXutility): continue
+        feed, product = util.ins[0], util.outs[0]
+        duty = abs(unit.outs[0].H - unit.ins[0].H)
+        if abs(product.H - feed.H) <= _SERVED_RTOL * duty:
+            product.copy_like(feed)
+
+def _load_utility_costs(unit):
+    """Recompute the utility cost of `unit` and of its owner (the unit whose
+    heat utilities include those of `unit`, e.g. a column for its
+    condenser) from their heat utilities."""
+    unit._load_operation_costs()
+    owner = unit.owner
+    if owner is not unit: owner._load_operation_costs()
+
+def _network_path(units, stream_life_cycles):
+    """
+    Return the simulation path of a synthesized network and its recycle
+    (tear) streams.
+
+    Every stream passes its stages in series, so the network is a directed
+    graph with an edge from each stage to the next one of the same stream.
+    The path is a topological order of that graph (Kahn's algorithm, ties
+    broken by the order of `units`); where the graph has a cycle (e.g. a
+    pair of streams matched both above and below the pinch, or repeated
+    matches in alternating order), the unit with the fewest unplaced
+    predecessors comes next and its inlets from later units become recycle
+    streams. Every unit then runs after all its feeders except across a
+    declared recycle, and the fixed-point iteration of the resulting
+    `System` converges the loops. (Deterministic, unlike a general network
+    sort, which need not settle on intertwined loops.)
+    """
+    position = {u: i for i, u in enumerate(units)}
+    successors = {u: [] for u in units}
+    N_waiting = {u: 0 for u in units}
+    for life_cycle in stream_life_cycles:
+        stages = life_cycle.life_cycle
+        for a, b in zip(stages, stages[1:]):
+            successors[a.unit].append((b.unit, a.unit.outs[a.index]))
+            N_waiting[b.unit] += 1
+    ready = [position[u] for u in units if not N_waiting[u]]
+    heapq.heapify(ready)
+    placed = {}
+    while len(placed) < len(units):
+        if ready:
+            unit = units[heapq.heappop(ready)]
+            if unit in placed: continue
+        else: # a cycle: break it where the fewest feeders are missing
+            unit = min((u for u in units if u not in placed),
+                       key=lambda u: (N_waiting[u], position[u]))
+        placed[unit] = len(placed)
+        for other, _ in successors[unit]:
+            N_waiting[other] -= 1
+            if not N_waiting[other] and other not in placed:
+                heapq.heappush(ready, position[other])
+    path = sorted(units, key=placed.__getitem__)
+    recycles = [s for unit in units for other, s in successors[unit]
+                if placed[other] <= placed[unit]]
+    return path, recycles
 
 
 class HeatExchangerNetwork(bst.Facility):
@@ -39,15 +126,64 @@ class HeatExchangerNetwork(bst.Facility):
     
     Notes
     -----
-    The network is synthesized with the pinch design method [1]_.
-    Original system stream and heat exchanger objects are preserved. All stream 
-    copies and new HX objects can be found in a newly created flowsheet 
-    '<sys>_HXN' where <sys> is the name of the system associated to the 
-    HeatExchangerNetwork object.
-    
+    The network is synthesized without stream splits by
+    :func:`~hensmith.hxn_synthesis.synthesize_network`: a problem table on
+    the streams' temperature-enthalpy curves gives the minimum energy
+    requirement (MER) targets, and a planner builds each side of the pinch
+    from the pinch outward [1]_ [2]_, keeping `T_min_app` everywhere inside
+    every exchanger on the exact stream states. It reaches the targets
+    whenever its search finds an unsplit network that does; the same pair
+    of streams may then be matched more than once (IDs with a suffix
+    ``_<n>``, e.g. ``HX_3_2_cs_2``), since series alternation can replace a
+    split. Where the pinch design rules prove that MER needs stream
+    splitting, the network is a best-effort one close to the targets. The
+    outcome is recorded in `synthesis_info` (a dict; see the `info` keyword
+    of `synthesize_network`): 'status' is 'mer' when the network's utilities
+    equal the targets and 'best_effort' otherwise, with the targets, the
+    planned utilities and, per side of the pinch, any proof that a split is
+    needed.
+
+    Original system stream and heat exchanger objects are preserved. All
+    stream copies and new HX objects can be found in a newly created
+    flowsheet '<sys>_HXN' where <sys> is the name of the system associated
+    to the HeatExchangerNetwork object. Each stream passes its exchangers in
+    series; the network is simulated as a `System` (`HXN_sys`) whose path
+    follows the streams, with the loops that repeated matches can form torn
+    and converged to a tight tolerance (every exchanger starts at its
+    planned state, so the loops are at their fixed point after one pass).
+
+    With `cache_network`, a network is reused while the set of heat
+    exchangers is the same: each process exchanger keeps, as its enthalpy
+    limit, the share of the stream's duty it had at synthesis (on the
+    stream that the plan serves completely on that side of the pinch; its
+    partner transfers that share, but never past its own outlet, and takes
+    the rest to its utility), and the utility exchangers
+    bring every stream to its new outlet. If the cached network does not
+    reproduce the outlets, or its energy balance is off, the network is
+    synthesized again.
+
+    Every utility exchanger is designed and costed by biosteam as usual. A
+    stream that its process exchangers bring to its outlet (within 1e-9 of
+    its duty: the residual of the enthalpy flashes) leaves its utility
+    exchanger in the state it enters it, so that exchanger has exactly no
+    duty and no cost instead of a spurious duty from re-flashing the
+    stream.
+
+    The facility's heat utilities are the new utilities less the original
+    ones, summed by agent (a negative utility cost is a saving). With
+    `replace_unit_heat_utilities`, each original heat utility takes the heat
+    utility of its own stream's utility exchanger instead, the utility costs
+    of its unit and of that unit's owner are reloaded, and the facility
+    carries no heat utilities. The original data are given back before the
+    network is costed again, so that the network is synthesized from the
+    units' own utilities whether or not the units were simulated again.
+
     References
     ----------
-    .. [1] Seider, W. D., Lewin,  D. R., Seader, J. D., Widagdo, S., Gani, R.,
+    .. [1] Linnhoff, B., & Hindmarsh, E. (1983). The pinch design method for
+        heat exchanger networks. Chemical Engineering Science, 38(5),
+        745-763.
+    .. [2] Seider, W. D., Lewin,  D. R., Seader, J. D., Widagdo, S., Gani, R.,
         & Ng, M. K. (2017). Product and Process Design Principles. Wiley.
         Heat Exchanger Networks (Chapter 9)
     
@@ -74,6 +210,8 @@ class HeatExchangerNetwork(bst.Facility):
     0.82
     >>> abs(HXN.energy_balance_percent_error) < 0.01
     True
+    >>> HXN.synthesis_info['status']  # the utilities equal the MER targets
+    'mer'
     >>> HXN.stream_life_cycles
     [<StreamLifeCycle: Stream_0, cold
     	life_cycle = [
@@ -81,15 +219,15 @@ class HeatExchangerNetwork(bst.Facility):
     		<LifeStage: <HXutility: Util_0_hs>, H_in = 4.24e+07 kJ/hr, H_out = 6.92e+07 kJ/hr>
     	]>, <StreamLifeCycle: Stream_1, cold
     	life_cycle = [
-    		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 0 kJ/hr, H_out = 3.34e+04 kJ/hr>
-    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 3.34e+04 kJ/hr, H_out = 5.06e+06 kJ/hr>
-    		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 5.06e+06 kJ/hr, H_out = 2.3e+07 kJ/hr>
+    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 0 kJ/hr, H_out = 5.05e+06 kJ/hr>
+    		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 5.05e+06 kJ/hr, H_out = 5.08e+06 kJ/hr>
+    		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 5.08e+06 kJ/hr, H_out = 2.3e+07 kJ/hr>
     		<LifeStage: <HXutility: Util_1_hs>, H_in = 2.3e+07 kJ/hr, H_out = 2.79e+08 kJ/hr>
     	]>, <StreamLifeCycle: Stream_2, hot
     	life_cycle = [
     		<LifeStage: <HXprocess: HX_0_2_hs>, H_in = 4.52e+07 kJ/hr, H_out = 8.12e+06 kJ/hr>
-    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 8.12e+06 kJ/hr, H_out = 3.1e+06 kJ/hr>
-    		<LifeStage: <HXutility: Util_2_cs>, H_in = 3.1e+06 kJ/hr, H_out = 1.14e+06 kJ/hr>
+    		<LifeStage: <HXprocess: HX_1_2_hs>, H_in = 8.12e+06 kJ/hr, H_out = 3.07e+06 kJ/hr>
+    		<LifeStage: <HXutility: Util_2_cs>, H_in = 3.07e+06 kJ/hr, H_out = 1.14e+06 kJ/hr>
     	]>, <StreamLifeCycle: Stream_3, hot
     	life_cycle = [
     		<LifeStage: <HXprocess: HX_1_3_hs>, H_in = 2.04e+07 kJ/hr, H_out = 2.47e+06 kJ/hr>
@@ -144,15 +282,70 @@ class HeatExchangerNetwork(bst.Facility):
         return [i for i in hx_utils if i.duty and i not in ignored_hx_utils]
         
     def _run(self): pass
+
+    def _enter_network(self, index, stage, stream):
+        """Bring `stream` (the network copy of stream `index`'s real inlet,
+        which enters the network at `stage`) to the state in which its first
+        process exchanger takes it: at equilibrium at its inlet enthalpy for
+        a point-load stream (see `hensmith.hxn_synthesis._first_inlet`)."""
+        if not isinstance(stage.unit, bst.HXprocess): return
+        point_load = index in self.synthesis_info.get('point_loads', ())
+        _first_inlet(stream, point_load, self.outlet_Ts[index],
+                     index not in self.cold_indices)
+
+    def _replace_unit_heat_utilities(self, heat_utilities, stream_life_cycles):
+        """
+        Overwrite each original heat utility with the heat utility of its own
+        stream's utility exchanger, the last stage of the stream's life
+        cycle (`heat_utilities` and `stream_life_cycles` are both in stream
+        order; `new_HX_utils` is not: it lists the hot streams first), and
+        reload the utility costs of its unit and of the unit's owner. The
+        original data are kept for `_restore_unit_heat_utilities`.
+        """
+        replaced = []
+        for hu, life_cycle in zip(heat_utilities, stream_life_cycles):
+            new = life_cycle.life_cycle[-1].unit.heat_utilities[0]
+            replaced.append((hu, hu.copy()))
+            if new.agent: hu.copy_like(new)
+            else: hu.empty() # a stream the process exchangers serve
+            _load_utility_costs(hu.unit)
+        self._replaced_heat_utilities = replaced
+
+    def _restore_unit_heat_utilities(self):
+        """
+        Copy their original data back into the heat utilities that
+        `_replace_unit_heat_utilities` last overwrote, and reload their
+        units' utility costs, wherever the unit still holds that heat
+        utility. A unit that
+        is simulated again replaces its heat utilities with new ones (as
+        every unit is before the facility in a system simulation), but one
+        that is not (e.g. when the network alone is simulated again, or
+        once per ignored utility in `_energy_balance_error_contributions`)
+        would otherwise hand the network its own utilities as the process
+        duties, and a stream that it serves completely, with no utility
+        left, would drop out of the next network.
+        """
+        replaced = getattr(self, '_replaced_heat_utilities', None)
+        if not replaced: return
+        self._replaced_heat_utilities = None
+        for hu, original in replaced:
+            unit = hu.unit
+            if any(i is hu for i in unit.heat_utilities):
+                hu.copy_like(original)
+                _load_utility_costs(unit)
+
     def _design(self): pass
     def _load_capital_costs(self): pass # Do not replace installed costs
 
     def _cost(self):
         sys = self.system
-        hx_utils = self._get_original_heat_utilties()
         flowsheet = bst.Flowsheet(sys.ID + '_HXN')
+        with flowsheet.temporary():
+            self._restore_unit_heat_utilities()
+        hx_utils = self._get_original_heat_utilties()
         use_cached_network = False
-        if self.cache_network and hasattr(self, 'original_heat_utils'):
+        if (self.cache_network and hasattr(self, 'original_heat_utils')
+                and hasattr(self, '_stage_fractions')):
             # Units are a stable key to compare whether system has changed configuration.
             hu_by_unit = {hu.unit: hu for hu in hx_utils}
             use_cached_network = (
@@ -168,19 +361,40 @@ class HeatExchangerNetwork(bst.Facility):
                 stream_life_cycles = self.stream_life_cycles
                 new_HXs = self.new_HXs
                 new_HX_utils = self.new_HX_utils
+                stage_fractions = self._stage_fractions
                 for i, life_cycle in enumerate(stream_life_cycles):
                     hx = hxs[i]
                     s_util_in = hx.ins[0]
                     stage = life_cycle.life_cycle[0]
                     s_lc = stage.unit.ins[stage.index]
                     s_lc.copy_like(s_util_in)
-                    s_util_out = hx.outs[0]
-                    H = s_util_out.H
+                    self._enter_network(i, stage, s_lc)
+                    H_in = s_util_in.H
+                    H_out = hx.outs[0].H
                     for lc in life_cycle.life_cycle:
-                        if isinstance(lc.unit, bst.HXutility):
-                            lc.unit.H = H
-                        else:
-                            setattr(lc.unit, f'H_lim{lc.index}', s_util_out.H)
+                        unit = lc.unit
+                        if isinstance(unit, bst.HXutility):
+                            unit.H = H_out
+                            continue
+                        # Each exchanger keeps the share of its "must"
+                        # stream's duty (port 1: the hot stream above the
+                        # pinch, the cold stream below it), which the plan
+                        # serves completely; the partner (port 0), which
+                        # leaves its remainder to its utility, takes what
+                        # that transfers up to its own outlet (its planned
+                        # share would cut the must short when only the
+                        # must's duty changed; no limit at all would let a
+                        # grown must pull it past its outlet, so that its
+                        # utility runs backwards). A port without a limit
+                        # in the synthesis (see `synthesize_network`) gets
+                        # none.
+                        index = lc.index
+                        fraction = stage_fractions.get((unit.ID, index))
+                        if (index == 0 and fraction is not None
+                                and (unit.ID, 1) in stage_fractions):
+                            fraction = 1.
+                        setattr(unit, f'H_lim{index}', None if fraction is None
+                                else H_in + fraction * (H_out - H_in))
                 sys = self.HXN_sys
                 for unit in sys.units:
                     for s_in, s_out in zip(unit.ins, unit.outs):
@@ -198,12 +412,13 @@ class HeatExchangerNetwork(bst.Facility):
                 hx_utils.sort(key = lambda x: x.duty)
                 self.HXN_flowsheet = HXN_F = flowsheet
                 for i in HXN_F.registries: i.clear()
+                self.synthesis_info = synthesis_info = {}
                 HXs_hot_side, HXs_cold_side, new_HX_utils, hxs, T_in_arr,\
                 T_out_arr, pinch_T_arr, C_flow_vector, hx_heat_utils_rearranged, streams_inlet, stream_HXs_dict,\
                 hot_indices, cold_indices = \
-                synthesize_network(hx_utils, self.T_min_app, self.Qmin, 
+                synthesize_network(hx_utils, self.T_min_app, self.Qmin,
                                    self.force_ideal_thermo, self.avoid_recycle,
-                                   self.sort_hus_by_T)
+                                   self.sort_hus_by_T, info=synthesis_info)
                 new_HXs = HXs_hot_side + HXs_cold_side
                 self.new_HXs_hot_side = HXs_hot_side
                 self.new_HXs_cold_side = HXs_cold_side
@@ -225,46 +440,55 @@ class HeatExchangerNetwork(bst.Facility):
                     s_util = hx_heat_utils_rearranged[i].unit.ins[0]
                     s_lc = stage.unit.ins[stage.index]
                     s_lc.copy_like(s_util)
+                    self._enter_network(i, stage, s_lc)
                 for life_cycle in stream_life_cycles:
                     s_out = None
                     for i in life_cycle.life_cycle:
                         unit = i.unit
                         if s_out: unit.ins[i.index] = s_out
                         s_out = unit.outs[i.index]
-                # Order the path by the rewired stream connections (and
-                # detect recycle loops) rather than using synthesis order: a
-                # hot-side exchanger is synthesized before the cold-side
-                # exchangers that feed it, and a single pass in synthesis
-                # order would leave it with stale inlets. HXprocess units are
-                # interaction units, which Network.from_units strips out (and
-                # disconnects) by default; keep them with interaction=False.
-                with warnings.catch_warnings(record=True) as caught:
-                    warnings.simplefilter('always', RuntimeWarning)
-                    network = tmo.Network.from_units(all_units, interaction=False)
-                for w in caught:
-                    if 'network path could not be determined' in str(w.message):
-                        warn('heat exchanger network path could not be fully '
-                             'ordered from its stream connections; exchangers '
-                             'fed by later ones in the path may be simulated '
-                             'with stale inlets until convergence', RuntimeWarning)
-                    else:
-                        warn(w.message, w.category)
-                self.HXN_sys = sys = bst.System._from_network(HXN_F.ID, network)
-                sys.set_tolerance(method='fixedpoint', subsystems=True)
-            
+                # For the cached network: the share of its stream's duty at
+                # which each process stage's enthalpy limit sits, so that a
+                # changed feed rescales every stage instead of letting the
+                # first one take the whole duty.
+                self._stage_fractions = stage_fractions = {}
+                for i, life_cycle in enumerate(stream_life_cycles):
+                    hx = hx_heat_utils_rearranged[i].unit
+                    H_in = hx.ins[0].H
+                    span = hx.outs[0].H - H_in
+                    for lc in life_cycle.life_cycle:
+                        unit = lc.unit
+                        if isinstance(unit, bst.HXutility): continue
+                        H_lim = getattr(unit, f'H_lim{lc.index}')
+                        if H_lim is None: continue
+                        stage_fractions[unit.ID, lc.index] = (
+                            (H_lim - H_in) / span if span else 0.
+                        )
+                path, recycles = _network_path(all_units, stream_life_cycles)
+                self.HXN_sys = sys = bst.System(HXN_F.ID, path,
+                                                recycle=recycles or None)
+                # Every stage starts at its planned state (synthesize_network
+                # runs each exchanger once), so recycle loops (e.g. a pair
+                # matched above and below the pinch) are at their fixed point
+                # after the first pass; tight tolerances close the energy
+                # balance to ~1e-10 % (molar flows never change: the
+                # temperature criterion governs; 1e-8 K sits above the flash
+                # noise).
+                sys.set_tolerance(method='fixedpoint', subsystems=True,
+                                  mol=1e-9, rmol=1e-12, T=1e-8, rT=1e-12,
+                                  maxiter=200)
+
             original_purchase_costs = [hx.purchase_cost for hx in hxs]
             original_installed_costs = [hx.installed_cost for hx in hxs]
-            # # Handle special case for heat exchanger crossing the pinch
-            # for hx in new_HXs:
-            #     if all([isinstance(i.sink, bst.HXutility) for i in hx.outs]):
-            #         hx.Tlim1 = None
-            #         hx.Hlim1 = hx.outs[1].sink.H
             sys._setup()
             try: 
                 sys.converge()
             except:
                 for i in sys.units: i._run()
                 warn('heat exchanger network was not able to converge', RuntimeWarning)
+            _pass_through_served_streams(
+                stream_life_cycles, [hu.unit for hu in hx_heat_utils_rearranged]
+            )
             for i in sys.units: i._summary()
             for i in range(len(stream_life_cycles)):
                 hx = hx_heat_utils_rearranged[i].unit
@@ -327,13 +551,11 @@ class HeatExchangerNetwork(bst.Facility):
                     + sum(new_purchase_costs_HXu)
                     - sum(original_purchase_costs)
                 ))
-                if self.replace_unit_heat_utilities:
-                    self.heat_utilities = []
-                    for hx_heat_util, new_hx_util in zip(hx_heat_utils_rearranged, new_HX_utils):
-                        hx_heat_util.copy_like(new_hx_util.heat_utilities[0])
-                        hx_heat_util.unit.owner._load_utility_cost() # Update new utility cost
-                else:
-                    self.heat_utilities = hus_final
+                # with replace_unit_heat_utilities, the units carry the new
+                # utilities (replaced below, once the network is final)
+                self.heat_utilities = (
+                    [] if self.replace_unit_heat_utilities else hus_final
+                )
             else: # if no matches were made, retain all original HXutilities (i.e., don't add the -- relatively minor -- differences between new and original HXutilities)
                 self.installed_costs['Heat exchangers'] = 0.
                 self.baseline_purchase_costs['Heat exchangers'] = self.purchase_costs['Heat exchangers'] = 0.
@@ -363,7 +585,12 @@ class HeatExchangerNetwork(bst.Facility):
                     raise RuntimeError(msg)
                 else:
                     warn(msg, RuntimeWarning, stacklevel=2)
-    
+            # Last, so that nothing above (the loads, a re-synthesis) reads
+            # the original heat utilities after they are overwritten
+            if new_HXs and self.replace_unit_heat_utilities:
+                self._replace_unit_heat_utilities(hx_heat_utils_rearranged,
+                                                  stream_life_cycles)
+
     def _energy_balance_error_contributions(self):
         original_ignored = ignored = self.ignored
         if ignored and callable(ignored): ignored = ignored()

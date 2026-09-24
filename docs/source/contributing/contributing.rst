@@ -9,7 +9,8 @@ change has to respect.
 Where the code lives
 --------------------
 
-The library is two modules under ``hensmith/``:
+The library is two public modules under ``hensmith/``, and two private ones
+behind them:
 
 ``hensmith/_heat_exchanger_network.py``
     The ``HeatExchangerNetwork`` facility unit: its ``_run``, ``_design`` and
@@ -17,13 +18,26 @@ The library is two modules under ``hensmith/``:
     utilities.
 
 ``hensmith/hxn_synthesis.py``
-    The algorithms: the problem table and pinch analysis (``problem_table``,
-    ``ProblemTable``), network synthesis (``synthesize_network``), the
-    per-stream bookkeeping of ``StreamLifeCycle``, and ``plot_pinch_diagram``.
+    The problem table and pinch analysis (``problem_table``,
+    ``ProblemTable``), network synthesis (``synthesize_network``: realizing
+    the planner's network as BioSTEAM exchangers and verifying it on exact
+    stream states), the per-stream bookkeeping of ``StreamLifeCycle``, and
+    ``plot_pinch_diagram``.
 
-``hensmith/__init__.py`` re-exports the ``__all__`` of both modules and holds
-the biosteam registration block described in `The import contract`_ below.
-The public API of both modules is documented under :doc:`../API/api`.
+``hensmith/_curves.py`` (private)
+    The piecewise-linear temperature-enthalpy curve of each process stream,
+    built once from a handful of flashes, on which both the problem table and
+    the synthesis work.
+
+``hensmith/_planner.py`` (private)
+    The pinch-outward planner of unsplit networks at minimum energy
+    requirement, on numbers only (numpy; no BioSTEAM objects). Its module
+    docstring documents the model, the lemmas the search relies on and its
+    guarantees.
+
+``hensmith/__init__.py`` re-exports the ``__all__`` of the two public modules
+and holds the biosteam registration block described in `The import
+contract`_ below. The public API is documented under :doc:`../API/api`.
 
 Tests live in ``tests/``:
 
@@ -31,12 +45,31 @@ Tests live in ``tests/``:
     Behavior of the ``HeatExchangerNetwork`` unit on small, hand-built
     systems.
 
+``tests/test_hxn_targets.py``
+    The stream curves, the problem table built on them, the pinch cut and
+    the exact internal-approach check, against an independent dense-grid
+    calculator of the targets.
+
+``tests/test_hxn_planner.py``
+    The planner on numbers only, against helpers written in the test module:
+    a constant heat capacity problem table, the pinch design rules, a network
+    walk and direct feasibility checks.
+
+``tests/test_hxn_mer.py`` (data in ``tests/hxn_mer_cases.py``)
+    78 problems synthesized through the public facility: 40 for which an
+    unsplit MER network provably exists, where the network must reach the
+    targets, and 38 that provably need stream splits, where it must never
+    beat them; the targets are checked against independent references, and
+    every balance and the exact internal approach of every exchanger are
+    checked in both sets.
+
 ``tests/test_hxn_regression.py``
     Ten synthetic systems of increasing complexity. For each, the synthesized
     network must close its energy balance, must not beat the minimum-energy
-    requirement targets of the problem table computed on the same streams,
-    and must recover at least as much heat as the utility loads documented in
-    the file.
+    requirement targets of the problem table computed on the same streams
+    (and must report ``'mer'`` exactly when it reaches them), must keep the
+    minimum approach temperature inside every exchanger, and must recover at
+    least as much heat as the utility loads documented in the file.
 
 Development environment
 -----------------------

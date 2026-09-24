@@ -6,11 +6,13 @@ HeatExchangerNetwork
 :class:`HeatExchangerNetwork` is a BioSTEAM facility that runs a pinch
 analysis over the heating and cooling utilities of a whole system,
 synthesizes a network of process heat exchangers that meets part of those
-duties by stream-to-stream exchange, and reports the utility loads and
-capital cost that result. The original units, streams and heat exchangers
-are left untouched: the stream copies and synthesized exchangers live in a
-separate flowsheet named ``<sys>_HXN``. See :doc:`../tutorial/index` for a
-worked example.
+duties by stream-to-stream exchange -- at the minimum energy requirement
+(MER) targets whenever it finds such a network without stream splits -- and
+reports the utility loads and capital cost that result. The original units,
+streams and heat exchangers are left untouched: the stream copies and
+synthesized exchangers live in a separate flowsheet named ``<sys>_HXN``. See
+:doc:`../tutorial/index` for a worked example and :doc:`../concepts` for the
+method.
 
 .. autoclass:: HeatExchangerNetwork
    :no-members:
@@ -37,16 +39,16 @@ shows what each of them changes.
      - Units whose heat utilities are excluded from the analysis; a callable is evaluated at simulation time. Defaults to None.
    * - ``Qmin``
      - float, kJ/hr
-     - Candidate exchangers with a duty below this are discarded during synthesis, and utility exchangers at or below it are not marked on the pinch diagram. Defaults to 1e-3.
+     - Planned exchangers with a duty below this are dropped and their duty left to the utilities (a large value can cost MER), and utility exchangers at or below it are not marked on the pinch diagram. Defaults to 1e-3.
    * - ``force_ideal_thermo``
      - bool
      - Run the analysis on stream copies with ideal thermodynamics; the synthesized exchangers inherit that thermo. Defaults to False.
    * - ``cache_network``
      - bool
-     - Reuse the network configuration of the previous simulation when the set of units contributing heat utilities is unchanged, updating only stream states and exchanger specifications. Defaults to False.
+     - Reuse the network configuration of the previous simulation when the set of units contributing heat utilities is unchanged, updating only stream states and exchanger specifications: each process exchanger keeps the fraction of its stream's duty at which its enthalpy limit sat at synthesis, and the utility exchangers bring every stream to its new outlet. The reused network is not planned again, so it need not be at MER for the new duties. Defaults to False.
    * - ``avoid_recycle``
      - bool
-     - Never match the same hot/cold stream pair twice, so that no two exchangers connect the same pair and form a recycle loop. Defaults to False.
+     - Never match the same hot/cold stream pair twice anywhere (on one side of the pinch or across the two), so that no two exchangers connect the same pair and form a recycle loop; this forbids the repeated matches some unsplit MER networks need. Defaults to False.
    * - ``acceptable_energy_balance_error``
      - float
      - When given, sets an instance attribute that overrides the class default of 0.02 (see below). Defaults to None, i.e. the class value is used.
@@ -55,7 +57,7 @@ shows what each of them changes.
      - Copy each synthesized utility exchanger's heat utility onto the corresponding original heat utility and reload that unit's utility cost, instead of reporting the net utilities on the facility itself. Applies only when at least one process exchanger was synthesized. Defaults to False.
    * - ``sort_hus_by_T``
      - bool
-     - Sort the heating utilities by inlet temperature descending and the cooling utilities ascending before the analysis, so that inlet temperature rather than signed duty (the default: smallest heating duty first, largest cooling duty first) sets the matching priority. Defaults to False.
+     - Sort the heating utilities by inlet temperature descending and the cooling utilities ascending before the analysis, so that inlet temperature rather than signed duty (the default: smallest heating duty first, largest cooling duty first) sets the stream indices, which break ties in the planner's search. Defaults to False.
 
 Class attributes
 ----------------
@@ -115,6 +117,9 @@ the cached network.
    * - ``energy_balance_percent_error``
      - float, %
      - Percent deviation from one of the ratio (twice the duty of each process exchanger, plus the new utility duties weighted by their agents' heat-transfer efficiency) / (the original utility duties weighted the same way), as computed in ``_cost``.
+   * - ``synthesis_info``
+     - dict
+     - The synthesis report (see the ``info`` keyword of :func:`synthesize_network`): ``'status'`` is ``'mer'`` when the network's utilities equal the MER targets and ``'best_effort'`` otherwise; next to it the targets, the planned and realized utilities, the penalty, per side of the pinch any proof that a split is needed, and the smallest approach inside any process exchanger. Kept from the synthesis that produced a cached network.
    * - ``stream_life_cycles``
      - list[StreamLifeCycle]
      - Ordered sequence of exchangers each stream passes through, aligned with ``original_heat_exchangers``.
@@ -123,10 +128,10 @@ the cached network.
      - All synthesized process exchangers, the hot-side ones followed by the cold-side ones.
    * - ``new_HXs_hot_side``
      - list[HXprocess]
-     - Process exchangers of the hot-side (above-pinch) design.
+     - Process exchangers of the hot-side (above-pinch) design, in plan order (from the pinch outward), IDs ``HX_<cold>_<hot>_hs``.
    * - ``new_HXs_cold_side``
      - list[HXprocess]
-     - Process exchangers of the cold-side (below-pinch) design.
+     - Process exchangers of the cold-side (below-pinch) design, in plan order, IDs ``HX_<hot>_<cold>_cs``; on either side the *n*-th exchanger of a repeated pair gets the suffix ``_<n>``.
    * - ``new_HX_utils``
      - list[HXutility]
      - One rigorous utility exchanger per stream, bringing it from its last process exchanger (or its inlet, if it was not matched) to its outlet enthalpy.
@@ -144,7 +149,7 @@ the cached network.
      - The flowsheet ``<sys>_HXN`` holding the network's stream copies and exchangers.
    * - ``pinch_Ts``
      - ndarray, K
-     - Per-stream pinch temperature at which the stream's duty is split between the hot-side and cold-side designs.
+     - Per-stream pinch temperature (informational): the process pinch on the stream's own scale when the stream crosses it, else its inlet temperature (inlet already past the pinch, or an isothermal or non-monotone stream) or its outlet temperature (stream ending before the pinch).
    * - ``inlet_Ts``
      - ndarray, K
      - Inlet temperature of each stream.
@@ -156,7 +161,7 @@ the cached network.
      - One copy of each stream's inlet, in stream order, as prepared for the analysis; the synthesis works on further copies, so these keep their inlet state.
    * - ``stream_HXs_dict``
      - dict[int, list[Unit]]
-     - Exchangers, the process ones then the utility one, that each stream index passes through, in synthesis order rather than flow order.
+     - Exchangers that each stream index passes through: its process exchangers in flow order, then its utility exchanger.
    * - ``cold_indices``
      - list[int]
      - Stream indices of the heated (cold) streams.

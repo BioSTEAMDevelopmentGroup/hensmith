@@ -75,10 +75,16 @@ def main():
             HXN.T_min_app = T_min_app
             sys.simulate()
             rows.append((T_min_app, HXN.actual_heat_util_load, HXN.actual_cool_util_load,
-                         HXN.installed_costs['Heat exchangers']))
-        print('T_min_app [K]   heating [kJ/hr]   cooling [kJ/hr]   added installed cost [USD]')
-        for T, heat, cool, cost in rows:
-            print(f'{T:13.0f}   {heat:15.4g}   {cool:15.4g}   {cost:26.4g}')
+                         HXN.installed_costs['Heat exchangers'], len(HXN.new_HXs),
+                         dict(HXN.synthesis_info)))
+        print('T_min_app  heating    cooling    added installed  pinch     process      status')
+        print('[K]        [kJ/hr]    [kJ/hr]    cost [USD]       [K]       exchangers')
+        for T, heat, cool, cost, n, info in rows:
+            pinch_T = info['plan_targets']['pinch_T']  # shifted scale
+            status = info['status']
+            if status != 'mer':  # process-side hot utility above the MER target
+                status += f" (+{info['Q_hot'] - info['Q_hot_target']:.3g} kJ/hr)"
+            print(f'{T:<9.0f}  {heat:<9.4g}  {cool:<9.4g}  {cost:<15.4g}  {pinch_T:<8.2f}  {n:<11d}  {status}')
         # [end:sweep]
     # [start:sweep_plot]
     T = [r[0] for r in rows]
@@ -137,11 +143,13 @@ def main():
         print(f'hot utility,  process side: target {table.hot_util_load:.4g}, network {heat:.4g} kJ/hr')
         print(f'cold utility, process side: target {table.cold_util_load:.4g}, network {cool:.4g} kJ/hr')
         print(f'energy balance error: {HXN10.energy_balance_percent_error:.2g} %')
+        print(f"synthesis status: {HXN10.synthesis_info['status']}")
         fig, ax = HXN10.plot_pinch_diagram()
         # [end:ten_streams]
     save(fig, 'tutorial_04_ten_streams_pinch_diagram.png')
     plt.close(fig)
-    assert len(HXN10.new_HXs) == 15, len(HXN10.new_HXs)
+    assert len(HXN10.new_HXs) == 10, len(HXN10.new_HXs)
+    assert HXN10.synthesis_info['status'] == 'mer'
     assert HXN10.actual_heat_util_load >= table.hot_util_load * (1 - 1e-3)
 
 

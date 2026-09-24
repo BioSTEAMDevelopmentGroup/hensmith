@@ -55,8 +55,9 @@ python docs\_demo_src\build_all.py
 first failure. That sequencing is not incidental: importing biosteam writes
 numba's shared on-disk cache, and two Python processes writing it at once
 corrupt it — so never run two of these scripts (or the test suite alongside
-one) concurrently by hand either. A full run takes a minute or two; the hero
-GIFs dominate it.
+one) concurrently by hand either. A full run takes about three minutes; the
+hero GIFs (about 70 s) and chapter 04's six-point ``T_min_app`` sweep and
+ten-stream synthesis (about 50 s) dominate it.
 
 Graphviz's `dot` must be on `PATH` — the flowsheet figures in chapters 01 and
 03 are rendered by biosteam's `system.diagram()`.
