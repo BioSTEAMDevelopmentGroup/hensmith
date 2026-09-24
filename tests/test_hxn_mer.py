@@ -110,6 +110,76 @@ What each check proves
     (NO_SPLIT) or are never below them (SPLIT), and
     ``synthesis_info['status']`` says so.
 
+Networks that split streams
+---------------------------
+A network synthesized with stream splitting is checked on its actual
+stream graph (object identity, each stream's sink and port there), and its
+bookkeeping against that graph (``_split_network_problems``; every problem
+is tagged with its check):
+
+G0
+    Only ``HXprocess``, ``HXutility``, ``Splitter`` and ``Mixer`` units, the
+    same as the facility's lists of them, with unique IDs of the
+    synthesizer's forms (``HX_..``, ``Util_..``, ``Split_..``, ``Mix_..``).
+G1
+    One life cycle per process stream; each stream's entry port holds a
+    feed of the network, and the entries are exactly the network's feeds.
+G2
+    Walking each stream from its entry: an ``HXprocess`` passes it on at the
+    port it entered; the splitters of one split (a tree) send every branch
+    to one mixer whose inlets are exactly the branch ends, and the walk goes
+    on from the mixer; it ends at the stream's own utility. A mixer outside
+    its split, leaving the network, the utility inside a split and a cycle
+    are problems.
+G3
+    Every inlet of every unit is on exactly one walk; the walk is the life
+    cycle (its stages, its connections, its splits) and
+    ``stream_HXs_dict``; every stage's inlet carries its stage's fraction of
+    the flow.
+G4
+    Splitters balance mass; each branch is one fraction f of the split's
+    feed (phase by phase), at least 1e-3, the product of the splitters'
+    ratios down to it equals the split's fraction, at the feed's T and P,
+    with f times its enthalpy.
+G5
+    Mixers balance mass, energy and pressure, and their outlet is at
+    equilibrium at its enthalpy (the flash-free ``_Temperature``); an
+    isothermal re-join has every inlet at the outlet's T and specific
+    enthalpy, any other feeds the stream's utility.
+G6
+    Every stage moves the stream towards its outlet, and no branch passes
+    the outlet in specific enthalpy.
+G7
+    Every ``HXprocess``: mass and heat balances and the exact internal
+    approach on its streams' own (branch) material, as in
+    ``test_network_balanced_and_feasible``.
+G8
+    Each stream's exchangers change it by its duty, and its utility takes
+    the whole flow.
+G9
+    Each stream enters and leaves the network in its original states.
+G10
+    Energy balance error; heat - cool == net process duty.
+
+Without splitting, the network is held to ``_linear_network_problems``
+(the checks of ``test_network_balanced_and_feasible``); with it, to G0-G10,
+and also to those if it has no splitter.
+``test_split_checker_agrees_on_linear_networks``
+    Both checks pass on every unsplit corpus network.
+``test_split_checker_detects_mutations``
+    On a split network wired by hand as the facility wires one
+    (``_wired_split_network``), each of fourteen defects (a misnamed or
+    unlisted unit, a moved entry, a mixer inlet taken from another stream's
+    trunk, swapped mixer inlets, a bypassed branch exchanger, a wrong split
+    ratio, a mis-scaled branch, a mixer outlet off its inlets, a branch past
+    the stream's outlet, a branch exchanger past its approach, a utility
+    short of flow, a shifted outlet, misreported heat) is caught by the
+    check made for it.
+``test_no_split_plan_unchanged_by_splitting`` / ``test_split_cases_keep_unsplit_sides``
+    At the planner (on the facility's round-0 inputs, ``_corpus_knots``),
+    splitting leaves an unsplit problem's plan, and a SPLIT problem's sides
+    that need no split, bit for bit as they are without it.
+
 Tolerances
 ----------
 * Constant-CP targets: 1e-9 of the total stream duty (both sides are exact
@@ -158,6 +228,13 @@ Tolerances
   T_sat, or an exact inversion along the bubble curve.
 * Split proofs (real thermo): no stream end (other than the supply that
   creates the pinch) and no phase change within 0.5 K of the pinch.
+* Split networks: flows and fractions within 1e-12 of the stream's flow
+  (a splitter scales its feed exactly; fractions multiply exactly up to
+  rounding); splitter outlets within 1e-9 K of their feed (a copy of its
+  state); mixer outlets within 1e-6 K of their equilibrium temperature and,
+  where the branches re-join isothermally, of every inlet (the T(H)
+  accuracy above, and the synthesizer's own mixer check is 1e-7 K);
+  enthalpies within 1e-6 of the stream's duty, as for exchangers.
 
 References
 ----------
@@ -168,15 +245,19 @@ exchanger networks. Chem. Eng. Sci. 38, 745-763.
 Kemp, I. C. (2007). Pinch Analysis and Process Integration, 2nd ed.
 Butterworth-Heinemann.
 """
+import contextlib
+import heapq
 import math
 import re
 import time
 import warnings
+from types import SimpleNamespace
 import numpy as np
 import pytest
 import biosteam as bst
 import thermosteam as tmo
-from hensmith import HeatExchangerNetwork
+from hensmith import HeatExchangerNetwork, _planner, _splitting, hxn_synthesis
+from hensmith._planner import plan_network
 from hensmith.hxn_synthesis import problem_table
 from hxn_mer_cases import NO_SPLIT, SPLIT, Q_UNITS, T_UNITS
 
@@ -196,6 +277,10 @@ NET_RTOL = 1e-8         # heat - cool vs net duty, x total duty
 DUTY_RTOL = 1e-6        # exchanger / stream enthalpies, x the streams' duties
 APPROACH_TOL = 1e-6 + 1e-9  # K: the synthesizer's guard + T(H) evaluation noise
 PINCH_MARGIN = 0.5      # K
+FLOW_RTOL = 1e-12       # split networks: flows and fractions, x the stream's flow
+SPLIT_T_TOL = 1e-9      # K: splitter outlets vs the splitter feed
+MIX_T_TOL = 1e-6        # K: mixer outlet at equilibrium; isothermal re-joins
+MIN_FRACTION = 1e-3     # smallest branch fraction on the corpus
 
 def _name(case): return case['name']
 
@@ -726,16 +811,35 @@ def _rt_split_proof(case, units):
 
 _NETWORKS = {}
 
-def _network(case):
-    """Synthesize the case with the public facility, like a user would."""
+@contextlib.contextmanager
+def _variant(variant):
+    """Patch the planner for one synthesis: None (the default) changes
+    nothing; 'V' leaves splitting with the backstop alone (no Stage S rule,
+    only the vertical core strategy)."""
+    if variant is None:
+        yield
+        return
+    if variant != 'V': raise ValueError(f'unknown variant {variant!r}')
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_splitting, '_SPLIT_RULES', ())
+        patch.setattr(_splitting, '_CORE_STRATEGIES', ('V',))
+        yield
+
+def _network(case, stream_splitting=False, variant=None):
+    """Synthesize the case with the public facility, like a user would,
+    with or without `stream_splitting` (the planner patched by `_variant`
+    during the synthesis only); cached per (name, stream_splitting,
+    variant)."""
     name = case['name']
-    if name not in _NETWORKS:
+    key = (name, stream_splitting, variant)
+    if key not in _NETWORKS:
         try:
             units, T_min_app = _build(case)
-            HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app)
+            options = dict(stream_splitting=True) if stream_splitting else {}
+            HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app, **options)
             sys = bst.System.from_units('sys', units=[*units, HXN])
             t0 = time.perf_counter()
-            with warnings.catch_warnings():
+            with warnings.catch_warnings(), _variant(variant):
                 warnings.simplefilter('error', RuntimeWarning)
                 # biosteam's HeatUtility.load_agent names a new 'oxygen_rich_inlet'
                 # stream for every fuel (furnace) utility; the network itself replaces
@@ -746,20 +850,65 @@ def _network(case):
             time_s = time.perf_counter() - t0
             hus = [hu for hx in HXN.new_HX_utils for hu in hx.heat_utilities]
             total, net = _duties(units)
-            _NETWORKS[name] = dict(
+            _NETWORKS[key] = dict(
                 units=units, HXN=HXN, T_min_app=T_min_app, time=time_s,
                 table=_hensmith_table(units, T_min_app), total=total, net=net,
                 heat=sum(hu.unit_duty for hu in hus if hu.unit_duty > 0),
                 cool=-sum(hu.unit_duty for hu in hus if hu.unit_duty < 0),
+                stream_splitting=stream_splitting, variant=variant,
             )
         except Exception as error:
-            _NETWORKS[name] = error
-    result = _NETWORKS[name]
+            _NETWORKS[key] = error
+    result = _NETWORKS[key]
     if isinstance(result, Exception):
         raise RuntimeError(f'{name}: synthesis failed: {result!r}') from result
     return result
 
+def _facility_heat_utilities(units, T_min_app):
+    """The heat utilities of `units` in the order `HeatExchangerNetwork`
+    hands them to `synthesize_network`: those of its system's units (the
+    order of `System.from_units`, not that of `units`), by duty (a tie keeps
+    that order, e.g. smith2005_ex16_1's two 2880 kW coolers)."""
+    HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app)
+    system = bst.System.from_units('sys', units=[*units, HXN])
+    hus = bst.process_tools.heat_exchanger_utilities_from_units(system.units)
+    return sorted([hu for hu in hus if hu.duty], key=lambda hu: hu.duty)
+
+_KNOTS = {}
+
+def _corpus_knots(case):
+    """The planner's inputs for the case, as `synthesize_network` plans its
+    round 0 in the facility (`_facility_heat_utilities`, `_pinch_analysis`,
+    `_grid_knots`): dict(knots, is_hot, T_min_app, time), `time` being the
+    seconds taken; cached."""
+    name = case['name']
+    if name not in _KNOTS:
+        t0 = time.perf_counter()
+        units, T_min_app = _build(case)
+        hus = _facility_heat_utilities(units, T_min_app)
+        result = hxn_synthesis._pinch_analysis(hus, T_min_app)
+        hxs, hot_indices, curves, grid = result[5], result[6], result[13], result[14]
+        _KNOTS[name] = dict(knots=hxn_synthesis._grid_knots(curves, grid),
+                            is_hot=[i in hot_indices for i in range(len(hxs))],
+                            T_min_app=T_min_app, time=time.perf_counter() - t0)
+    return _KNOTS[name]
+
+def _case(name):
+    return next(case for case in NO_SPLIT + SPLIT if case['name'] == name)
+
 def _network_problems(net):
+    """Everything wrong with a synthesized network: today's checks
+    (`_linear_network_problems`) without stream splitting; with it, the
+    strict split-aware checks (`_split_network_problems`), plus today's
+    checks when the network has no splitter."""
+    if not net.get('stream_splitting', False):
+        return _linear_network_problems(net)
+    problems = _split_network_problems(net)
+    if not any(type(u) is bst.Splitter for u in net['HXN'].HXN_sys.units):
+        problems += _linear_network_problems(net)
+    return problems
+
+def _linear_network_problems(net):
     """Everything physically wrong with a synthesized network (see the
     module docstring, test_network_balanced_and_feasible)."""
     HXN, T_min_app = net['HXN'], net['T_min_app']
@@ -831,6 +980,672 @@ def _network_problems(net):
         if not approach >= T_min_app - APPROACH_TOL:
             problems.append(f'{hx.ID}: internal approach {approach:.7f} K < {T_min_app} K')
     return problems
+
+# ---------------------------------------------------------------------------
+# Strict checks of a network that may split streams (G0-G10)
+# ---------------------------------------------------------------------------
+
+#: (unit type, ID pattern, the facility's list of them) for every unit a
+#: synthesized network may hold
+_NETWORK_UNITS = (
+    (bst.HXprocess, re.compile(r'^HX_\d+_\d+_(hs|cs)(_\d+)?$'), 'new_HXs'),
+    (bst.HXutility, re.compile(r'^Util_\d+_(hs|cs)$'), 'new_HX_utils'),
+    (bst.Splitter, re.compile(r'^Split_\d+_(hs|cs)(_\d+)?(_b\d+)?$'), 'new_splitters'),
+    (bst.Mixer, re.compile(r'^Mix_\d+_(hs|cs)(_\d+)?$'), 'new_mixers'),
+)
+#: a splitter ID; group 1 names its split (the ID without the ``_b<c>`` of
+#: a chain element)
+_SPLITTER_ID = re.compile(r'^(Split_\d+_(?:hs|cs)(?:_\d+)?)(?:_b\d+)?$')
+
+def _is_stream(s):
+    return isinstance(s, tmo.Stream)  # not a MissingStream
+
+def _array(x):
+    """A (sparse) flow or split vector as a numpy array."""
+    return x.to_array() if hasattr(x, 'to_array') else np.asarray(x, dtype=float)
+
+def _phase_flows(s):
+    """{phase: molar flows} of a stream, phase by phase for a MultiStream."""
+    if isinstance(s, tmo.MultiStream):
+        return {phase: _array(s.imol[phase]) for phase in s.phases}
+    return {s.phase: _array(s.mol)}
+
+def _is_fraction_of(s, f, feed, atol):
+    """Whether every phase of stream `s` carries `f` times that of `feed`."""
+    flows, feeds = _phase_flows(s), _phase_flows(feed)
+    zero = np.zeros_like(_array(feed.mol))
+    return all(np.allclose(flows.get(p, zero), f * feeds.get(p, zero),
+                           rtol=FLOW_RTOL, atol=atol) for p in {*flows, *feeds})
+
+def _inlet_port(unit, stream):
+    """Index of `stream` (by identity) in ``unit.ins``, or None."""
+    for port, s in enumerate(unit.ins):
+        if s is stream: return port
+    return None
+
+def _walk_stream(lc, network, claims, problem, name):
+    """
+    Walk the stream of life cycle `lc` on the actual stream graph (object
+    identity, ``s.sink`` and the port index there) from its entry port
+    (G2). An HXprocess passes it on at the port it entered. A splitter tree
+    (the elements of one split, ``Split_<j>_<hs|cs>[_<k>]`` and its
+    ``_b<c>`` chain, feeding each other) sends every leaf branch on to one
+    mixer, whose inlets must be exactly those branch ends, and the walk
+    goes on from the mixer's outlet (a split inside a branch likewise). The
+    walk must end at the stream's own utility, ``lc.life_cycle[-1].unit``,
+    outside every split. A mixer reached outside its split, a unit outside
+    the `network` (a set of units), the utility reached inside a split and
+    a cycle within the stream are problems, reported by calling
+    ``problem('G2', text)``. Every inlet port passed is counted in `claims`
+    (a dict keyed by (unit, port)).
+
+    Returns
+    -------
+    ports : list[tuple[HXprocess, int]]
+        The process exchanger ports passed, in flow order: trunk, then the
+        branches of a split, branch by branch.
+    edges : list[tuple]
+        ``(up, up_port, down, down_port)`` for every stream followed.
+    splits : list[tuple]
+        ``(splitters, leaves, mixer, branches)`` for every split passed:
+        its splitters in the order met, its leaves ``(splitter, port,
+        ratio)`` in branch order (`ratio`: the product of the splitters'
+        ratios down to that outlet, per chemical), its mixer and each
+        branch's process exchanger ports.
+    complete : bool
+        Whether the walk reached the utility.
+    """
+    utility = lc.life_cycle[-1].unit
+    ports, edges, splits, seen = [], [], [], set()
+
+    def enter(unit, port):
+        if (unit, port) in seen:
+            problem('G2', f'{name}: a cycle through {unit.ID} inlet {port}')
+            return False
+        seen.add((unit, port))
+        claims[unit, port] = claims.get((unit, port), 0) + 1
+        return True
+
+    def follow(unit, port):
+        s = unit.outs[port]
+        sink = s.sink
+        index = None if sink is None else _inlet_port(sink, s)
+        if sink not in network or index is None:
+            problem('G2', f'{name}: leaves the network at {unit.ID} outlet {port}')
+            return None
+        edges.append((unit, port, sink, index))
+        return sink, index
+
+    def split(root, depth):
+        match = _SPLITTER_ID.match(root.ID)
+        splitters, leaves = [root], []
+        def expand(splitter, ratio):
+            r = _array(splitter.split)
+            for port, share in ((0, r), (1, 1. - r)):
+                sink = splitter.outs[port].sink
+                other = (_SPLITTER_ID.match(sink.ID) if type(sink) is bst.Splitter
+                         and sink in network else None)
+                if match and other and other.group(1) == match.group(1):
+                    nxt = follow(splitter, port)
+                    if nxt is None or not enter(*nxt): return False
+                    splitters.append(sink)
+                    if not expand(sink, ratio * share): return False
+                else:
+                    leaves.append((splitter, port, ratio * share))
+            return True
+        if not expand(root, 1.): return None
+        ends, branches = [], []
+        for splitter, port, _ in leaves:
+            first = len(ports)
+            nxt = follow(splitter, port)
+            end = None if nxt is None else segment(*nxt, depth + 1)
+            if end is None: return None
+            ends.append(end)
+            branches.append(ports[first:])
+        mixer = ends[0][0]
+        if (any(unit is not mixer for unit, _ in ends)
+                or sorted(port for _, port in ends) != list(range(len(mixer.ins)))):
+            problem('G2', f'{name}: the branches of {root.ID} end at '
+                          f'{[(unit.ID, port) for unit, port in ends]}, not at '
+                          f'every inlet of one mixer')
+            return None
+        splits.append((splitters, leaves, mixer, branches))
+        return follow(mixer, 0)
+
+    def segment(unit, port, depth):
+        # from inlet (unit, port) to the utility (depth 0) or to a mixer
+        # inlet (depth > 0), returned as (unit, port)
+        while True:
+            if not enter(unit, port): return None
+            kind = type(unit)
+            if kind is bst.HXprocess:
+                ports.append((unit, port))
+                nxt = follow(unit, port)
+            elif kind is bst.Splitter:
+                nxt = split(unit, depth)
+            elif kind is bst.Mixer and depth:
+                return unit, port
+            elif kind is bst.HXutility and unit is utility and not depth:
+                return unit, port
+            else:
+                where = ('outside a split' if kind is bst.Mixer
+                         else 'inside a split' if unit is utility
+                         else 'not its utility')
+                problem('G2', f'{name}: reaches {unit.ID} inlet {port} ({where})')
+                return None
+            if nxt is None: return None
+            unit, port = nxt
+
+    unit, port = lc.entry
+    complete = unit in network and segment(unit, port, 0) is not None
+    return ports, edges, splits, complete
+
+def _split_network_problems(net):
+    """
+    Everything wrong with a synthesized network that may split streams:
+    the checks G0-G10 of the module docstring, made on the actual stream
+    graph (`_walk_stream`), against which the network's bookkeeping (the
+    facility's unit lists, the life cycles with their splits and
+    connections, ``stream_HXs_dict``) is checked. Every problem starts with
+    its check's tag ('G0 ...').
+    """
+    HXN, T_min_app = net['HXN'], net['T_min_app']
+    system = HXN.HXN_sys
+    units = list(system.units)
+    network = set(units)
+    problems = []
+    def problem(tag, text): problems.append(f'{tag} {text}')
+    def IDs(items): return [u.ID for u in items]
+    # G0 unit types, the facility's lists of them, IDs
+    kinds = [kind for kind, _, _ in _NETWORK_UNITS]
+    for u in units:
+        if type(u) not in kinds: problem('G0', f'{u.ID}: a {type(u).__name__}')
+    for kind, pattern, attr in _NETWORK_UNITS:
+        listed = list(getattr(HXN, attr, []))
+        present = [u for u in units if type(u) is kind]
+        if not (len(set(listed)) == len(listed) and set(listed) == set(present)):
+            problem('G0', f'{attr} {IDs(listed)} != the {kind.__name__} units '
+                          f'{IDs(present)}')
+        for u in present:
+            if not pattern.match(u.ID): problem('G0', f'{u.ID}: not a {kind.__name__} ID')
+    if len(set(IDs(units))) != len(units):
+        problem('G0', f'duplicate IDs in {sorted(IDs(units))}')
+    originals, cycles = HXN.original_heat_exchangers, HXN.stream_life_cycles
+    if not (len(originals) == len(cycles) == len(net['units'])
+            and set(originals) == set(net['units'])):
+        problem('G1', f'{len(cycles)} life cycles for {len(originals)} original exchangers; '
+                      f"expected one per process stream ({len(net['units'])})")
+    def same_state(s, t, duty):
+        return (_is_stream(s) and np.allclose(s.mol, t.mol, rtol=1e-12, atol=1e-12)
+                and abs(s.P - t.P) <= 1e-9 * t.P and abs(s.H - t.H) <= DUTY_RTOL * duty)
+    def specific(s): return s.H / s.F_mol if s.F_mol else math.nan
+    claims = {}       # (unit, inlet port) -> number of stream walks through it
+    stream_duty = {}  # (HXprocess, port) -> total duty of the stream it carries
+    entries = []
+    for hx, lc in zip(originals, cycles):
+        inlet, outlet = hx.ins[0], hx.outs[0]
+        duty = abs(outlet.H - inlet.H)
+        sign = 1. if outlet.H >= inlet.H else -1.
+        F = inlet.F_mol
+        atol = FLOW_RTOL * F
+        name = f'stream {lc.index} ({hx.ID})'
+        stages = lc.life_cycle
+        utility = stages[-1].unit
+        for stage in stages: stream_duty[stage.unit, stage.index] = duty
+        # G1 the entry is a feed of the network
+        unit, port = lc.entry
+        entry = unit.ins[port]
+        entries.append(entry)
+        if unit not in network or entry.source in network:
+            problem('G1', f'{name}: its entry, {unit.ID} inlet {port}, is not a feed '
+                          f'of the network')
+        if type(utility) is not bst.HXutility:
+            problem('G2', f'{name}: its life cycle ends at {utility.ID}, not at a utility')
+        # G2 the series-parallel walk
+        ports, edges, walked, complete = _walk_stream(lc, network, claims, problem, name)
+        # G3 the bookkeeping is the walk
+        path = ports + [(utility, 0)] if complete else ports
+        planned = [(stage.unit, stage.index) for stage in stages]
+        if path != planned:
+            problem('G3', f'{name}: walked {[(u.ID, p) for u, p in path]} != its life '
+                          f'cycle {[(u.ID, p) for u, p in planned]}')
+        connections = list(lc.connections())
+        if len(set(edges)) != len(edges) or set(edges) != set(connections):
+            extra = [(a.ID, i, b.ID, j) for a, i, b, j in set(edges) - set(connections)]
+            missing = [(a.ID, i, b.ID, j) for a, i, b, j in set(connections) - set(edges)]
+            problem('G3', f'{name}: walked {extra} beyond its life-cycle connections, '
+                          f'which also list {missing}')
+        for stage in stages:
+            s = stage.s_in
+            if not (_is_stream(s) and abs(stage.fraction * F - s.F_mol) <= FLOW_RTOL * F):
+                problem('G3', f'{name}: {stage.unit.ID} port {stage.index} is a stage with '
+                              f'fraction {stage.fraction:.15g} of the flow, its inlet '
+                              f'carries {s.F_mol / F if _is_stream(s) else 0.:.15g}')
+        HXs = HXN.stream_HXs_dict[lc.index]
+        if [id(u) for u in HXs] != [id(u) for u, _ in planned]:
+            problem('G3', f'{name}: stream_HXs_dict {IDs(HXs)} != its life cycle')
+        own = list(lc.splits)
+        for splitters, leaves, mixer, branches in walked:
+            root = splitters[0]
+            split = next((sp for sp in own if sp.splitters[0] is root), None)
+            if split is None:
+                problem('G3', f'{name}: the split at {root.ID} is not one of its splits')
+            else:
+                own.remove(split)
+                if not ([id(u) for u in split.splitters] == [id(u) for u in splitters]
+                        and split.mixer is mixer
+                        and [[id(u) for u in hxs] for hxs in split.branches]
+                        == [[id(u) for u, _ in b] for b in branches]):
+                    problem('G3', f'{name}: {split!r} is not the split walked from {root.ID}')
+            # G4 splitters: a splitter tree is one split
+            feed = root.ins[0]
+            for u in splitters:
+                total = _array(u.outs[0].mol) + _array(u.outs[1].mol)
+                if not np.allclose(total, _array(u.ins[0].mol), rtol=FLOW_RTOL, atol=atol):
+                    problem('G4', f'{u.ID}: its outlets carry {total.sum():.15g} kmol/hr, '
+                                  f'its feed {u.ins[0].F_mol:.15g}')
+            for b, (u, port, ratio) in enumerate(leaves):
+                s = u.outs[port]
+                f = s.F_mol / feed.F_mol if feed.F_mol else math.nan
+                label = f'{u.ID} outlet {port} (branch {b} of {name})'
+                if not MIN_FRACTION <= f < 1.:
+                    problem('G4', f'{label}: fraction {f:.15g}')
+                if not _is_fraction_of(s, f, feed, atol):
+                    problem('G4', f'{label}: its flows are not {f:.15g} x those of the feed')
+                if split is not None and not (
+                        b < len(split.fractions)
+                        and np.all(np.abs(ratio - split.fractions[b]) <= FLOW_RTOL)):
+                    problem('G4', f'{label}: the split ratios give {np.unique(ratio)}, '
+                                  f'the split fractions are {split.fractions}')
+                if not (abs(s.T - feed.T) <= SPLIT_T_TOL and s.P == feed.P):
+                    problem('G4', f'{label}: at {s.T:.12g} K, {s.P:.12g} Pa; the feed at '
+                                  f'{feed.T:.12g} K, {feed.P:.12g} Pa')
+                if not abs(s.H - f * feed.H) <= DUTY_RTOL * duty:
+                    problem('G4', f'{label}: H = {s.H:.10g} != {f:.15g} x the feed H '
+                                  f'{feed.H:.10g} kJ/hr')
+            # G5 mixers
+            out = mixer.outs[0]
+            H_in = math.fsum([s.H for s in mixer.ins])
+            mol_in = sum([_array(s.mol) for s in mixer.ins])
+            if not np.allclose(_array(out.mol), mol_in, rtol=FLOW_RTOL, atol=atol):
+                problem('G5', f'{mixer.ID}: mass balance')
+            if not abs(out.H - H_in) <= DUTY_RTOL * duty:
+                problem('G5', f'{mixer.ID}: outlet H = {out.H:.10g} != that of its inlets, '
+                              f'{H_in:.10g} kJ/hr')
+            if any(s.P != out.P for s in mixer.ins):
+                problem('G5', f'{mixer.ID}: inlets at {[s.P for s in mixer.ins]} Pa, '
+                              f'outlet at {out.P} Pa')
+            T_H = _temperature(out)(out.H) if out.F_mol else math.nan
+            if not abs(out.T - T_H) <= MIX_T_TOL:
+                problem('G5', f'{mixer.ID}: outlet at {out.T:.9f} K, not at equilibrium at '
+                              f'its enthalpy ({T_H:.9f} K)')
+            if split is None: continue
+            if split.isothermal:
+                h = specific(out)
+                for b, s in enumerate(mixer.ins):
+                    if not (abs(specific(s) - h) <= DUTY_RTOL * duty / F
+                            and abs(s.T - out.T) <= MIX_T_TOL):
+                        problem('G5', f'{mixer.ID} inlet {b}: at {s.T:.9f} K, '
+                                      f'{specific(s):.10g} kJ/kmol; the isothermal '
+                                      f're-join at {out.T:.9f} K, {h:.10g} kJ/kmol')
+            elif out.sink is not utility:
+                problem('G5', f'{mixer.ID}: a non-isothermal re-join feeding '
+                              f'{getattr(out.sink, "ID", None)}, not the utility')
+        if own:
+            problem('G3', f'{name}: splits never walked: {own}')
+        # G6 every stage moves the stream towards its outlet, and no branch
+        # passes the outlet (in specific enthalpy)
+        h_out = specific(outlet)
+        for u, p in ports + ([(utility, 0)] if complete else []):
+            s_in, s_out = u.ins[p], u.outs[p]
+            change = sign * (s_out.H - s_in.H)
+            if not change >= -DUTY_RTOL * duty:
+                problem('G6', f'{name}: {"cooled" if sign > 0 else "heated"} by '
+                              f'{-change:.10g} kJ/hr in {u.ID}')
+            if not sign * (h_out - specific(s_out)) >= -DUTY_RTOL * duty / F:
+                problem('G6', f'{name}: passes its outlet in {u.ID} ({specific(s_out):.10g} '
+                              f'kJ/kmol; outlet {h_out:.10g} kJ/kmol)')
+        # G8 the stream's exchangers change it by its duty, and its utility
+        # takes the whole flow
+        if complete:
+            change = math.fsum([u.outs[p].H - u.ins[p].H for u, p in ports]
+                               + [utility.outs[0].H - utility.ins[0].H])
+            if not abs(change - (outlet.H - inlet.H)) <= DUTY_RTOL * duty:
+                problem('G8', f'{name}: its exchangers change it by {change:.10g} kJ/hr, '
+                              f'not {outlet.H - inlet.H:.10g}')
+            if not np.allclose(_array(utility.ins[0].mol), _array(inlet.mol),
+                               rtol=FLOW_RTOL, atol=atol):
+                problem('G8', f'{name}: {utility.ID} takes {utility.ins[0].F_mol:.15g} '
+                              f'kmol/hr of {F:.15g}')
+        # G9 end states
+        for label, s, original in (('inlet', entry, inlet),
+                                   ('outlet', utility.outs[0], outlet)):
+            if not same_state(s, original, duty):
+                problem('G9', f'{name}: network {label} != original (H={original.H:.10g} '
+                              f'kJ/hr, P={original.P:.8g} Pa)')
+    # G1 the entries are the network's feeds
+    feeds = [s for u in units for s in u.ins if s.source not in network]
+    entry_IDs = {id(s) for s in entries}
+    if not (len(entry_IDs) == len(entries) == len(feeds)
+            and entry_IDs == {id(s) for s in feeds} == {id(s) for s in system.feeds}):
+        problem('G1', f'entry streams {sorted(map(str, entries))} != the feeds of the '
+                      f'network {sorted(map(str, feeds))} (of HXN_sys: '
+                      f'{sorted(map(str, system.feeds))})')
+    # G3 every inlet of every unit is on exactly one stream walk
+    for u in units:
+        for port in range(len(u.ins)):
+            n = claims.get((u, port), 0)
+            if n != 1: problem('G3', f'{u.ID} inlet {port}: on {n} stream walks, expected 1')
+    # G7 every process exchanger: mass, heat and the exact internal approach
+    # on its streams' own material (C11-C13)
+    for hx in [u for u in units if type(u) is bst.HXprocess]:
+        if not all(map(_is_stream, [*hx.ins, *hx.outs])):
+            problem('G7', f'{hx.ID}: a port without a stream')
+            continue
+        dH = [s_in.H - s_out.H for s_in, s_out in zip(hx.ins, hx.outs)]
+        for s_in, s_out in zip(hx.ins, hx.outs):
+            if not np.allclose(s_in.mol, s_out.mol, rtol=1e-12, atol=1e-12):
+                problem('G7', f'{hx.ID}: mass balance')
+        scale = (stream_duty.get((hx, 0), 0.) + stream_duty.get((hx, 1), 0.)
+                 or sum(map(abs, dH)))
+        h = int(np.argmax(dH))
+        c = 1 - h
+        if not abs(dH[h] + dH[c]) <= DUTY_RTOL * scale:
+            problem('G7', f'{hx.ID}: heat released {dH[h]:.10g} != heat absorbed '
+                          f'{-dH[c]:.10g} kJ/hr')
+        if dH[h] <= 1e-12 * scale: continue  # no heat transferred
+        if not (hx.ins[h].F_mol and hx.ins[c].F_mol):
+            problem('G7', f'{hx.ID}: an empty inlet')
+            continue
+        approach = _min_approach(
+            _temperature(hx.ins[h]), hx.ins[h].H, hx.outs[h].H,
+            _temperature(hx.ins[c]), hx.ins[c].H, hx.outs[c].H,
+        )
+        if not approach >= T_min_app - APPROACH_TOL:
+            problem('G7', f'{hx.ID}: internal approach {approach:.7f} K < {T_min_app} K')
+    # G10 energy balance error; heat - cool == net duty (C1, C2)
+    if not abs(HXN.energy_balance_percent_error) < EB_TOL:
+        problem('G10', f'energy balance error {HXN.energy_balance_percent_error:.3g} %')
+    if not abs(net['heat'] - net['cool'] - net['net']) <= NET_RTOL * net['total']:
+        problem('G10', f"heat - cool = {net['heat'] - net['cool']:.10g} "
+                       f"!= net duty {net['net']:.10g}")
+    return problems
+
+# ---------------------------------------------------------------------------
+# A split network wired by hand, as the facility wires one
+# ---------------------------------------------------------------------------
+
+def _converge(system):
+    """Converge a network's system and design and cost its units, as
+    ``HeatExchangerNetwork._cost`` does (without its fallback: a failure
+    raises)."""
+    system._setup()
+    system.converge()
+    for unit in system.units: unit._summary()
+
+def _connection_path(units, cycles):
+    """The simulation path of `units` along the connections of the life
+    `cycles`, and the streams to tear: a topological order (ties by the
+    order of `units`) that places, where the connections form a cycle, the
+    unit with the fewest unplaced feeders next (the rule of the facility's
+    `_network_path`)."""
+    position = {u: n for n, u in enumerate(units)}
+    successors = {u: [] for u in units}
+    waiting = {u: 0 for u in units}
+    for lc in cycles:
+        for up, port, down, _ in lc.connections():
+            successors[up].append((down, up.outs[port]))
+            waiting[down] += 1
+    ready = [position[u] for u in units if not waiting[u]]
+    heapq.heapify(ready)
+    placed = {}
+    while len(placed) < len(units):
+        if ready:
+            unit = units[heapq.heappop(ready)]
+            if unit in placed: continue
+        else:
+            unit = min((u for u in units if u not in placed),
+                       key=lambda u: (waiting[u], position[u]))
+        placed[unit] = len(placed)
+        for other, _ in successors[unit]:
+            waiting[other] -= 1
+            if not waiting[other] and other not in placed:
+                heapq.heappush(ready, position[other])
+    path = sorted(units, key=placed.__getitem__)
+    recycles = [s for u in units for other, s in successors[u] if placed[other] <= placed[u]]
+    return path, recycles
+
+_WIRED = {}
+
+def _wired_split_network(case, cached=False):
+    """
+    The case's network with stream splitting, wired by hand the way
+    `HeatExchangerNetwork` wires its own (the stream-splitting design,
+    5.2): `synthesize_network` with `stream_splitting`, one
+    `StreamLifeCycle` per stream given the splits, a copy of the stream's
+    real inlet in its entry port, every connection of every life cycle,
+    and one converged `System`. Returned as `_network` returns a network,
+    its 'HXN' a namespace with the facility's attributes; a fresh network
+    unless `cached`.
+    """
+    name = case['name']
+    if cached and name in _WIRED: return _WIRED[name]
+    units, T_min_app = _build(case)
+    hus = _facility_heat_utilities(units, T_min_app)
+    flowsheet = bst.Flowsheet('mer_wired_HXN')
+    for registry in flowsheet.registries: registry.clear()
+    info = {}
+    with flowsheet.temporary(), bst.IgnoreDockingWarnings():
+        (hot_side, cold_side, utils, hxs, _, T_out, _, _, _, _, stream_HXs, _,
+         cold_indices) = hxn_synthesis.synthesize_network(
+            hus, T_min_app, info=info, stream_splitting=True)
+        new_HXs = hot_side + cold_side
+        cycles = []
+        for i in range(len(hxs)):
+            lc = hxn_synthesis.StreamLifeCycle(i, i in cold_indices)
+            lc.get_life_cycle(new_HXs, utils, splits=info['splits'])
+            cycles.append(lc)
+        for i, lc in enumerate(cycles):
+            unit, port = lc.entry
+            inlet = unit.ins[port]
+            inlet.copy_like(hxs[i].ins[0])
+            if isinstance(unit, (bst.HXprocess, bst.Splitter)):
+                hxn_synthesis._first_inlet(inlet, i in info['point_loads'], T_out[i],
+                                           i not in cold_indices)
+        for lc in cycles:
+            for up, up_port, down, down_port in lc.connections():
+                down.ins[down_port] = up.outs[up_port]
+        splitters = [u for split in info['splits'] for u in split.splitters]
+        mixers = [split.mixer for split in info['splits']]
+        path, recycles = _connection_path(new_HXs + utils + splitters + mixers, cycles)
+        system = bst.System('mer_wired', path, recycle=recycles or None)
+        system.set_tolerance(method='fixedpoint', subsystems=True, mol=1e-9, rmol=1e-12,
+                             T=1e-8, rT=1e-12, maxiter=200)
+        _converge(system)
+    new_hus = [hu for hx in utils for hu in hx.heat_utilities]
+    def load(hus): return sum([abs(hu.duty * hu.agent.heat_transfer_efficiency)
+                               for hu in bst.HeatUtility.sum_by_agent(hus)])
+    Q_bal = (2. * sum([abs(hx.Q) for hx in new_HXs]) + load(new_hus)) / load(hus)
+    HXN = SimpleNamespace(
+        HXN_sys=system, new_HXs=new_HXs, new_HX_utils=utils, new_splitters=splitters,
+        new_mixers=mixers, original_heat_exchangers=hxs, stream_life_cycles=cycles,
+        stream_HXs_dict=stream_HXs, synthesis_info=info,
+        energy_balance_percent_error=100. * (Q_bal - 1.),
+    )
+    total, net = _duties(units)
+    result = dict(
+        units=units, HXN=HXN, T_min_app=T_min_app, total=total, net=net,
+        heat=sum(hu.unit_duty for hu in new_hus if hu.unit_duty > 0),
+        cool=-sum(hu.unit_duty for hu in new_hus if hu.unit_duty < 0),
+        stream_splitting=True, variant=None,
+    )
+    if cached: _WIRED[name] = result
+    return result
+
+# ---------------------------------------------------------------------------
+# Defects of a split network, one per check (each returns the check's tag)
+# ---------------------------------------------------------------------------
+
+MUTATION_CASE = 'smith2005_ex18_2_split'
+
+def _split_stage(net, b=0):
+    """The network's first split, the index of its stream's life cycle, and
+    the life-cycle stage of the first exchanger of its branch `b`."""
+    HXN = net['HXN']
+    split = HXN.synthesis_info['splits'][0]
+    n = next(n for n, lc in enumerate(HXN.stream_life_cycles) if lc.index == split.stream)
+    stage = next(s for s in HXN.stream_life_cycles[n].life_cycle
+                 if s.unit is split.branches[b][0])
+    return split, n, stage
+
+def _rewire(unit, port, stream):
+    with bst.IgnoreDockingWarnings(): unit.ins[port] = stream
+
+def _misnamed_mixer(net):
+    split, *_ = _split_stage(net)
+    split.mixer.ID = 'Mixer_' + split.mixer.ID
+    return 'G0'
+
+def _unlisted_splitter(net):
+    net['HXN'].new_splitters.remove(_split_stage(net)[0].splitters[0])
+    return 'G0'
+
+def _entry_moved(net):
+    # the stream's entry moved into its first branch
+    split, n, stage = _split_stage(net)
+    net['HXN'].stream_life_cycles[n].entry = hxn_synthesis._Port(stage.unit, stage.index)
+    return 'G1'
+
+def _mixer_inlet_from_a_trunk(net):
+    # a mixer inlet re-pointed to another stream's trunk
+    split, *_ = _split_stage(net)
+    other = next(lc for lc in net['HXN'].stream_life_cycles
+                 if lc.index != split.stream and not lc.splits and len(lc.life_cycle) > 1)
+    _rewire(split.mixer, 1, other.life_cycle[0].s_out)
+    return 'G2'
+
+def _mixer_inlets_swapped(net):
+    # the branches re-join at each other's mixer inlets
+    mixer = _split_stage(net)[0].mixer
+    with bst.IgnoreDockingWarnings(): mixer.ins[:] = [mixer.ins[1], mixer.ins[0], *mixer.ins[2:]]
+    return 'G3'
+
+def _branch_exchanger_bypassed(net):
+    # the exchanger's inlet stream wired to its outlet's sink
+    stage = _split_stage(net)[2]
+    s_out = stage.s_out
+    _rewire(s_out.sink, _inlet_port(s_out.sink, s_out), stage.s_in)
+    return 'G3'
+
+def _wrong_split_ratio(net):
+    split, *_ = _split_stage(net)
+    split.splitters[0].split = 0.9 * split.fractions[0]
+    _converge(net['HXN'].HXN_sys)
+    return 'G4'
+
+def _branch_inlet_scaled(net):
+    # a branch inlet carries the wrong fraction
+    _split_stage(net)[2].s_in.scale(1.1)
+    return 'G4'
+
+def _mixer_outlet_shifted(net):
+    mixer = _split_stage(net)[0].mixer
+    mixer.outs[0].T += 0.01
+    return 'G5'
+
+def _branch_passes_the_outlet(net):
+    split, n, stage = _split_stage(net)
+    outlet = net['HXN'].original_heat_exchangers[n].outs[0]
+    sign = 1. if net['HXN'].stream_life_cycles[n].cold else -1.
+    stage.s_out.T = outlet.T + sign
+    return 'G6'
+
+def _branch_H_lim_shifted(net):
+    # a branch exchanger's enthalpy limits moved on by 5 % of its duty,
+    # past its approach (its dT guard lowered too: at T_min_app - 1e-6 K it
+    # would cap the duty at the terminals). Branch 1: on MUTATION_CASE its
+    # partner comes from outside the split stream's loop (branch 0's
+    # partner is heated by the split stream below the pinch, and the
+    # converged loop lowers its inlet, keeping the approach)
+    split, n, stage = _split_stage(net, 1)
+    hx = stage.unit
+    hx.dT = 0.5 * net['T_min_app']
+    for k in (0, 1):
+        H_lim = getattr(hx, f'H_lim{k}')
+        if H_lim is not None:
+            setattr(hx, f'H_lim{k}', H_lim + 0.05 * (H_lim - hx.ins[k].H))
+    _converge(net['HXN'].HXN_sys)
+    return 'G7'
+
+def _utility_inlet_short(net):
+    split, n, stage = _split_stage(net)
+    net['HXN'].stream_life_cycles[n].life_cycle[-1].s_in.scale(1. - 1e-9)
+    return 'G8'
+
+def _utility_outlet_shifted(net):
+    split, n, stage = _split_stage(net)
+    net['HXN'].stream_life_cycles[n].life_cycle[-1].s_out.T += 0.01
+    return 'G9'
+
+def _heat_misreported(net):
+    net['heat'] += 1e-6 * net['total']
+    return 'G10'
+
+SPLIT_MUTATIONS = {f.__name__.strip('_'): f for f in (
+    _misnamed_mixer, _unlisted_splitter, _entry_moved, _mixer_inlet_from_a_trunk,
+    _mixer_inlets_swapped, _branch_exchanger_bypassed, _wrong_split_ratio,
+    _branch_inlet_scaled, _mixer_outlet_shifted, _branch_passes_the_outlet,
+    _branch_H_lim_shifted, _utility_inlet_short, _utility_outlet_shifted,
+    _heat_misreported,
+)}
+
+# ---------------------------------------------------------------------------
+# Plans (bitwise comparison)
+# ---------------------------------------------------------------------------
+
+def _same(a, b):
+    """Whether `a` and `b` are equal, floats bit for bit (nested dicts,
+    lists, tuples and arrays)."""
+    if isinstance(a, dict):
+        return (isinstance(b, dict) and a.keys() == b.keys()
+                and all(_same(a[k], b[k]) for k in a))
+    if isinstance(a, (list, tuple)):
+        return (type(a) is type(b) and len(a) == len(b)
+                and all(map(_same, a, b)))
+    if isinstance(a, np.ndarray):
+        return (isinstance(b, np.ndarray) and a.dtype == b.dtype
+                and a.shape == b.shape and a.tobytes() == b.tobytes())
+    if isinstance(a, (float, np.floating)):
+        return (isinstance(b, (float, np.floating))
+                and float(a).hex() == float(b).hex())
+    return type(a) is type(b) and a == b
+
+def _plan_exchangers(plan):
+    return [(e.side, e.hot, e.cold, e.Q, e.H_hot_in, e.H_hot_out, e.H_cold_in,
+             e.H_cold_out, e.pair_index, e.hot_seq, e.cold_seq, e.hot_frac,
+             e.cold_frac, e.hot_branch, e.cold_branch) for e in plan.exchangers]
+
+def _side_matches(plan, side):
+    """{stream: [(side, hot, cold, Q) of its exchangers on `side`, in flow
+    order]}."""
+    return {j: [(e.side, e.hot, e.cold, e.Q) for e in (plan.exchangers[n] for n in stages)
+                if e.side == side] for j, stages in plan.stages.items()}
+
+def _plan_without_best_effort(knots, is_hot, T_min_app):
+    """`plan_network` without stream splitting, except that a side it
+    cannot serve at MER is left unplanned instead of planned for best
+    effort (`_planner._best_effort` is patched to return every must's
+    whole duty as a gap). Without `avoid_recycle`, `plan_network` plans
+    each side on its own (`_planner._plan_sides`), and only a side whose
+    status is then 'best_effort' reaches `_best_effort`, so every 'mer'
+    and 'trivial' side is exactly as in the real plan; the best-effort
+    searches of the SPLIT problems (94 s in all) are skipped."""
+    def unplanned(side, proof, cap1, forbid, work_scale, work):
+        return _planner._SidePlan([], list(side.Qm), 'best_effort', 'unplanned',
+                                  work, proof)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_planner, '_best_effort', unplanned)
+        return plan_network(knots, is_hot, T_min_app)
 
 # ---------------------------------------------------------------------------
 # Tests
@@ -951,3 +1766,89 @@ def test_split_network_never_beats_mer(case):
         assert got >= target * (1. - BEAT_RTOL) - atol, (label, got, target)
         assert got >= ref - ref_tol - atol, (label, got, ref)
     assert net['HXN'].synthesis_info['status'] == 'best_effort'
+
+# ---------------------------------------------------------------------------
+# Stream splitting: the strict checker and the planner at the corpus
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize('case', NO_SPLIT + SPLIT, ids=_name)
+def test_split_checker_agrees_on_linear_networks(case):
+    # on the unsplit networks, the strict split-aware checks (G0-G10) and
+    # today's checks agree: neither finds a problem
+    net = _network(case)
+    problems = _split_network_problems(net)
+    assert not problems, '\n'.join(problems)
+    problems = _linear_network_problems(net)
+    assert not problems, '\n'.join(problems)
+
+@pytest.mark.parametrize('mutation', list(SPLIT_MUTATIONS))
+def test_split_checker_detects_mutations(mutation):
+    # a split network wired by hand (as the facility wires it) passes the
+    # strict checks; each defect, applied to a fresh copy, is caught by the
+    # check made for it (and possibly others)
+    case = _case(MUTATION_CASE)
+    problems = _network_problems(_wired_split_network(case, cached=True))
+    assert not problems, '\n'.join(problems)
+    net = _wired_split_network(case)
+    tag = SPLIT_MUTATIONS[mutation](net)
+    problems = _network_problems(net)
+    assert any(p.startswith(tag + ' ') for p in problems), (tag, problems)
+
+@pytest.mark.parametrize('case', NO_SPLIT, ids=_name)
+def test_no_split_plan_unchanged_by_splitting(case):
+    # a problem that needs no split plans bit for bit as without splitting
+    knots = _corpus_knots(case)
+    args = knots['knots'], knots['is_hot'], knots['T_min_app']
+    off = plan_network(*args)
+    on = plan_network(*args, stream_splitting=True)
+    assert on.status == off.status == 'mer'
+    assert on.splits == []
+    assert all(side['split'] is None for side in on.info['sides'].values())
+    info = dict(on.info, sides={name: {k: v for k, v in side.items() if k != 'split'}
+                                for name, side in on.info['sides'].items()})
+    assert _same(info, off.info)
+    assert _same(_plan_exchangers(on), _plan_exchangers(off))
+    for attr in ('Q_hot_target', 'Q_cold_target', 'pinch_T', 'cut', 'stages',
+                 'utility', 'Q_hot', 'Q_cold', 'penalty', 'paths'):
+        assert _same(getattr(on, attr), getattr(off, attr)), attr
+
+#: SPLIT problems with a side that an unsplit plan serves
+UNSPLIT_SIDES = {'smith2005_ex18_2_split': 'below', 'rtB05_above_2h1c': 'below',
+                 'luo_20sp_ph10c10': 'above'}
+
+@pytest.mark.parametrize('case', SPLIT, ids=_name)
+def test_split_cases_keep_unsplit_sides(case):
+    # the side of a SPLIT problem that an unsplit plan serves (or that is
+    # trivial) is planned exactly as without splitting: the same matches in
+    # the same order along every stream, and the same side info. Enthalpies
+    # are not compared: a stream crossing into the split side enters the
+    # unsplit side at another enthalpy once the split side reaches MER.
+    knots = _corpus_knots(case)
+    args = knots['knots'], knots['is_hot'], knots['T_min_app']
+    on = plan_network(*args, stream_splitting=True)
+    assert on.status == 'mer'
+    off = _plan_without_best_effort(*args)
+    kept = [name for name, side in off.info['sides'].items()
+            if side['status'] in ('mer', 'trivial')]
+    assert all(side['method'] == 'unplanned' for name, side in off.info['sides'].items()
+               if name not in kept)
+    if case['name'] in UNSPLIT_SIDES: assert UNSPLIT_SIDES[case['name']] in kept
+    for name in kept:
+        side_on, side_off = on.info['sides'][name], off.info['sides'][name]
+        assert side_on['split'] is None, name
+        assert _same({k: side_on[k] for k in side_off}, side_off), name
+        assert _same(_side_matches(on, name), _side_matches(off, name)), name
+
+def test_network_variant_is_patched_for_the_synthesis_only():
+    # the backstop variant ('V') patches the splitting portfolio inside its
+    # context only, so a cached variant network never leaks the patch
+    rules, strategies = _splitting._SPLIT_RULES, _splitting._CORE_STRATEGIES
+    with _variant('V'):
+        assert _splitting._SPLIT_RULES == ()
+        assert _splitting._CORE_STRATEGIES == ('V',)
+    assert _splitting._SPLIT_RULES is rules
+    assert _splitting._CORE_STRATEGIES is strategies
+    with _variant(None):
+        assert _splitting._SPLIT_RULES is rules
+    with pytest.raises(ValueError):
+        with _variant('LV'): pass
