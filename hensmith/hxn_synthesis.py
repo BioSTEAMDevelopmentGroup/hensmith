@@ -15,6 +15,7 @@ stream life cycles (`StreamLifeCycle`) and pinch diagrams
 """
 from collections import namedtuple
 import heapq
+import math
 import re
 import numpy as np
 import biosteam as bst
@@ -22,6 +23,7 @@ from warnings import warn
 from ._curves import (StreamCurve, stream_curves, _end_state, _T_EQ, _T_SIDE,
                       _copy, _point_load_inlet)
 from ._planner import plan_network
+from ._splitting import Split
 
 __all__ = ('StreamLifeCycle', 'ProblemTable', 'problem_table',
            'synthesize_network', 'plot_pinch_diagram')
@@ -804,11 +806,22 @@ def _interval_min(f, a, fa, b, fb):
     return fx
 
 def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
-                        T_min_app):
+                        T_min_app, fh=1., fc=1.):
     """
     Exact-state check of one counter-current exchanger of duty `Q` in which
     stream `h` enters hot at `H_hot_in` and stream `c` enters cold at
     `H_cold_in` (enthalpies relative to each stream's H_lo).
+
+    With stream splitting, `fh` and `fc` are the flow fractions of the hot
+    and the cold branch in the exchanger: a branch at fraction f has its
+    parent's states at f times the parent's enthalpy flow, so the duty
+    moves its parent-equivalent enthalpy by ``Q / f``. The duty position q
+    in [0, Q] (from the hot inlet and the cold outlet end) lies at
+    ``H_hot_in - q / fh`` and ``H_cold_out - q / fc``, a knot H at
+    ``(H_hot_in - H) fh`` or ``(H_cold_out - H) fc``; the states returned
+    are parent-equivalent (what `_refine_knots` takes). At f = 1 every
+    expression is the unsplit one, bit for bit (division and
+    multiplication by 1. are exact).
 
     The positions are the ends and every knot and curve breakpoint inside
     the exchanger. Between two consecutive positions both knot curves are
@@ -830,15 +843,15 @@ def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
     which misses an internal pinch at a phase change).
     """
     hot, cold = curves[h], curves[c]
-    H_hot_out, H_cold_out = H_hot_in - Q, H_cold_in + Q
+    H_hot_out, H_cold_out = H_hot_in - Q / fh, H_cold_in + Q / fc
     qs = [0., Q]
     for H in (knots[h][1], hot.H - hot.H_lo):
-        qs.extend(H_hot_in - H[(H > H_hot_out) & (H < H_hot_in)])
+        qs.extend((H_hot_in - H[(H > H_hot_out) & (H < H_hot_in)]) * fh)
     for H in (knots[c][1], cold.H - cold.H_lo):
-        qs.extend(H_cold_out - H[(H > H_cold_in) & (H < H_cold_out)])
+        qs.extend((H_cold_out - H[(H > H_cold_in) & (H < H_cold_out)]) * fc)
     qs = np.unique(np.clip(qs, 0., Q))
-    planned = (_knot_T(knots[h], H_hot_in - qs, True)
-               - _knot_T(knots[c], H_cold_out - qs, False))
+    planned = (_knot_T(knots[h], H_hot_in - qs / fh, True)
+               - _knot_T(knots[c], H_cold_out - qs / fc, False))
     near = planned < T_min_app + _curve_tol_T(hot) + _curve_tol_T(cold) + 1e-9
     limit = T_min_app - _APPROACH_TOL
     points = []
@@ -846,11 +859,12 @@ def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
 
     def exact(q):
         if q not in states:
-            T_hot = hot.T_exact(hot.H_lo + H_hot_in - q, 'low')
-            T_cold = cold.T_exact(cold.H_lo + H_cold_out - q, 'high')
+            qh, qc = q / fh, q / fc
+            T_hot = hot.T_exact(hot.H_lo + H_hot_in - qh, 'low')
+            T_cold = cold.T_exact(cold.H_lo + H_cold_out - qc, 'high')
             states[q] = dT = T_hot - T_cold
             if dT < limit:
-                points.append((T_hot, H_hot_in - q, T_cold, H_cold_out - q))
+                points.append((T_hot, H_hot_in - qh, T_cold, H_cold_out - qc))
         return states[q]
 
     worst = float(planned[~near].min()) if not near.all() else np.inf
@@ -868,7 +882,8 @@ def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
 def _exact_approach(plan, duties, ends, curves, knots, T_min_app):
     """
     `_exchanger_approach` of every exchanger in `duties` (duty by index into
-    ``plan.exchangers``) at the enthalpies of the walk `ends` (see `_walk`).
+    ``plan.exchangers``) at the enthalpies of the walk `ends` (see `_walk`),
+    with the flow fractions of its branches (1 on a trunk).
     Returns the smallest approach [K], the violating exact states by stream,
     ``{stream: [(T_exact, H - H_lo), ...]}``, and the violating exchangers.
     """
@@ -879,7 +894,8 @@ def _exact_approach(plan, duties, ends, curves, knots, T_min_app):
         e = plan.exchangers[n]
         h, c = e.hot, e.cold
         approach, points = _exchanger_approach(
-            curves, knots, h, c, ends[n, h][0], ends[n, c][0], Q, T_min_app
+            curves, knots, h, c, ends[n, h][0], ends[n, c][0], Q, T_min_app,
+            e.hot_frac, e.cold_frac
         )
         worst = min(worst, approach)
         if points: bad.append(n)
@@ -888,30 +904,34 @@ def _exact_approach(plan, duties, ends, curves, knots, T_min_app):
             violations.setdefault(c, []).append((T_cold, H_cold))
     return worst, violations, bad
 
-def _shrink(curves, knots, h, c, H_hot_in, H_cold_in, Q, T_min_app):
+def _shrink(curves, knots, h, c, H_hot_in, H_cold_in, Q, T_min_app,
+            fh=1., fc=1.):
     """
     Largest duty ``Q' <= Q`` (to 1e-9 of Q) at which the exchanger of
-    `_exchanger_approach` keeps ``T_min_app - _APPROACH_TOL`` on the exact
-    states. With both inlets fixed, a smaller duty lowers the cold stream's
-    enthalpy (so its temperature) at every position and shortens the
-    exchanger, so the approach can only grow: the feasible duties form an
-    interval [0, Q'] and bisection finds its end.
+    `_exchanger_approach` (branches at flow fractions `fh` and `fc`) keeps
+    ``T_min_app - _APPROACH_TOL`` on the exact states. With both inlets
+    fixed, a smaller duty lowers the cold stream's enthalpy (so its
+    temperature) at every position and shortens the exchanger, so the
+    approach can only grow: the feasible duties form an interval [0, Q']
+    and bisection finds its end. On branches too: duty position q lies at
+    ``H_cold_in + (Q - q) / fc`` on the cold branch, which falls with Q,
+    and at ``H_hot_in - q / fh`` on the hot one, whatever Q.
     """
     def ok(x):
         return not _exchanger_approach(curves, knots, h, c, H_hot_in,
-                                       H_cold_in, x, T_min_app)[1]
+                                       H_cold_in, x, T_min_app, fh, fc)[1]
     lo, hi = 0., Q
     # a first guess from the local heat capacity flow rates saves most of
     # the bisection: the violations are within the chord error of the knots
     approach, _ = _exchanger_approach(curves, knots, h, c, H_hot_in,
-                                      H_cold_in, Q, T_min_app)
-    CP = 0.
-    for j in (h, c):
+                                      H_cold_in, Q, T_min_app, fh, fc)
+    CP = 0. # of the branches: f times the parent's
+    for j, f in ((h, fh), (c, fc)):
         T, H = knots[j]
         dT = np.diff(T)
         dH = np.diff(H)
         slopes = dH[dT > 0.] / dT[dT > 0.]
-        if slopes.size: CP = max(CP, float(slopes.max()))
+        if slopes.size: CP = max(CP, f * float(slopes.max()))
     guess = Q - 2. * (T_min_app - approach) * CP
     if 0. < guess < Q and ok(guess): lo = guess
     while hi - lo > 1e-9 * Q:
@@ -927,8 +947,11 @@ def _repair(plan, duties, knots, is_hot, curves, T_min_app):
     its duty goes to the utilities. Shrinking a match moves the later stages
     of both its streams toward their inlets, which never reduces another
     exchanger's approach (the curves are monotone), so one pass suffices;
-    the loop only guards against rounding. Returns the new duties and the
-    changes, ``[(n, Q_before, Q_after)]``.
+    the loop only guards against rounding. A branch exchanger shrinks with
+    its flow fractions; its later branch stages and the mix (at the split
+    enthalpy -/+ the surviving branch duties, see `_walk`) move toward the
+    inlet too. Returns the new duties and the changes, ``[(n, Q_before,
+    Q_after)]``.
     """
     duties = dict(duties)
     changes = []
@@ -940,7 +963,8 @@ def _repair(plan, duties, knots, is_hot, curves, T_min_app):
             e = plan.exchangers[n]
             ends = _walk(plan, duties, knots, is_hot)[0]
             Q = _shrink(curves, knots, e.hot, e.cold, ends[n, e.hot][0],
-                        ends[n, e.cold][0], duties[n], T_min_app)
+                        ends[n, e.cold][0], duties[n], T_min_app,
+                        e.hot_frac, e.cold_frac)
             changes.append((n, duties[n], Q))
             duties[n] = Q
     return duties, changes
@@ -1040,18 +1064,42 @@ def _walk(plan, duties, knots, is_hot):
     (side, hot, cold) pair, in the order the hot stream meets them). A
     smaller duty (a dropped or shrunk match) shifts the later stages of both
     streams toward their inlets.
+
+    With stream splitting (``plan.splits``), every stream is walked along
+    ``plan.paths``: a split's branches start at the split enthalpy and a
+    branch exchanger of flow fraction f moves the branch by its duty over
+    f, so its `ends` are parent-equivalent (the enthalpies of the full flow
+    in the branch's state); the stream re-joins at the split enthalpy -/+
+    the sum of the surviving branch duties, which the fractions leave free
+    of round-off. A dropped branch exchanger shortens its branch, a branch
+    without any bypasses, and later stages move toward the inlet by the
+    duty lost (`_split_nodes` gives the split enthalpies).
     """
     ends = {}
     last = []
-    for j, hot in enumerate(is_hot):
-        H = knots[j][1][-1] if hot else 0.
-        for n in plan.stages[j]:
-            if n not in duties: continue
-            Q = duties[n]
-            H_next = H - Q if hot else H + Q
-            ends[n, j] = (H, H_next)
-            H = H_next
-        last.append(H)
+    if not plan.splits:
+        for j, hot in enumerate(is_hot):
+            H = knots[j][1][-1] if hot else 0.
+            for n in plan.stages[j]:
+                if n not in duties: continue
+                Q = duties[n]
+                H_next = H - Q if hot else H + Q
+                ends[n, j] = (H, H_next)
+                H = H_next
+            last.append(H)
+    else:
+        for j, hot in enumerate(is_hot):
+            H = knots[j][1][-1] if hot else 0.
+            for item in plan.paths[j]:
+                if isinstance(item, Split):
+                    H = _walk_split(item, duties, ends, H, hot)
+                    continue
+                if item not in duties: continue
+                Q = duties[item]
+                H_next = H - Q if hot else H + Q
+                ends[item, j] = (H, H_next)
+                H = H_next
+            last.append(H)
     count = {}
     pair_index = {}
     for j, hot in enumerate(is_hot):
@@ -1062,6 +1110,81 @@ def _walk(plan, duties, knots, is_hot):
             key = (e.side, e.hot, e.cold)
             count[key] = pair_index[n] = count.get(key, 0) + 1
     return ends, last, pair_index
+
+def _branch_duty(split, duties):
+    """Sum (exactly rounded) of the duties of `split`'s branch exchangers
+    in `duties`."""
+    return math.fsum([duties[n] for ns in split.branches for n in ns
+                      if n in duties])
+
+def _walk_split(split, duties, ends, H, hot):
+    """
+    `_walk` over `split` (a `hensmith._splitting.Split` of a stream that is
+    cooled if `hot`) from the split enthalpy `H`: fill the `ends` of its
+    branch exchangers in `duties`, each branch from `H` by duty over
+    fraction, and return the enthalpy where the branches re-join.
+    """
+    j = split.stream
+    for f, ns in zip(split.fractions, split.branches):
+        Hb = H
+        for n in ns:
+            if n not in duties: continue
+            Q = duties[n] / f
+            H_next = Hb - Q if hot else Hb + Q
+            ends[n, j] = (Hb, H_next)
+            Hb = H_next
+    D = _branch_duty(split, duties)
+    return H - D if hot else H + D
+
+def _split_nodes(plan, duties, ends):
+    """
+    Where the streams of a plan with splits (``plan.splits``) split and
+    re-join, for the exchangers in `duties` and their walk `ends` (see
+    `_walk`, whose arithmetic this repeats).
+
+    Returns
+    -------
+    first_nodes : dict[int, tuple[int]]
+        For every stream, the first exchanger of every branch of the split
+        that is its first node (the first item of ``plan.paths[j]`` with an
+        exchanger in `duties`), in branch order: they all take the stream's
+        real inlet (`_realize`). Empty if the first node is not a split.
+    split_ends : list[tuple or None]
+        For every split of ``plan.splits``, ``(H_split, [H_end, ...],
+        H_mix)``: the enthalpies (relative to the stream's H_lo) where it
+        splits, where each branch ends (a parent-equivalent enthalpy;
+        ``H_split`` for a branch without exchangers, which bypasses) and
+        where the branches re-join. None for a split whose branches have
+        no exchanger left: it is not realized, the stream passes it
+        unchanged.
+    """
+    split_ends = []
+    for split in plan.splits:
+        j = split.stream
+        live = [[n for n in ns if n in duties] for ns in split.branches]
+        n = next((ns[0] for ns in live if ns), None)
+        if n is None:
+            split_ends.append(None)
+            continue
+        H = ends[n, j][0]
+        D = _branch_duty(split, duties)
+        H_mix = H - D if plan.exchangers[n].hot == j else H + D
+        split_ends.append((H, [ends[ns[-1], j][1] if ns else H
+                               for ns in live], H_mix))
+    first_nodes = {}
+    for j, path in plan.paths.items():
+        first_nodes[j] = ()
+        for item in path:
+            if not isinstance(item, Split):
+                if item in duties: break
+                continue
+            firsts = [next((n for n in ns if n in duties), None)
+                      for ns in item.branches]
+            firsts = tuple(n for n in firsts if n is not None)
+            if firsts:
+                first_nodes[j] = firsts
+                break
+    return first_nodes, split_ends
 
 def _discard(units):
     """Remove units, and the streams connected to them, from the registry of
@@ -1078,10 +1201,19 @@ def _realize(plan, duties, curves, knots, streams_inlet, is_hot, T_min_app):
     them cannot be simulated. Returns ``(units, first, last)``: the units by
     exchanger index, each stream's first exchanger (None if it has none)
     and the enthalpy at which it enters its utility (relative to its H_lo).
+
+    A branch exchanger of a split stream (flow fraction f) runs f of the
+    stream's flow in the states of the full stream: its inlet is the full
+    stream's state at the branch's (parent-equivalent) inlet enthalpy,
+    scaled by f, and its enthalpy limit f times the full stream's at the
+    planned outlet (`_enthalpy_limit` judges the full-flow state). The
+    first exchanger of every branch of a split at a stream's inlet takes
+    the real inlet (`_split_nodes`).
     """
     ends, last, pair_index = _walk(plan, duties, knots, is_hot)
     first = [next((n for n in plan.stages[j] if n in duties), None)
              for j in range(len(is_hot))]
+    first_nodes = _split_nodes(plan, duties, ends)[0] if plan.splits else {}
     units = {}
     dT = T_min_app - _APPROACH_TOL
     for n in sorted(duties):
@@ -1091,26 +1223,31 @@ def _realize(plan, duties, curves, knots, streams_inlet, is_hot, T_min_app):
         if e.side == 'above':
             ID = f'HX_{c}_{h}_hs{suffix}'
             ports = (c, h)
+            fractions = (e.cold_frac, e.hot_frac)
         else:
             ID = f'HX_{h}_{c}_cs{suffix}'
             ports = (h, c)
+            fractions = (e.hot_frac, e.cold_frac)
         ins, outs, H_lims = [], [], []
-        for j in ports:
+        for j, f in zip(ports, fractions):
             curve = curves[j]
             H_in, H_out = ends[n, j]
-            if first[j] == n:
+            if first[j] == n or n in first_nodes.get(j, ()):
                 s = _copy(streams_inlet[j]) # the real inlet state
                 _first_inlet(s, not curve.monotone, curve.T_out, is_hot[j])
             else:
                 s = curve.state_at_H(curve.H_lo + H_in)
             s.ID = f's_{j}__{ID}'
-            ins.append(s)
-            outs.append(s.copy(f'{ID}__s_{j}'))
             # a planned outlet whose equilibrium state is not past the inlet
             # (inside a non-equilibrium end jump, or a point load's): leave
             # it to the other stream's limit
-            H_lims.append(_enthalpy_limit(curve, s, curve.H_lo + H_out,
-                                          is_hot[j]))
+            H_lim = _enthalpy_limit(curve, s, curve.H_lo + H_out, is_hot[j])
+            if f != 1.: # a branch: f of the flow, in the same states
+                s.scale(f)
+                if H_lim is not None: H_lim *= f
+            ins.append(s)
+            outs.append(s.copy(f'{ID}__s_{j}'))
+            H_lims.append(H_lim)
         hx = bst.HXprocess(ID=ID, ins=ins, outs=outs, H_lim0=H_lims[0],
                            H_lim1=H_lims[1], dT=dT, thermo=ins[0].thermo)
         units[n] = hx

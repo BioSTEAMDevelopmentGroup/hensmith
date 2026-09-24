@@ -1345,5 +1345,348 @@ def test_pinch_diagram_legend():
     finally:
         plt.close(fig)
 
+# ---------------------------------------------------------------------------
+# Stream splitting: exact checks and exchangers on branches (flow fractions)
+# ---------------------------------------------------------------------------
+
+from hensmith._curves import StreamCurve, GLIDE, _copy
+from hensmith._planner import Exchanger, Plan, plan_network
+from hensmith import _splitting
+from test_hxn_planner import records_case
+from hxn_mer_cases import SPLIT as MER_SPLIT
+import test_hxn_mer
+
+#: Branch fractions of the hot and the cold stream in the branch tests (not
+#: dyadic, so that a lost or a doubled fraction shows).
+FH, FC = 0.37, 0.61
+
+def branch_streams(kind):
+    """Inlets and quenched outlets ``[h_in, h_out, c_in, c_out]`` of a hot
+    and a cold stream: constant CP (400 -> 300 K, 2 kW/K against 330 ->
+    390 K, 3 kW/K), or hot water (rtB07's H1, 400 -> 300 K at 5 bar)
+    against rtB07's water/methanol boiler C3 (330 -> 372 K at 1 atm),
+    whose curve has a glide."""
+    if kind == 'constant_cp':
+        units = cp_units('branch_cp', [('H1', 400., 300., 2.),
+                                       ('C1', 330., 390., 3.)])
+    else:
+        bst.settings.set_thermo(['Water', 'Methanol'], cache=True)
+        bst.main_flowsheet.set_flowsheet('branch_glide')
+        units = []
+        for ID, T, P, T_out, rigorous, flow in (
+                ('H1', 400., 5e5, 300., False, dict(Water=30.)),
+                ('C3', 330., 101325., 372., True,
+                 dict(Water=12., Methanol=3.))):
+            s = bst.Stream(ID + '_in', T=T, P=P, phase='l', units='kmol/hr',
+                           **flow)
+            hx = bst.HXutility(ID, ins=s, T=T_out, rigorous=rigorous)
+            hx.simulate()
+            units.append(hx)
+    streams = []
+    for hx in units:
+        s_in, s_out = _copy(hx.ins[0]), _copy(hx.outs[0])
+        s_out.vle(H=s_out.H, P=s_out.P)
+        streams += [s_in, s_out]
+    return streams
+
+def branch_curves(kind, fh=1., fc=1.):
+    """Curves and knots (the curves' breakpoints) of `branch_streams`, the
+    hot stream at `fh` of its flow and the cold one at `fc` of its flow."""
+    h_in, h_out, c_in, c_out = branch_streams(kind)
+    for s in (h_in, h_out): s.scale(fh)
+    for s in (c_in, c_out): s.scale(fc)
+    curves = [StreamCurve(h_in, h_out, True), StreamCurve(c_in, c_out, False)]
+    return curves, [(c.T, c.H - c.H_lo) for c in curves]
+
+def branch_exchanger(curves):
+    """A branch exchanger on the full-flow `curves` (parent-equivalent
+    enthalpies): the hot branch (FH) enters at the hot stream's inlet, the
+    cold branch (FC) at 10 % of the cold stream's duty, and the duty is 90 %
+    of what the tighter branch has left."""
+    ch, cc = curves
+    H_hot_in = ch.H_hi - ch.H_lo
+    H_cold_in = 0.1 * (cc.H_hi - cc.H_lo)
+    Q = 0.9 * min(FH * H_hot_in, FC * (cc.H_hi - cc.H_lo - H_cold_in))
+    return H_hot_in, H_cold_in, Q
+
+@pytest.mark.parametrize('kind', ['constant_cp', 'glide'])
+def test_branch_exchanger_approach_matches_scaled_curve(kind):
+    # a branch at fraction f runs its parent's curve with f times the
+    # enthalpy: the check on the parent curves with the fractions equals a
+    # direct computation on the curves of the scaled streams, and its
+    # violating states are parent-equivalent (what `_refine_knots` takes)
+    curves, knots = branch_curves(kind)
+    scaled, scaled_knots = branch_curves(kind, FH, FC)
+    ch, cc = curves
+    chf, ccf = scaled
+    if kind == 'glide': assert GLIDE in cc.kinds
+    H_hot_in, H_cold_in, Q = branch_exchanger(curves)
+    approach = hxn_synthesis._exchanger_approach
+    inf = float('inf')
+    worst, points = approach(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
+                             inf, FH, FC)
+    worst_f, _ = approach(scaled, scaled_knots, 0, 1, chf.H_hi - chf.H_lo,
+                          FC * H_cold_in, Q, inf)
+    assert abs(worst - worst_f) <= 1e-9
+    assert len(points) > 2
+    assert worst == min(T_hot - T_cold for T_hot, _, T_cold, _ in points)
+    H_cold_out = H_cold_in + Q / FC
+    for T_hot, H_hot, T_cold, H_cold in points:
+        q = (H_hot_in - H_hot) * FH  # the duty done, the same on both
+        assert -1e-12 * Q <= q <= Q * (1. + 1e-12)
+        assert abs((H_cold_out - H_cold) * FC - q) <= 1e-12 * Q
+        assert abs(chf.T_exact(chf.H_lo + FH * H_hot, 'low') - T_hot) <= 1e-9
+        assert abs(ccf.T_exact(ccf.H_lo + FC * H_cold, 'high')
+                   - T_cold) <= 1e-9
+    # every knot inside the branches is a position of the check (between
+    # positions both knot curves are linear)
+    H_hot_out = H_hot_in - Q / FH
+    for (_, H), at, lo, hi in (
+            (knots[0], [p[1] for p in points], H_hot_out, H_hot_in),
+            (knots[1], [p[3] for p in points], H_cold_in, H_cold_out)):
+        for x in H[(H > lo) & (H < hi)]:
+            assert np.abs(np.array(at) - x).min() <= 1e-12 * H[-1]
+    # a violation of 0.5 K is found where it is (the knots screen the rest)
+    assert approach(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
+                    worst + 0.5, FH, FC)[0] == worst
+    # `_exact_approach` checks a plan's exchangers on their fractions
+    e = Exchanger()
+    e.hot, e.cold, e.hot_frac, e.cold_frac = 0, 1, FH, FC
+    plan = Plan()
+    plan.exchangers = [e]
+    ends = {(0, 0): (H_hot_in, H_hot_out), (0, 1): (H_cold_in, H_cold_out)}
+    assert hxn_synthesis._exact_approach(plan, {0: Q}, ends, curves, knots,
+                                         inf) == (worst, {
+        0: [(T_hot, H_hot) for T_hot, H_hot, _, _ in points],
+        1: [(T_cold, H_cold) for _, _, T_cold, H_cold in points]}, [0])
+    # fractions of 1 are the unsplit check, bit for bit
+    for T_min_app in (inf, worst + 0.5):
+        assert (approach(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
+                         T_min_app, 1., 1.)
+                == approach(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
+                            T_min_app))
+
+@pytest.mark.parametrize('kind', ['constant_cp', 'glide'])
+def test_shrink_with_fractions_is_monotone(kind):
+    # with both branch inlets fixed, a smaller duty moves the cold branch's
+    # outlet toward its inlet: the exact approach never falls as the duty
+    # falls, the feasible duties are [0, Q'] and `_shrink` finds Q' (as on
+    # the curves of the scaled streams)
+    curves, knots = branch_curves(kind)
+    scaled, scaled_knots = branch_curves(kind, FH, FC)
+    H_hot_in, H_cold_in, Q = branch_exchanger(curves)
+    approach, shrink = hxn_synthesis._exchanger_approach, hxn_synthesis._shrink
+    inf = float('inf')
+    xs = np.linspace(0.05, 1., 20) * Q
+    dTs = [approach(curves, knots, 0, 1, H_hot_in, H_cold_in, x, inf,
+                    FH, FC)[0] for x in xs]
+    assert all(b <= a + 1e-9 for a, b in zip(dTs, dTs[1:]))
+    T_min_app = 0.5 * (dTs[0] + dTs[-1])  # Q itself violates
+    Q_ok = shrink(curves, knots, 0, 1, H_hot_in, H_cold_in, Q, T_min_app,
+                  FH, FC)
+    assert 0. < Q_ok < Q
+    for x in xs:
+        violates = bool(approach(curves, knots, 0, 1, H_hot_in, H_cold_in,
+                                 x, T_min_app, FH, FC)[1])
+        assert violates == (x > Q_ok), x
+    limit = T_min_app - hxn_synthesis._APPROACH_TOL
+    at = approach(curves, knots, 0, 1, H_hot_in, H_cold_in, Q_ok, inf,
+                  FH, FC)[0]
+    assert limit <= at <= limit + 1e-6
+    chf = scaled[0]
+    Q_f = shrink(scaled, scaled_knots, 0, 1, chf.H_hi - chf.H_lo,
+                 FC * H_cold_in, Q, T_min_app)
+    assert abs(Q_ok - Q_f) <= 1e-8 * Q
+    if kind == 'constant_cp':
+        # closed form: the approach is smallest at the cold end, where the
+        # hot branch leaves 400 K - Q / (FH 2 kW/K) against the cold
+        # branch's inlet, 330 K + 10 % of 60 K
+        assert_allclose(Q_ok, FH * 2. * kW * (400. - 336. - limit),
+                        rtol=1e-8)
+    assert (shrink(curves, knots, 0, 1, H_hot_in, H_cold_in, Q, T_min_app,
+                   1., 1.)
+            == shrink(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
+                      T_min_app))
+
+def records_plan():
+    """The hand-built split plan of `test_hxn_planner.records_case` (H1,
+    400 -> 200 with CP 1, splits into halves that serve C1 and C2, re-joins
+    at 100 and serves C2 and C1 on its trunk), with its knot enthalpies."""
+    sides, plans, curves = records_case()
+    (recs, _, dropped, stages, _, _, splits,
+     paths) = _splitting._split_records(sides, plans, curves, 3, 0.,
+                                         sides['above'].tolQ)
+    assert not dropped
+    plan = Plan()
+    plan.exchangers, plan.stages, plan.paths, plan.splits = (
+        recs, stages, paths, splits)
+    knots = [(np.array([200., 400.]), np.array([0., 200.])),
+             (np.array([20., 170.]), np.array([0., 150.])),
+             (np.array([20., 170.]), np.array([0., 150.]))]
+    return plan, knots, [True, False, False]
+
+def test_walk_split_paths():
+    plan, knots, is_hot = records_plan()
+    walk, nodes = hxn_synthesis._walk, hxn_synthesis._split_nodes
+    b0, b1, t1, t0 = range(4)
+    duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
+    ends, last, pair_index = walk(plan, duties, knots, is_hot)
+    # the planner's own walk: parent-equivalent enthalpies on the branches
+    for n, e in enumerate(plan.exchangers):
+        assert ends[n, e.hot] == (e.H_hot_in, e.H_hot_out)
+        assert ends[n, e.cold] == (e.H_cold_in, e.H_cold_out)
+    assert ends[b0, 0] == (200., 80.) and ends[b1, 0] == (200., 120.)
+    assert ends[t1, 0] == (100., 40.) and ends[t0, 0] == (40., 0.)
+    assert last == [0., 100., 100.]
+    assert pair_index == {b0: 1, t0: 2, b1: 1, t1: 2}
+    assert nodes(plan, duties, ends) == ({0: (b0, b1), 1: (), 2: ()},
+                                         [(200., [80., 120.], 100.)])
+    # a dropped branch exchanger: its branch bypasses, the stream re-joins
+    # at H_split - 60 and C2 starts on its trunk exchanger
+    del duties[b1]
+    ends, last, pair_index = walk(plan, duties, knots, is_hot)
+    assert ends == {(b0, 0): (200., 80.), (b0, 1): (0., 60.),
+                    (t1, 0): (140., 80.), (t1, 2): (0., 60.),
+                    (t0, 0): (80., 40.), (t0, 1): (60., 100.)}
+    assert last == [40., 100., 60.]
+    assert pair_index == {b0: 1, t0: 2, t1: 1}
+    assert nodes(plan, duties, ends) == ({0: (b0,), 1: (), 2: ()},
+                                         [(200., [80., 200.], 140.)])
+    # a shrunk branch exchanger: its branch ends earlier (by Q / f), the
+    # mix and the later stages move toward the inlet by the duty
+    duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
+    duties[b0] = 30.
+    ends, last, _ = walk(plan, duties, knots, is_hot)
+    assert ends[b0, 0] == (200., 140.) and ends[b0, 1] == (0., 30.)
+    assert ends[t1, 0] == (130., 70.) and ends[t0, 0] == (70., 30.)
+    assert last == [30., 70., 100.]
+    assert nodes(plan, duties, ends)[1] == [(200., [140., 120.], 130.)]
+    # a split whose branches were all dropped is passed as a trunk (it is
+    # not realized): no first nodes, no split ends
+    duties = {t1: 60., t0: 40.}
+    ends, last, _ = walk(plan, duties, knots, is_hot)
+    assert ends[t1, 0] == (200., 140.) and ends[t0, 0] == (140., 100.)
+    assert last == [100., 40., 60.]
+    assert nodes(plan, duties, ends) == ({0: (), 1: (), 2: ()}, [None])
+    # without splits, the walk is the unsplit one on `stages`
+    plan.splits, plan.paths = [], None
+    assert walk(plan, duties, knots, is_hot)[:2] == (ends, last)
+
+def planned_split(name):
+    """Split plan of corpus case `name` on the synthesizer's round-0 grid
+    knots, with what the synthesis hands to its exact checks."""
+    case = next(c for c in MER_SPLIT if c['name'] == name)
+    units, dT = test_hxn_mer._build(case)
+    hus = sorted([hx.heat_utilities[0] for hx in units],
+                 key=lambda hu: hu.duty)
+    r = hxn_synthesis._pinch_analysis(hus, dT)
+    hxs, hot_indices, streams_inlet, curves, grid = (r[5], r[6], r[9],
+                                                     r[13], r[14])
+    is_hot = [i in hot_indices for i in range(len(hxs))]
+    knots = hxn_synthesis._grid_knots(curves, grid)
+    plan = plan_network(knots, is_hot, dT, stream_splitting=True)
+    assert plan.status == 'mer' and plan.splits
+    return plan, curves, knots, is_hot, streams_inlet, dT
+
+@pytest.mark.parametrize('name', ['smith2005_ex18_2_split', 'rtB05_above_2h1c'])
+def test_realize_split_branch_ports(name):
+    # every branch exchanger is an HXprocess on f of its stream's flow: its
+    # inlet is the parent's state at the branch's inlet enthalpy (the real
+    # inlet where the stream splits at its inlet) scaled by f, and its
+    # enthalpy limit is f times the parent's at the planned outlet
+    plan, curves, knots, is_hot, streams_inlet, dT = planned_split(name)
+    span = [c.H_hi - c.H_lo for c in curves]
+    duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
+    ends, last, _ = hxn_synthesis._walk(plan, duties, knots, is_hot)
+    for n, e in enumerate(plan.exchangers):
+        assert_allclose(ends[n, e.hot], (e.H_hot_in, e.H_hot_out),
+                        rtol=0, atol=1e-12 * span[e.hot])
+        assert_allclose(ends[n, e.cold], (e.H_cold_in, e.H_cold_out),
+                        rtol=0, atol=1e-12 * span[e.cold])
+    assert_allclose(last, [u if hot else D - u for u, D, hot
+                           in zip(plan.utility, span, is_hot)],
+                    rtol=0, atol=1e-12 * sum(span))
+    first_nodes, split_ends = hxn_synthesis._split_nodes(plan, duties, ends)
+    assert len(split_ends) == len(plan.splits)
+    for s, (H_split, H_ends, H_mix) in zip(plan.splits, split_ends):
+        assert_allclose([H_split, H_mix], [s.H_split, s.H_mix], rtol=0,
+                        atol=1e-12 * span[s.stream])
+        assert len(H_ends) == len(s.branches)
+    # smith2005_ex18_2 splits a cold stream at its inlet; rtB05 splits its
+    # cold stream after its trunk exchanger below the pinch
+    assert any(first_nodes.values()) == name.startswith('smith')
+    min_approach, violations, bad = hxn_synthesis._exact_approach(
+        plan, duties, ends, curves, knots, dT)
+    if name.startswith('smith'):   # constant CP: the knots are exact
+        assert not bad and min_approach >= dT - 1e-9
+    bst.main_flowsheet.set_flowsheet('realize_' + name)
+    units, first, _ = hxn_synthesis._realize(
+        plan, duties, curves, knots, streams_inlet, is_hot, dT)
+    try:
+        n_branch = 0
+        for n, hx in units.items():
+            e = plan.exchangers[n]
+            above = e.side == 'above'
+            ports = (e.cold, e.hot) if above else (e.hot, e.cold)
+            fracs = ((e.cold_frac, e.hot_frac) if above
+                     else (e.hot_frac, e.cold_frac))
+            duty = span[e.hot] + span[e.cold]
+            assert abs(hx.Q - duties[n]) <= 1e-9 * duty, hx.ID
+            for k, (j, f) in enumerate(zip(ports, fracs)):
+                n_branch += f != 1.
+                curve = curves[j]
+                H_in, H_out = ends[n, j]
+                s_in, s_out = hx.ins[k], hx.outs[k]
+                assert_allclose(s_in.F_mol, f * streams_inlet[j].F_mol,
+                                rtol=1e-14)
+                assert abs(s_in.H - f * (curve.H_lo + H_in)) <= 1e-9 * duty
+                assert abs(s_out.H - f * (curve.H_lo + H_out)) <= 1e-9 * duty
+                H_lim = getattr(hx, f'H_lim{k}')
+                assert H_lim is not None
+                assert_allclose(H_lim, f * (curve.H_lo + H_out), rtol=1e-14)
+                if n == first[j] or n in first_nodes[j]:
+                    assert s_in.T == streams_inlet[j].T   # the real inlet
+            if name.startswith('smith'):
+                assert internal_approach(hx) >= dT - APPROACH_TOL, hx.ID
+        assert n_branch
+    finally:
+        hxn_synthesis._discard(units.values())
+
+def test_repair_shrinks_branches_with_fractions(monkeypatch):
+    # 5 K more than planned: `_repair` shrinks every violating exchanger,
+    # branches with their fractions, in one pass, to duties that keep the
+    # new approach on the exact states (and on the realized exchangers)
+    plan, curves, knots, is_hot, streams_inlet, dT = planned_split(
+        'smith2005_ex18_2_split')
+    T_min_app = dT + 5.
+    duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
+    ends = hxn_synthesis._walk(plan, duties, knots, is_hot)[0]
+    bad = hxn_synthesis._exact_approach(plan, duties, ends, curves, knots,
+                                        T_min_app)[2]
+    fractions = [(e.hot_frac, e.cold_frac) for e in plan.exchangers]
+    assert any(fractions[n] != (1., 1.) for n in bad)
+    shrink, calls = hxn_synthesis._shrink, []
+    def spy(*args):
+        calls.append(args[-2:])
+        return shrink(*args)
+    monkeypatch.setattr(hxn_synthesis, '_shrink', spy)
+    new, changes = hxn_synthesis._repair(plan, duties, knots, is_hot, curves,
+                                         T_min_app)
+    assert [n for n, _, _ in changes] == bad   # one pass
+    assert calls == [fractions[n] for n in bad]
+    assert all(0. <= Q_after < Q_before for _, Q_before, Q_after in changes)
+    ends = hxn_synthesis._walk(plan, new, knots, is_hot)[0]
+    worst, _, bad = hxn_synthesis._exact_approach(plan, new, ends, curves,
+                                                  knots, T_min_app)
+    assert not bad and worst >= T_min_app - hxn_synthesis._APPROACH_TOL
+    bst.main_flowsheet.set_flowsheet('repair_split')
+    units = hxn_synthesis._realize(plan, new, curves, knots, streams_inlet,
+                                   is_hot, T_min_app)[0]
+    try:
+        for hx in units.values():
+            assert internal_approach(hx) >= T_min_app - APPROACH_TOL, hx.ID
+    finally:
+        hxn_synthesis._discard(units.values())
+
 if __name__ == '__main__':
     pytest.main([__file__, '-q', '-p', 'no:cacheprovider'])
