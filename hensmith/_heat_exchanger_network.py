@@ -61,6 +61,48 @@ def _load_utility_costs(unit):
     owner = unit.owner
     if owner is not unit: owner._load_operation_costs()
 
+def _move_flows(unit):
+    """
+    Give the outlets of `unit`, a unit of a cached network, the flows that
+    its inlets carry now, so that the network's convergence starts from
+    the new flows (`HeatExchangerNetwork._cost` moves them in path order).
+    No enthalpy flash runs here: only the convergence, which the facility
+    guards, runs the rigorous units.
+
+    - A splitter splits its feed at its fixed fractions (`Splitter._run`
+      copies the feed's intensive state and flashes nothing).
+    - A mixer's outlet takes the summed flows of its inlets (running the
+      rigorous mixer would flash).
+    - Any other unit's outlet ``k`` takes the flows of its inlet ``k``.
+
+    A multiphase outlet keeps its temperature and pressure: its flows are
+    scaled to the new total and, if that does not reproduce the inlet
+    flows, replaced by them and split between the phases at its
+    temperature and pressure.
+    """
+    if isinstance(unit, bst.Splitter):
+        unit._run()
+    elif isinstance(unit, bst.Mixer):
+        s_out, = unit.outs
+        ins = unit.ins
+        mol = sum([s.mol for s in ins])
+        if isinstance(s_out, bst.MultiStream):
+            s_out.F_mol = sum([s.F_mol for s in ins])
+            if not s_out.mol.sparse_equal(mol):
+                s_out.imol.mix_from([s.imol for s in ins])
+                s_out.vle(T=s_out.T, P=s_out.P)
+        else:
+            s_out.mol[:] = mol
+    else:
+        for s_in, s_out in zip(unit.ins, unit.outs):
+            if isinstance(s_out, bst.MultiStream):
+                s_out.F_mol = s_in.F_mol
+                if not s_out.mol.sparse_equal(s_in.mol):
+                    s_out.copy_flow(s_in)
+                    s_out.vle(T=s_out.T, P=s_out.P)
+            else:
+                s_out.mol[:] = s_in.mol
+
 def _network_path(units, stream_life_cycles):
     """
     Return the simulation path of a synthesized network and its recycle
@@ -167,12 +209,14 @@ class HeatExchangerNetwork(bst.Facility):
     planned state, so the loops are at their fixed point after one pass).
 
     With `cache_network`, a network is reused while the set of heat
-    exchangers is the same: each process exchanger keeps, as its enthalpy
-    limit, the share of the stream's duty it had at synthesis (on the
-    stream that the plan serves completely on that side of the pinch; its
-    partner transfers that share, but never past its own outlet, and takes
-    the rest to its utility), and the utility exchangers
-    bring every stream to its new outlet. If the cached network does not
+    exchangers and `stream_splitting` are the same: each process exchanger
+    keeps, as its enthalpy limit, the share of the stream's duty it had at
+    synthesis (on the stream that the plan serves completely on that side
+    of the pinch; its partner transfers that share, but never past its own
+    outlet, and takes the rest to its utility), and the utility exchangers
+    bring every stream to its new outlet. The splitters keep their
+    fractions, so a branch exchanger's limit is its branch's fraction of
+    the whole stream's. If the cached network does not
     reproduce the outlets, or its energy balance is off, the network is
     synthesized again.
 
@@ -362,8 +406,12 @@ class HeatExchangerNetwork(bst.Facility):
             self._restore_unit_heat_utilities()
         hx_utils = self._get_original_heat_utilties()
         use_cached_network = False
+        # A network synthesized with other options (stream splitting on or
+        # off) is never reused.
         if (self.cache_network and hasattr(self, 'original_heat_utils')
-                and hasattr(self, '_stage_fractions')):
+                and hasattr(self, '_stage_fractions')
+                and getattr(self, '_synthesis_options', (False,))
+                    == (self.stream_splitting,)):
             # Units are a stable key to compare whether system has changed configuration.
             hu_by_unit = {hu.unit: hu for hu in hx_utils}
             use_cached_network = (
@@ -380,13 +428,16 @@ class HeatExchangerNetwork(bst.Facility):
                 new_HXs = self.new_HXs
                 new_HX_utils = self.new_HX_utils
                 stage_fractions = self._stage_fractions
+                # (none in a network cached before stream splitting existed)
+                stage_scales = getattr(self, '_stage_scales', {})
                 for i, life_cycle in enumerate(stream_life_cycles):
                     hx = hxs[i]
                     s_util_in = hx.ins[0]
-                    stage = life_cycle.life_cycle[0]
-                    s_lc = stage.unit.ins[stage.index]
+                    # at its entry port, as in a fresh synthesis
+                    entry = life_cycle.entry
+                    s_lc = entry.unit.ins[entry.index]
                     s_lc.copy_like(s_util_in)
-                    self._enter_network(i, stage, s_lc)
+                    self._enter_network(i, entry, s_lc)
                     H_in = s_util_in.H
                     H_out = hx.outs[0].H
                     for lc in life_cycle.life_cycle:
@@ -405,24 +456,25 @@ class HeatExchangerNetwork(bst.Facility):
                         # grown must pull it past its outlet, so that its
                         # utility runs backwards). A port without a limit
                         # in the synthesis (see `synthesize_network`) gets
-                        # none.
+                        # none. A branch stage (fraction f of the flow) takes
+                        # f times the whole stream's limit at its share (the
+                        # partner: f times the stream's outlet), since the
+                        # splits keep their fractions.
                         index = lc.index
-                        fraction = stage_fractions.get((unit.ID, index))
+                        key = unit.ID, index
+                        fraction = stage_fractions.get(key)
                         if (index == 0 and fraction is not None
                                 and (unit.ID, 1) in stage_fractions):
                             fraction = 1.
-                        setattr(unit, f'H_lim{index}', None if fraction is None
-                                else H_in + fraction * (H_out - H_in))
-                sys = self.HXN_sys
-                for unit in sys.units:
-                    for s_in, s_out in zip(unit.ins, unit.outs):
-                        if isinstance(s_out, bst.MultiStream):
-                            s_out.F_mol = s_in.F_mol
-                            if not s_out.mol.sparse_equal(s_in.mol):
-                                s_out.copy_flow(s_in)
-                                s_out.vle(T=s_out.T, P=s_out.P)
+                        if fraction is None:
+                            H_lim = None
                         else:
-                            s_out.mol[:] = s_in.mol
+                            H_lim = H_in + fraction * (H_out - H_in)
+                            f = stage_scales.get(key, 1.)
+                            if f != 1.: H_lim *= f
+                        setattr(unit, f'H_lim{index}', H_lim)
+                sys = self.HXN_sys
+                for unit in sys.units: _move_flows(unit)
             else:
                 # Signed-duty order is the default matching priority of the
                 # synthesis passes: smallest heating duty first among the cold
