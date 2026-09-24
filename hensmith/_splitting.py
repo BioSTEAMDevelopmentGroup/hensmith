@@ -186,18 +186,22 @@ key, smaller is better: exchangers below ``Qmin`` or with a fraction below
 of the same stream, and curved streams with more than `_SPLIT_MIX_CAP`
 mixers; exchangers parallel at the minimum approach on sides with a curved
 stream; units + extra branches + split stages; the most mixers on one
-stream; the candidate order. Its signature holds no duty or position, so it
-identifies the same network across knot refinements and generators.
+stream; the candidate order. Its signature holds no duty or position, and
+`_same_network` compares signatures with the split fractions within
+`_SPLIT_SAME_FRACTION` (fractions are CP ratios on the knots, which a refine
+round moves by ~1e-6), so it identifies the same network across knot
+refinements and generators.
 
 Selection and records
 ---------------------
 `_split_side` generates the candidates of a side from the pre-leaked root.
-The previous refine round's pick is tried first and kept if its signature
-is not excluded; otherwise the smallest key wins among the candidates not
-excluded (a side's last candidate is never excluded). Each must's gap is
-its pre-leak plus its leak, so the side's penalty is truthful. A side with
-no candidate falls back to the planner's best effort, which keeps the
-attempt's info (candidate None, the reasons and the errors).
+The previous refine round's pick is tried first and kept if it plans the
+same network (`_same_network`) and that network is not excluded;
+otherwise the smallest key wins among the candidates not excluded (a
+side's last candidate is never excluded). Each must's gap is its pre-leak
+plus its leak, so the side's penalty is truthful. A side with no candidate
+falls back to the planner's best effort, which keeps the attempt's info
+(candidate None, the reasons and the errors).
 `_split_records` turns the side plans into the plan's records: every
 split stage becomes a `Split`, branch enthalpies are parent-equivalent (a
 branch exchanger moves its branch by ``Q/f``), a mix is written with the
@@ -224,6 +228,9 @@ _SPLIT_MIN_FRACTION = 1e-3   # smallest branch fraction of a coarsened block
 _SPLIT_COARSEN = True        # False: elementary vertical blocks only
 _SPLIT_MIX_CAP = 2           # mixers per curved stream and side (the key)
 _ISO_TOL = 10.               # isothermal remix, x tolQ
+_SPLIT_SAME_FRACTION = 1e-3  # one network: fractions this close (the
+                             # refine drift is ~1e-6; distinct networks
+                             # differ by >= 1.6e-2 on the corpus)
 _CORE_ORDER = ('V', 'LV', 'VT', 'LVT')   # candidate order of the core
 _CORE_STRATEGIES = _CORE_ORDER   # the core strategies `_drive` runs
 _SPLIT_BISECT = 30           # pinch block: bisection steps on lambda
@@ -1581,7 +1588,9 @@ def _sig(v):
 
 
 def _signature(side, merged, stages):
-    """Knot-independent identity of a split network (see `_Candidate`)."""
+    """Identity of a split network (see `_Candidate`): its structure, which
+    no knot refinement changes, and its split fractions to 9 significant
+    digits, which a refinement moves (compare with `_same_network`)."""
     musts, flexes = side.musts, side.flexes
     by_stream = defaultdict(list)
     for (role, s, sid), br in stages.items():
@@ -1619,6 +1628,30 @@ def _signature(side, merged, stages):
               path('f', c.j, c.kf)) for c in merged]
     cells.sort(key=lambda r: (r[0], r[1], r[2] or (), r[3] or ()))
     return tuple(cells), tuple(sorted(fracs))
+
+
+def _same_network(a, b):
+    """
+    True if signatures `a` and `b` (`_signature`) are one network: the same
+    exchangers on the same branches, and every split fraction within
+    `_SPLIT_SAME_FRACTION`.
+
+    A split's fractions are CP ratios on the knots, so a refine round moves
+    them (by ~1e-6 on real thermo) while the network stays the same; an
+    exact comparison would make every refined network new. Distinct
+    networks of one structure differ by 1.6e-2 to 0.45 in some fraction on
+    the corpus, and a difference below `_SPLIT_MIN_FRACTION` (the smallest
+    branch planned) is not a branch of its own.
+    """
+    if a is None or b is None:
+        return a is b
+    if a[0] != b[0] or len(a[1]) != len(b[1]):
+        return False
+    for (*key_a, fa), (*key_b, fb) in zip(a[1], b[1]):
+        if key_a != key_b or len(fa) != len(fb) or any(
+                abs(x - y) > _SPLIT_SAME_FRACTION for x, y in zip(fa, fb)):
+            return False
+    return True
 
 
 class _Candidate:
@@ -1672,8 +1705,9 @@ class _Candidate:
         The sorted exchangers ``(must stream, flex stream, must branch,
         flex branch)`` (a branch is ``(split ordinal on the stream, branch
         ordinal)`` or None), and each split's fractions to 9 significant
-        digits. It holds no duty or position, so it identifies the same
-        network across knot refinements and generators.
+        digits. It holds no duty or position; with the fractions compared
+        within `_SPLIT_SAME_FRACTION` (`_same_network`), it identifies the
+        same network across knot refinements and generators.
     excluded : bool
         Set by the caller (exclusion by signature).
 
@@ -2521,9 +2555,11 @@ def _stage_s(side, a0, proof, cap1, forbid, work_scale, split, errors,
 # %% Portfolio and selection
 
 def _excluded(split, side_name, cand):
-    """True if the network signature of `cand` is excluded on its side
-    (exclusion is by network, never by generator name)."""
-    return cand.signature in split['exclude'].get(side_name, ())
+    """True if the network of `cand` is excluded on its side: one of the
+    side's excluded signatures is the same network (`_same_network`).
+    Exclusion is by network, never by generator name."""
+    return any(_same_network(cand.signature, signature)
+               for signature in split['exclude'].get(side_name, ()))
 
 
 def _side_plan(side, best, reasons, a0, delta, errors, work, proof):
@@ -2587,8 +2623,9 @@ def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     `_SPLIT_RULES`) if the root proof is a pinch rule ('outward' or
     'inward'), then the core (`_CORE_STRATEGIES`). The preferred candidate
     (the previous refine round's pick) is generated first and taken as is
-    while it plans the same network (its signature is the preferred one),
-    unless that signature is excluded. Otherwise every generator runs (the
+    while it plans the same network (`_same_network` with the preferred
+    signature: the knots of a refine round move the fractions), unless that
+    network is excluded. Otherwise every generator runs (the
     preferred one is not run again) and the smallest `_Candidate.key` wins
     among the candidates not excluded or, if all are excluded, among all
     of them: a side's last candidate is never excluded. With
@@ -2645,7 +2682,8 @@ def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     elif core and prefer in _CORE_STRATEGIES:
         first = [generate(prefer)]
     for c in first:
-        if c is not None and not c.excluded and c.signature == signature:
+        if (c is not None and not c.excluded
+                and _same_network(c.signature, signature)):
             return plan(c)
     # the portfolio: Stage S, then the core
     if s_ok:

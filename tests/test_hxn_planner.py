@@ -2348,10 +2348,52 @@ def test_split_exclusion_by_signature(monkeypatch):
     assert other['candidate'] == 'V'
 
 
+def drifted(signature, d):
+    """`signature` with every split fraction moved by `d` (alternating in
+    sign, as a refine round moves the CP ratios of the knots)."""
+    cells, fracs = signature
+    return cells, tuple((role, stream, k, tuple(
+        f + (d if b % 2 else -d) for b, f in enumerate(fs)))
+        for role, stream, k, fs in fracs)
+
+
+def test_split_identity_tolerates_refined_fractions():
+    # a split's fractions are CP ratios on the knots, so a refine round
+    # moves them (by ~1e-6 on real thermo) while the network stays the
+    # same: the preferred and the excluded networks are matched by
+    # `_same_network` (the structure exactly, the fractions within
+    # `_SPLIT_SAME_FRACTION`), not by an exact signature
+    dT, rows = SPLIT['smith2005_ex16_5_five_stream']
+    streams = streams_from(rows)
+
+    def plan(**kw):
+        net = P._plan_numeric(streams, dT, **SPLIT_ON, **kw)
+        (name, sp), = split_infos(net['plan']).items()
+        return name, sp
+    name, sp = plan()
+    sig = sp['signature']
+    same, tol = SP._same_network, SP._SPLIT_SAME_FRACTION
+    assert sig[1] and 1e-6 < tol <= 1e-3
+    assert same(sig, sig) and same(sig, drifted(sig, 1e-6))
+    assert same(sig, drifted(sig, 0.5 * tol))
+    assert not same(sig, drifted(sig, 2. * tol))
+    assert not same(sig, (sig[0][1:], sig[1]))
+    assert not same(sig, (sig[0], ()))
+    # the preferred network, drifted, is still taken first and alone
+    _, pr = plan(_split_prefer={name: (sp['candidate'],
+                                       drifted(sig, 1e-6))})
+    assert pr['candidate'] == sp['candidate']
+    assert set(pr['candidates']) == {sp['candidate']}
+    # an excluded network, drifted, is still excluded
+    _, ex = plan(_split_exclude={name: {drifted(sig, 1e-6)}})
+    assert not same(ex['signature'], sig)
+    assert ex['candidates'][sp['candidate']] == 'excluded'
+
+
 def test_split_signature_is_knot_independent():
     # the refine loop re-plans on refined knots and excludes (or prefers)
-    # by signature, so the signature holds nothing knot-dependent: extra
-    # collinear knots give the same pick with the same signature
+    # by network (`_same_network`); extra collinear knots move no fraction,
+    # so they give the same pick with the same signature
     cases = [*SPLIT.values(), *(corpus_problem(name) for name in (
         'smith2005_exr18_5_nine_stream', 'fs_22sp_ph', 'cgm_unbalanced10'))]
     n = 0

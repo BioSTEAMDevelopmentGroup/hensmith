@@ -1352,7 +1352,9 @@ def test_pinch_diagram_legend():
 from hensmith._curves import StreamCurve, GLIDE, _copy
 from hensmith._planner import Exchanger, Plan, plan_network
 from hensmith import _splitting
-from test_hxn_planner import records_case
+from hensmith import _planner
+from test_hxn_planner import (records_case, sides_from_knots,
+                              _verify_side_cells)
 from hxn_mer_cases import SPLIT as MER_SPLIT
 import test_hxn_mer
 
@@ -1459,12 +1461,9 @@ def test_branch_exchanger_approach_matches_scaled_curve(kind):
                                          inf) == (worst, {
         0: [(T_hot, H_hot) for T_hot, H_hot, _, _ in points],
         1: [(T_cold, H_cold) for _, _, T_cold, H_cold in points]}, [0])
-    # fractions of 1 are the unsplit check, bit for bit
-    for T_min_app in (inf, worst + 0.5):
-        assert (approach(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
-                         T_min_app, 1., 1.)
-                == approach(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
-                            T_min_app))
+    # (fractions of 1, the default, are the unsplit check bit for bit: the
+    # R1 oracle's full mode compares every unsplit synthesis with the one
+    # before stream splitting)
 
 @pytest.mark.parametrize('kind', ['constant_cp', 'glide'])
 def test_shrink_with_fractions_is_monotone(kind):
@@ -1477,7 +1476,9 @@ def test_shrink_with_fractions_is_monotone(kind):
     H_hot_in, H_cold_in, Q = branch_exchanger(curves)
     approach, shrink = hxn_synthesis._exchanger_approach, hxn_synthesis._shrink
     inf = float('inf')
-    xs = np.linspace(0.05, 1., 20) * Q
+    # (an exact check at T_min_app = inf evaluates every position: 0.85 s
+    # on the glide curve, 0.04 s at constant CP)
+    xs = np.linspace(0.05, 1., 20 if kind == 'constant_cp' else 8) * Q
     dTs = [approach(curves, knots, 0, 1, H_hot_in, H_cold_in, x, inf,
                     FH, FC)[0] for x in xs]
     assert all(b <= a + 1e-9 for a, b in zip(dTs, dTs[1:]))
@@ -1503,10 +1504,6 @@ def test_shrink_with_fractions_is_monotone(kind):
         # branch's inlet, 330 K + 10 % of 60 K
         assert_allclose(Q_ok, FH * 2. * kW * (400. - 336. - limit),
                         rtol=1e-8)
-    assert (shrink(curves, knots, 0, 1, H_hot_in, H_cold_in, Q, T_min_app,
-                   1., 1.)
-            == shrink(curves, knots, 0, 1, H_hot_in, H_cold_in, Q,
-                      T_min_app))
 
 def records_plan():
     """The hand-built split plan of `test_hxn_planner.records_case` (H1,
@@ -1540,7 +1537,8 @@ def test_walk_split_paths():
     assert last == [0., 100., 100.]
     assert pair_index == {b0: 1, t0: 2, b1: 1, t1: 2}
     assert nodes(plan, duties, ends) == ({0: (b0, b1), 1: (), 2: ()},
-                                         [(200., [80., 120.], 100.)])
+                                         [(200., [80., 120.], 100.)],
+                                         {0: 0})
     # a dropped branch exchanger: its branch bypasses, the stream re-joins
     # at H_split - 60 and C2 starts on its trunk exchanger
     del duties[b1]
@@ -1551,7 +1549,8 @@ def test_walk_split_paths():
     assert last == [40., 100., 60.]
     assert pair_index == {b0: 1, t0: 2, t1: 1}
     assert nodes(plan, duties, ends) == ({0: (b0,), 1: (), 2: ()},
-                                         [(200., [80., 200.], 140.)])
+                                         [(200., [80., 200.], 140.)],
+                                         {0: 0})
     # a shrunk branch exchanger: its branch ends earlier (by Q / f), the
     # mix and the later stages move toward the inlet by the duty
     duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
@@ -1567,7 +1566,8 @@ def test_walk_split_paths():
     ends, last, _ = walk(plan, duties, knots, is_hot)
     assert ends[t1, 0] == (200., 140.) and ends[t0, 0] == (140., 100.)
     assert last == [100., 40., 60.]
-    assert nodes(plan, duties, ends) == ({0: (), 1: (), 2: ()}, [None])
+    assert nodes(plan, duties, ends) == ({0: (), 1: (), 2: ()}, [None],
+                                         {})
     # without splits, the walk is the unsplit one on `stages`
     plan.splits, plan.paths = [], None
     assert walk(plan, duties, knots, is_hot)[:2] == (ends, last)
@@ -1606,7 +1606,9 @@ def test_realize_split_branch_ports(name):
     assert_allclose(last, [u if hot else D - u for u, D, hot
                            in zip(plan.utility, span, is_hot)],
                     rtol=0, atol=1e-12 * sum(span))
-    first_nodes, split_ends = hxn_synthesis._split_nodes(plan, duties, ends)
+    first_nodes, split_ends, first_splits = hxn_synthesis._split_nodes(
+        plan, duties, ends)
+    assert set(first_splits) == {j for j, ns in first_nodes.items() if ns}
     assert len(split_ends) == len(plan.splits)
     for s, (H_split, H_ends, H_mix) in zip(plan.splits, split_ends):
         assert_allclose([H_split, H_mix], [s.H_split, s.H_mix], rtol=0,
@@ -1652,6 +1654,97 @@ def test_realize_split_branch_ports(name):
     finally:
         hxn_synthesis._discard(units.values())
 
+def double_split_plan():
+    """
+    A hand-built plan whose stream splits twice on one side (the records
+    case of `test_hxn_planner`, in two splits), on the constant-CP fluid:
+    H1 (400 -> 200 C, CP 1 kW/K) serves C1 and C2 (20 -> 170 C, CP 1 kW/K
+    each; all above the pinch) from its inlet: split 1 into halves (30 kW
+    to each cold), a trunk exchanger (40 kW to C1), split 2 into halves (30
+    kW to each cold) and a trunk exchanger (40 kW to C2).
+    """
+    case = dict(name='double_split', kind='constant_cp', T_unit='C',
+                Q_unit='kW', dTmin=10.,
+                streams=[('H1', 'hot', 400., 200., 1.),
+                         ('C1', 'cold', 20., 170., 1.),
+                         ('C2', 'cold', 20., 170., 1.)])
+    units, dT = test_hxn_mer._build(case)
+    hus = sorted([hx.heat_utilities[0] for hx in units],
+                 key=lambda hu: hu.duty)
+    r = hxn_synthesis._pinch_analysis(hus, dT)
+    hot_indices, streams_inlet, curves, grid = r[6], r[9], r[13], r[14]
+    is_hot = [i in hot_indices for i in range(len(curves))]
+    assert is_hot == [False, False, True]   # C1, C2, H1
+    knots = hxn_synthesis._grid_knots(curves, grid)
+    sides = sides_from_knots(knots, is_hot, dT)
+    side = sides['above']
+    assert (side.M, side.F) == (1, 2)
+    kW = 3600.   # kJ/hr
+    B = _splitting._Cell
+    cells = [B(0, 0, 30. * kW, 140. * kW, 0., .5, 1., ('S', 0, 0)),
+             B(0, 1, 30. * kW, 140. * kW, 0., .5, 1., ('S', 0, 1)),
+             B(0, 0, 40. * kW, 100. * kW, 30. * kW),
+             B(0, 0, 30. * kW, 40. * kW, 70. * kW, .5, 1., ('S', 1, 0)),
+             B(0, 1, 30. * kW, 40. * kW, 30. * kW, .5, 1., ('S', 1, 1)),
+             B(0, 1, 40. * kW, 0., 60. * kW)]
+    _verify_side_cells(side, cells)
+    plans = {'above': _planner._SidePlan([], [0.], 'mer', 'split-X',
+                                         cells=cells, units=6)}
+    (recs, _, dropped, stages, _, _, splits, paths) = (
+        _splitting._split_records(sides, plans, _planner._stream_curves(
+            knots, is_hot, dT), 3, 0., side.tolQ))
+    assert not dropped and len(splits) == 2
+    plan = Plan()
+    plan.exchangers, plan.stages, plan.paths, plan.splits = (
+        recs, stages, paths, splits)
+    plan.info = dict(tolQ=side.tolQ)
+    return plan, curves, knots, is_hot, streams_inlet, dT
+
+def test_realize_splits_of_one_stream_on_one_side(monkeypatch):
+    # the second split of a stream on a side is numbered 2 (`_2` in its
+    # splitter's and mixer's IDs), its position counts the trunk exchanger
+    # before it, and only the first split (the stream's first node) takes
+    # the real inlet, in its splitter feed and its branches' first
+    # exchangers
+    plan, curves, knots, is_hot, streams_inlet, dT = double_split_plan()
+    duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
+    first_inlet, real = hxn_synthesis._first_inlet, []
+    def spy(s, *args):
+        real.append(s)
+        return first_inlet(s, *args)
+    monkeypatch.setattr(hxn_synthesis, '_first_inlet', spy)
+    bst.main_flowsheet.set_flowsheet('double_split')
+    units = hxn_synthesis._realize(plan, duties, curves, knots,
+                                   streams_inlet, is_hot, dT)[0]
+    splits, deviations = hxn_synthesis._realize_splits(
+        plan, duties, units, curves, knots, streams_inlet, is_hot)
+    try:
+        assert deviations == []
+        assert [(sp.stream, sp.side, sp.index, sp.position, sp.isothermal)
+                for sp in splits] == [(2, 'above', 1, 0, True),
+                                      (2, 'above', 2, 1, True)]
+        assert [[u.ID for u in sp.splitters] for sp in splits] == [
+            ['Split_2_hs'], ['Split_2_hs_2']]
+        assert [sp.mixer.ID for sp in splits] == ['Mix_2_hs', 'Mix_2_hs_2']
+        assert [sp.mixer.outs[0].ID for sp in splits] == [
+            'Mix_2_hs__s_2', 'Mix_2_hs_2__s_2']
+        def is_real(s): return any(s is r for r in real)
+        for sp, first in zip(splits, (True, False)):
+            assert is_real(sp.splitters[0].ins[0]) == first
+            for branch in sp.branches:
+                hx = branch[0]
+                assert is_real(hx.ins[stream_port(hx, 2)]) == first, hx.ID
+            # the stream re-joins at the planned state, between the splits
+            H_mix = math.fsum(s.H for s in sp.mixer.ins)
+            assert abs(sp.mixer.outs[0].H - H_mix) <= 1e-12 * abs(H_mix)
+        # the trunk exchanger between them cools H1 by 40 kW
+        assert abs(splits[0].H_mix - splits[1].H_split - 40. * 3600.
+                   ) <= 1e-9 * splits[0].H_mix
+    finally:
+        hxn_synthesis._discard([*units.values(),
+                                *(u for sp in splits
+                                  for u in (*sp.splitters, sp.mixer))])
+
 def test_repair_shrinks_branches_with_fractions(monkeypatch):
     # 5 K more than planned: `_repair` shrinks every violating exchanger,
     # branches with their fractions, in one pass, to duties that keep the
@@ -1692,7 +1785,9 @@ def test_repair_shrinks_branches_with_fractions(monkeypatch):
 # Stream splitting: splitters, mixers and the refine loop (synthesize_network)
 # ---------------------------------------------------------------------------
 
+import itertools
 import math
+import re
 
 SPLIT_CASES = ['smith2005_ex18_2_split', 'rtB05_above_2h1c']
 
@@ -1819,11 +1914,18 @@ def test_synthesize_network_with_splitting(name):
         assert stages[k:k + len(branches)] == branches
         assert len([hx for hx in stages[:k]
                     if hx not in branch_HXs]) == sp.position
-        if k == 0:   # a split at the stream's inlet takes the real inlet
+        if k == 0:   # a split at the stream's inlet takes the real inlet,
+            # in its splitter chain and in every branch's first exchanger
+            # (rtB03's vapor inlet is 1.7e-13 K off its state at the inlet
+            # enthalpy)
             real = _copy(streams_inlet[j])
             hxn_synthesis._first_inlet(real, not curve.monotone,
                                        curve.T_out, hot)
             assert feed.T == real.T
+            for branch in sp.branches:
+                if branch:
+                    hx = branch[0]
+                    assert hx.ins[stream_port(hx, j)].T == real.T, hx.ID
     # smith2005_ex18_2 splits at the inlet and re-joins at the pinch (one
     # temperature); rtB05 re-joins non-isothermally into its heater
     if name.startswith('crude'):
@@ -1844,7 +1946,15 @@ def test_split_mixer_outlet_is_the_planned_state(name, monkeypatch):
     # round-off for constant CP; a real-thermo outlet's H is the H of the
     # converged T); isothermal inlets share the mix state, others each
     # carry the end state of their branch
-    result, info, curves, dT = split_synthesis(name, 'mix_' + name)
+    run, ran = bst.Mixer._run, []
+    def spy(self):
+        ran.append(self.ID)
+        return run(self)
+    with monkeypatch.context() as m:
+        m.setattr(bst.Mixer, '_run', spy)
+        result, info, curves, dT = split_synthesis(name, 'mix_' + name)
+    # every mixer is flashed, once: the checks below are on its outlet
+    assert ran == [sp.mixer.ID for sp in info['splits']]
     assert hxn_synthesis._MIX_T_TOL == 1e-7
     smith = name.startswith('smith')
     for sp in info['splits']:
@@ -1869,14 +1979,21 @@ def test_split_mixer_outlet_is_the_planned_state(name, monkeypatch):
                 hx = branch[-1]
                 assert abs(s.H - hx.outs[stream_port(hx, j)].H
                            ) <= 1e-9 * duty
-    # one rule for every mixer: outside the tolerance, it is reported
-    monkeypatch.setattr(hxn_synthesis, '_MIX_T_TOL', -1.)
-    _, info, _, _ = split_synthesis(name, 'mix_dev_' + name)
-    assert [d['ID'] for d in info['split_deviations']] == [
-        sp.mixer.ID for sp in info['splits']]
-    for d, sp in zip(info['split_deviations'], info['splits']):
-        assert set(d) == {'ID', 'T_plan', 'T', 'H_plan', 'H'}
-        assert d['T'] == sp.mixer.outs[0].T and d['H'] == sp.mixer.outs[0].H
+    # one rule for every mixer: outside either tolerance (T, then H alone;
+    # `_DUTY_TOL` only decides what is reported), it is reported
+    for tol in ('_MIX_T_TOL', '_DUTY_TOL'):
+        with monkeypatch.context() as m:
+            m.setattr(hxn_synthesis, tol, -1.)
+            _, info, curves, _ = split_synthesis(
+                name, f'mix_dev_{tol}_{name}')
+        assert [d['ID'] for d in info['split_deviations']] == [
+            sp.mixer.ID for sp in info['splits']], tol
+        for d, sp in zip(info['split_deviations'], info['splits']):
+            out = sp.mixer.outs[0]
+            assert set(d) == {'ID', 'T_plan', 'T', 'H_plan', 'H'}
+            assert d['T'] == out.T and d['H'] == out.H
+            assert d['H_plan'] == math.fsum(s.H for s in sp.mixer.ins)
+            assert d['T_plan'] == curves[sp.stream].state_at_H(sp.H_mix).T
 
 def test_unsplit_refine_loop_identical_with_splitting(monkeypatch):
     # with chords 0.5 K off the exact curves and no refine round, round 0
@@ -1932,7 +2049,7 @@ def test_split_retry_changes_the_candidate(monkeypatch):
     assert len(plans) == 2 and info['refine_rounds'] == 1
     sp0 = plans[0][0].info['sides'][s]['split']
     sp1 = plans[1][0].info['sides'][s]['split']
-    assert sp1['signature'] != sp0['signature']
+    assert not _splitting._same_network(sp1['signature'], sp0['signature'])
     assert plans[1][1]['_split_exclude'] == {s: {sp0['signature']}}
     assert plans[1][1]['_split_prefer'] == {
         s: (sp0['candidate'], sp0['signature'])}
@@ -1980,15 +2097,85 @@ def test_split_retry_restores_the_best_plan(monkeypatch):
     (sp,) = info['splits']
     assert sp.fractions == plans[0][0].splits[0].fractions
 
+#: A real-thermo problem (a methanol and a steam desuperheater, a
+#: water/ethanol condenser, a water/methanol glide and pressurized water;
+#: random, review B) whose split side below the pinch keeps one exchanger
+#: 2.5e-5 K short through every refine round (it is repaired): the refine
+#: rounds move its split fraction by ~1e-7 each, and the retries must still
+#: see the same network there.
+DRIFT_CASE = dict(
+    name='split_fraction_drift', kind='real_thermo',
+    chemicals=['Water', 'Ethanol', 'Methanol'], T_min_app=5.,
+    streams=[
+        ('H0', {'Methanol': 24.2}, 414.09091911932484, 322.2002126772226,
+         200000.0, 'g', True),
+        ('H1', {'Water': 14.38}, 452.16355011784566, 396.2897045670141,
+         500000.0, 'g', True),
+        ('H2', {'Water': 28.1, 'Ethanol': 14.05}, 'dew', 345.28119572613235,
+         101325.0, 'l', True),
+        ('C0', {'Water': 16.7625, 'Methanol': 4.47}, 328.63252116884047,
+         372.0, 101325.0, 'l', True),
+        ('C1', {'Water': 123.1}, 300.025591230207, 367.08069142831766,
+         1000000.0, 'l', False)])
+
+def test_split_identity_survives_refined_knots(monkeypatch):
+    # every refine round re-plans the split side's pick alone (its network
+    # is unchanged, its fraction only drifts with the knots), and a retry
+    # never picks a network it excluded while another candidate is live
+    same = _splitting._same_network
+    plans = spy_plans(monkeypatch)
+    units, dT = test_hxn_mer._build(DRIFT_CASE)
+    hus = sorted([hx.heat_utilities[0] for hx in units],
+                 key=lambda hu: hu.duty)
+    bst.main_flowsheet.set_flowsheet('split_fraction_drift')
+    info = {}
+    synthesize_network(hus, dT, info=info, stream_splitting=True)
+    assert info['status'] == 'mer' and info['split_deviations'] == []
+    assert info['refine_rounds'] == len(plans) - 1 > hxn_synthesis._MAX_REFINE
+    picks = [plan.info['sides']['below']['split'] for plan, _ in plans]
+    assert all(sp['candidate'] is not None for sp in picks)
+    fractions = [plan.splits[0].fractions for plan, _ in plans]
+    assert fractions[1] != fractions[0]   # the knots moved them
+    last = hxn_synthesis._MAX_REFINE
+    for r, ((plan, kw), sp) in enumerate(zip(plans, picks)):
+        if 1 <= r <= last:   # stickiness
+            prefer = kw['_split_prefer']['below']
+            assert prefer == (picks[r - 1]['candidate'],
+                              picks[r - 1]['signature'])
+            assert set(sp['candidates']) == {prefer[0]}, r
+            assert same(sp['signature'], prefer[1])
+        elif r > last:   # a retry: never a network excluded before while
+            # another candidate is live
+            before = [p['signature'] for p in picks[last:r]]
+            live = [v for v in sp['candidates'].values()
+                    if isinstance(v, tuple)]
+            assert live or not any(same(sp['signature'], s) for s in before)
+            assert sp['candidates'][picks[r - 1]['candidate']] == 'excluded'
+    # every retry excluded a network not excluded before (the set is the
+    # loop's own, so it is read after the loop)
+    excluded = plans[-1][1]['_split_exclude']['below']
+    assert len(excluded) == len(plans) - 1 - last
+    assert all(any(same(p['signature'], s) for s in excluded)
+               for p in picks[last:-1])
+    assert not any(same(a, b) for a, b in itertools.combinations(excluded, 2))
+
 def test_split_realization_failure_merges_the_split(monkeypatch):
     # a mixer that cannot be simulated: its split's branch exchangers are
     # dropped (their duty goes to the utilities), no splitter or mixer is
-    # left, the stream passes as a trunk and every balance still closes
+    # left, the stream passes as a trunk and every balance still closes;
+    # the failed round's units (exchangers included) leave the registry, so
+    # the next round replaces none of them
     plans = spy_plans(monkeypatch)
     def fail(self): raise RuntimeError('mixer failed')
     monkeypatch.setattr(bst.Mixer, '_run', fail)
-    result, info, curves, dT = split_synthesis('smith2005_ex18_2_split',
-                                               'split_failure')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        result, info, curves, dT = split_synthesis('smith2005_ex18_2_split',
+                                                   'split_failure')
+    replaced = re.compile(r'<\w+: (HX_|s_\d|Split_|Mix_)\S*> has been '
+                          r'replaced in registry')
+    assert not [str(w.message) for w in caught
+                if replaced.search(str(w.message))]
     hs, cs, utils = result[:3]
     streams_inlet, stream_HXs = result[9], result[10]
     (plan, _), = plans

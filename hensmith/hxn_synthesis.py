@@ -23,7 +23,7 @@ from warnings import warn
 from ._curves import (StreamCurve, stream_curves, _end_state, _T_EQ, _T_SIDE,
                       _copy, _point_load_inlet)
 from ._planner import plan_network
-from ._splitting import Split, _ISO_TOL
+from ._splitting import Split, _ISO_TOL, _same_network
 
 __all__ = ('StreamLifeCycle', 'ProblemTable', 'problem_table',
            'synthesize_network', 'plot_pinch_diagram')
@@ -730,12 +730,17 @@ _ACHIEVED_TOL = 1e-6
 #: Rounds of exact-state verification and local knot refinement.
 _MAX_REFINE = 3
 #: Extra rounds with stream splitting after the last refine round, each run
-#: only if a violating exchanger lies on a split side whose network (its
-#: signature) is newly excluded, so that every one plans another network.
+#: only if a violating exchanger lies on a split side whose network
+#: (`hensmith._splitting._same_network`) is newly excluded. The retry
+#: re-plans that side without its networks excluded so far: another network
+#: if the side has one left, else the same one on the refined knots (a side's
+#: last candidate is never excluded), after which no network is new.
 _MAX_SPLIT_RETRY = 2
 #: A split's mixer outlet further than this from the planned temperature [K]
 #: is a deviation: 133 times the offset of a branch-flow PH flash (7.5e-10
-#: K) and 10 times below the approach guard `_APPROACH_TOL`.
+#: K) and 10 times below the approach guard `_APPROACH_TOL`. It catches
+#: thermosteam's PH flash disagreeing with the stream's curve (risk R-2),
+#: measured at 0.8-2.4 K inside random water/methanol glides.
 _MIX_T_TOL = 1e-7
 
 def _grid_knots(curves, grid):
@@ -1148,9 +1153,9 @@ def _walk(plan, duties, knots, is_hot):
     f, so its `ends` are parent-equivalent (the enthalpies of the full flow
     in the branch's state); the stream re-joins at the split enthalpy -/+
     the sum of the surviving branch duties, which the fractions leave free
-    of round-off. A dropped branch exchanger shortens its branch, a branch
-    without any bypasses, and later stages move toward the inlet by the
-    duty lost (`_split_nodes` gives the split enthalpies).
+    of round-off. A dropped branch exchanger shortens its branch (a branch
+    left without exchangers bypasses), and later stages move toward the
+    inlet by the duty lost (`_split_nodes` gives the split enthalpies).
     """
     ends = {}
     last = []
@@ -1225,7 +1230,8 @@ def _split_nodes(plan, duties, ends):
         For every stream, the first exchanger of every branch of the split
         that is its first node (the first item of ``plan.paths[j]`` with an
         exchanger in `duties`), in branch order: they all take the stream's
-        real inlet (`_realize`). Empty if the first node is not a split.
+        real inlet (`_realize`), as that split's splitter chain does
+        (`_realize_splits`). Empty if the first node is not a split.
     split_ends : list[tuple or None]
         For every split of ``plan.splits``, ``(H_split, [H_end, ...],
         H_mix)``: the enthalpies (relative to the stream's H_lo) where it
@@ -1234,6 +1240,9 @@ def _split_nodes(plan, duties, ends):
         where the branches re-join. None for a split whose branches have
         no exchanger left: it is not realized, the stream passes it
         unchanged.
+    first_splits : dict[int, int]
+        For every stream whose first node is a split, that split's index
+        into ``plan.splits`` (the one rule for both of the above).
     """
     split_ends = []
     for split in plan.splits:
@@ -1248,20 +1257,22 @@ def _split_nodes(plan, duties, ends):
         H_mix = H - D if plan.exchangers[n].hot == j else H + D
         split_ends.append((H, [ends[ns[-1], j][1] if ns else H
                                for ns in live], H_mix))
-    first_nodes = {}
+    order = {id(split): k for k, split in enumerate(plan.splits)}
+    first_nodes, first_splits = {}, {}
     for j, path in plan.paths.items():
         first_nodes[j] = ()
         for item in path:
             if not isinstance(item, Split):
                 if item in duties: break
                 continue
-            firsts = [next((n for n in ns if n in duties), None)
-                      for ns in item.branches]
-            firsts = tuple(n for n in firsts if n is not None)
-            if firsts:
-                first_nodes[j] = firsts
+            k = order[id(item)]
+            if split_ends[k] is not None:
+                first_nodes[j] = tuple(
+                    next(n for n in ns if n in duties)
+                    for ns in item.branches if any(n in duties for n in ns))
+                first_splits[j] = k
                 break
-    return first_nodes, split_ends
+    return first_nodes, split_ends, first_splits
 
 def _discard(units):
     """Remove units, and the streams connected to them, from the registry of
@@ -1351,7 +1362,12 @@ def _realize_splits(plan, duties, units, curves, knots, streams_inlet,
     enthalpy if every branch ends there (an isothermal re-join), else each
     in the state at its branch's end (parent-equivalent, see `_walk`). Its
     outlet starts at the planned state (the full stream at the mix
-    enthalpy), where the flash of an adiabatic mix lands.
+    enthalpy), which only speeds up the flash: where thermosteam's PH flash
+    disagrees with the stream's curve (inside some two-phase glides), the
+    outlet lands off the plan whatever its start, and the check on T
+    reports it. Such a mixer is reported, not undone: the PH flash at that
+    enthalpy lands there from every start state (measured), so a process
+    exchanger of the stream ending there would too, split or not.
 
     Returns
     -------
@@ -1372,24 +1388,22 @@ def _realize_splits(plan, duties, units, curves, knots, streams_inlet,
         units built for the splits and `units`.
     """
     ends = _walk(plan, duties, knots, is_hot)[0]
-    split_ends = _split_nodes(plan, duties, ends)[1]
+    _, split_ends, first_splits = _split_nodes(plan, duties, ends)
     tolQ = plan.info['tolQ']
     # each realized split's ordinal (per stream and side, from 1 in flow
-    # order), the stream's trunk exchangers before it and whether it is the
-    # stream's first node
+    # order) and the stream's trunk exchangers before it
     order = {id(split): k for k, split in enumerate(plan.splits)}
     where = {}
     for path in plan.paths.values():
-        count, trunk, started = {}, 0, False
+        count, trunk = {}, 0
         for item in path:
             if not isinstance(item, Split):
-                if item in duties: trunk, started = trunk + 1, True
+                trunk += item in duties
                 continue
             k = order[id(item)]
             if split_ends[k] is None: continue
             count[item.side] = count.get(item.side, 0) + 1
-            where[k] = (count[item.side], trunk, not started)
-            started = True
+            where[k] = (count[item.side], trunk)
     splits, deviations, built = [], [], []
 
     def run(unit, k, live):
@@ -1404,12 +1418,12 @@ def _realize_splits(plan, duties, units, curves, knots, streams_inlet,
         H_split, H_ends, H_mix = split_ends[k]
         j, fractions = split.stream, split.fractions
         curve = curves[j]
-        index, position, first = where[k]
+        index, position = where[k]
         base = f"Split_{j}_{'hs' if split.side == 'above' else 'cs'}"
         if index > 1: base += f'_{index}'
         mix_ID = 'Mix' + base[len('Split'):]
         live = [[n for n in ns if n in duties] for ns in split.branches]
-        if first:
+        if first_splits.get(j) == k:   # the stream's first node
             s = _copy(streams_inlet[j]) # the real inlet state
             _first_inlet(s, not curve.monotone, curve.T_out, is_hot[j])
         else:
@@ -1685,12 +1699,15 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     planned state; a mixer outlet off that state is reported in
     ``info['split_deviations']``. Each refine round re-plans a split
     side's previous pick first and keeps it while it plans the same
-    network (its signature). If exchangers on a split side still violate
-    after the last refine round, that network is excluded and the side
-    re-planned (at most two more rounds, each with a network not tried
-    before); if that does worse, the best MER plan of the rounds is
-    restored. A split whose splitters or mixer cannot be simulated becomes
-    a trunk (its branch exchangers are dropped, as in ``info['dropped']``).
+    network (its signature, with the fractions the refined knots move). If
+    exchangers on a split side still violate after the last refine round,
+    that network is excluded and the side re-planned (at most two more
+    rounds): with another network if the side has one left, else with the
+    same one on the refined knots (a side's last candidate is never
+    excluded), which ends the retries. If that does worse, the best MER
+    plan of the rounds is restored. A split whose splitters or mixer
+    cannot be simulated becomes a trunk (its branch exchangers are
+    dropped, as in ``info['dropped']``).
 
     *Guarantees and limits.* The utilities are never below the targets.
     Every process exchanger keeps ``T_min_app - 1e-6`` K on the exact
@@ -1801,7 +1818,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     # With stream splitting, every round re-plans a split side's previous
     # pick first (stickiness); after the last refine round, up to
     # _MAX_SPLIT_RETRY more rounds run while violating exchangers lie on
-    # split sides whose networks can still be excluded (by signature), and
+    # split sides whose networks can still be excluded (_same_network), and
     # if they end worse, the best MER plan of the rounds is restored.
     knots = _grid_knots(curves, grid)
     exclude, prefer, best = {}, {}, None
@@ -1821,8 +1838,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         )
         if stream_splitting and plan.status == 'mer' and (
                 best is None or len(bad) < best[0]):
-            best = (len(bad), plan, knots, duties, ends, min_approach,
-                    violations, bad)
+            best = (len(bad), plan, knots, duties, min_approach, bad)
         if (not violations or plan.status != 'mer'
             or refine_round == n_rounds): break
         if refine_round >= _MAX_REFINE:
@@ -1833,9 +1849,11 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
             for n in bad:
                 side = plan.exchangers[n].side
                 split = plan.info['sides'][side]['split']
-                if (split is not None and split['candidate'] is not None
-                        and split['signature'] not in exclude.get(side, ())):
-                    exclude.setdefault(side, set()).add(split['signature'])
+                if split is None or split['candidate'] is None: continue
+                signature = split['signature']
+                if not any(_same_network(signature, excluded)
+                           for excluded in exclude.get(side, ())):
+                    exclude.setdefault(side, set()).add(signature)
                     grew = True
             if not grew: break
         if stream_splitting:
@@ -1849,7 +1867,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
             and (plan.status != 'mer' or len(bad) > best[0])):
         # the retries did worse: back to the best MER plan (the fewest
         # violating exchangers, the earliest round), with its knots
-        _, plan, knots, duties, ends, min_approach, violations, bad = best
+        _, plan, knots, duties, min_approach, bad = best
     repaired = []
     if bad:
         duties, changes = _repair(plan, duties, knots, is_hot, curves,
