@@ -183,15 +183,17 @@ and also to those if it has no splitter.
     splitting leaves an unsplit problem's plan, and a SPLIT problem's sides
     that need no split, bit for bit as they are without it.
 ``test_split_network_balanced_and_feasible`` / ``test_split_network_reaches_mer``
-    Every constant-CP SPLIT problem (``SPLIT_CP``), synthesized with
-    ``stream_splitting=True``, passes
+    Every SPLIT problem, synthesized with ``stream_splitting=True``, passes
     G0-G10 and reaches both hensmith's targets and the independent
     reference within the NO_SPLIT tolerances (``_split_mer_problems``):
     status 'mer', no side left to best effort, every exchanger at its
-    planned duty (``deviations``), nothing repaired, dropped or dropped by
-    ``Qmin``, every mixer outlet at its planned state, the minimum
-    approach kept, and every split side free of leaks, pre-leaks, cells
-    below ``Qmin`` and failed strategies.
+    planned duty (``deviations``), nothing repaired (the refine rounds
+    closed every exact-state violation of a real-thermo plan), dropped or
+    dropped by ``Qmin``, every mixer outlet at its planned state, the
+    minimum approach kept, every split side free of leaks, pre-leaks,
+    cells below ``Qmin`` and failed strategies, and at most
+    ``_SPLIT_MIX_CAP`` mixers per curved stream and side (which bounds the
+    mixers' enthalpy residuals on real thermo).
 ``test_split_network_structure``
     Every realized split has two or more branches, each with a process
     exchanger and one fraction, the fractions summing to 1; each life cycle
@@ -199,16 +201,22 @@ and also to those if it has no splitter.
     stages; a must re-joins isothermally.
 ``test_split_exact_dTmin_is_enthalpy_limited``
     A branch exchanger at exactly ``T_min_app`` stops at its enthalpy limit
-    (its guard ``dT`` sits 1e-6 K lower), at its planned duty.
+    (its guard ``dT`` sits 1e-6 K lower), at its planned duty (a
+    constant-CP and a real-thermo problem).
 ``test_no_split_network_with_splitting``
     A NO_SPLIT problem synthesized with ``stream_splitting=True`` is the
-    network synthesized without it, bit for bit.
+    network synthesized without it, bit for bit (every real-thermo one and
+    two with constant CP, ``NO_SPLIT_WITH_SPLITTING``).
 ``test_backstop_alone_reaches_mer`` / ``..._in_the_facility``
     With the vertical core alone (no Stage S rule, strategy V only), every
-    split side of ``SPLIT_CP``, and of the two constructed problems whose
+    split side of ``SPLIT``, and of the two constructed problems whose
     roots pre-leak, is planned at MER, with cells that pass
     test_hxn_planner's independent ``_verify_side_cells``; the facility's
-    backstop network (smith2005_ex18_4_split) passes the checks above.
+    backstop networks (``BACKSTOP_FACILITY``) pass the checks above.
+``test_long_vertical_chain_is_exact``
+    Without coarsening, the vertical core chains hundreds of elementary
+    blocks on a glide (rtB07 above), and every node still satisfies the
+    residual condition by direct evaluation, with exact cells and no leak.
 
 Tolerances
 ----------
@@ -291,7 +299,7 @@ from hensmith._planner import plan_network
 from hensmith.hxn_synthesis import problem_table
 from hxn_mer_cases import NO_SPLIT, SPLIT, Q_UNITS, T_UNITS
 from test_hxn_planner import (NEAR_DOUBLE_PINCH, NEAR_THRESHOLD, _verify_side_cells,
-                              sides_from_knots)
+                              sides_from_knots, verify_core)
 
 # ---------------------------------------------------------------------------
 # Tolerances (justified in the module docstring)
@@ -1878,12 +1886,18 @@ def test_network_variant_is_patched_for_the_synthesis_only():
 # Stream splitting: the facility at the corpus
 # ---------------------------------------------------------------------------
 
-#: the constant-CP SPLIT problems
-SPLIT_CP = [case for case in SPLIT if _is_cp(case)]
+#: NO_SPLIT problems synthesized end to end with stream splitting: every
+#: real-thermo one (only a synthesis refines their knots) and two with
+#: constant CP (at the planner, test_no_split_plan_unchanged_by_splitting
+#: covers them all)
+NO_SPLIT_WITH_SPLITTING = (['4sp1_lee1970_dt10F', 'linnhoff_4stream']
+                           + [case['name'] for case in NO_SPLIT if not _is_cp(case)])
 
-#: NO_SPLIT problems synthesized end to end with stream splitting (at the
-#: planner, test_no_split_plan_unchanged_by_splitting covers them all)
-NO_SPLIT_WITH_SPLITTING = ['4sp1_lee1970_dt10F', 'linnhoff_4stream']
+#: the backstop's facility networks: one constant-CP problem and two real-
+#: thermo ones (rtB12: a superheated vapor at the pinch; rtB07: a glide
+#: boiler above it)
+BACKSTOP_FACILITY = ['smith2005_ex18_4_split', 'rtB12_above_2h1c_cond_boil_below',
+                     'rtB07_above_with_cold_glide']
 
 #: problems (dT, rows) of test_hxn_planner whose roots the planner's own
 #: cascade tolerances leave slightly negative, so that splitting starts
@@ -1957,14 +1971,14 @@ def _split_mer_problems(case, net, candidate=None):
             problems.append(f'stream {key[0]} {key[1]}: {n} mixers on a curved stream')
     return problems
 
-@pytest.mark.parametrize('case', SPLIT_CP, ids=_name)
+@pytest.mark.parametrize('case', SPLIT, ids=_name)
 def test_split_network_balanced_and_feasible(case):
     # the strict split-aware checks (G0-G10) on the network synthesized
     # with stream splitting
     problems = _network_problems(_network(case, True))
     assert not problems, '\n'.join(problems)
 
-@pytest.mark.parametrize('case', SPLIT_CP, ids=_name)
+@pytest.mark.parametrize('case', SPLIT, ids=_name)
 def test_split_network_reaches_mer(case):
     # with stream splitting, a problem whose MER needs splits reaches both
     # hensmith's targets and the independent reference, with every
@@ -1973,7 +1987,7 @@ def test_split_network_reaches_mer(case):
     problems = _split_mer_problems(case, _network(case, True))
     assert not problems, '\n'.join(problems)
 
-@pytest.mark.parametrize('case', SPLIT_CP, ids=_name)
+@pytest.mark.parametrize('case', SPLIT, ids=_name)
 def test_split_network_structure(case):
     # every realized split: at least two branches with one fraction each,
     # summing to 1, each with a process exchanger; the life cycles hold
@@ -2023,7 +2037,8 @@ def _planned_duties(case):
         duties[ID] = e.Q
     return duties
 
-@pytest.mark.parametrize('case', [_case('smith2005_ex18_4_split')], ids=_name)
+@pytest.mark.parametrize('case', [_case('smith2005_ex18_4_split'),
+                                  _case('rtB12_above_2h1c_cond_boil_below')], ids=_name)
 def test_split_exact_dTmin_is_enthalpy_limited(case):
     # a branch exchanger at exactly the minimum approach (at the pinch) runs
     # with its guard dT = T_min_app - 1e-6 K, so its duty ends where an
@@ -2069,7 +2084,7 @@ def test_no_split_network_with_splitting(name):
     problems = _network_problems(on)
     assert not problems, '\n'.join(problems)
 
-@pytest.mark.parametrize('name', [case['name'] for case in SPLIT_CP]
+@pytest.mark.parametrize('name', [case['name'] for case in SPLIT]
                                  + list(PRELEAK_PROBLEMS))
 def test_backstop_alone_reaches_mer(name, monkeypatch):
     # the vertical core alone (no Stage S rule, strategy V only) plans every
@@ -2104,10 +2119,25 @@ def test_backstop_alone_reaches_mer(name, monkeypatch):
         assert result.status == 'mer'
         _verify_side_cells(side, result.cells, _splitting._preleak_root(side)[1])
 
-@pytest.mark.parametrize('case', [_case('smith2005_ex18_4_split')], ids=_name)
+@pytest.mark.parametrize('case', [_case(name) for name in BACKSTOP_FACILITY], ids=_name)
 def test_backstop_alone_reaches_mer_in_the_facility(case):
     # the facility with the vertical core alone: MER, and a strictly
     # balanced and feasible network
     net = _network(case, True, variant='V')
     problems = _network_problems(net) + _split_mer_problems(case, net, candidate='V')
     assert not problems, '\n'.join(problems)
+
+def test_long_vertical_chain_is_exact(monkeypatch):
+    # the vertical core with elementary blocks only (no coarsening) on
+    # rtB07 above (a glide boiler: hundreds of knots): a chain of hundreds
+    # of closed-form nodes, each satisfying (R) by direct evaluation, with
+    # no leak and exact cells (round-off does not accumulate along it)
+    k = _corpus_knots(_case('rtB07_above_with_cold_glide'))
+    side = sides_from_knots(k['knots'], k['is_hot'], k['T_min_app'])['above']
+    a0 = _splitting._preleak_root(side)[1]
+    assert a0 == [0.] * side.M
+    coarse = _splitting._drive(side, a0, 'V')
+    monkeypatch.setattr(_splitting, '_SPLIT_COARSEN', False)
+    chain = _splitting._drive(side, a0, 'V')
+    assert len(chain.blocks) >= 200 and len(coarse.blocks) <= 10  # 276 and 3
+    verify_core(side, chain, a0)

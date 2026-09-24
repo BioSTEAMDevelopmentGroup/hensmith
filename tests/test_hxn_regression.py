@@ -56,6 +56,13 @@ enthalpy flashes, which leave residuals of ~1e-12 of the duty.
 Improvements leave slack; a maintainer lowers the numbers deliberately when
 a better network is intended. Never raise them to make a failing test pass
 (cases 4 and 10 were raised because the old networks were infeasible).
+
+``test_hxn_regression_with_splitting`` synthesizes every case again with
+``stream_splitting=True`` and holds it to the same checks (i)-(v). Cases
+4, 8 and 9 (``SPLIT_CASES``) must then reach their MER targets with split
+streams; every other case must give, bit for bit, the network it gives
+without the option (the same exchangers and duties, refine rounds and
+repairs).
 """
 import warnings
 import pytest
@@ -201,13 +208,17 @@ CASES = {
     'case_10_ten_streams':         (case_10_ten_streams,         1.44713e+07, 8.46199e+06),
 }
 
+#: the cases whose MER needs stream splits (see the module docstring)
+SPLIT_CASES = ('case_04_report_case', 'case_08_two_condensers', 'case_09_near_degenerate')
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
 
-def synthesize(builder):
+def synthesize(builder, stream_splitting=False):
     units, T_min_app = builder()
-    HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app,
+                               stream_splitting=stream_splitting)
     sys = bst.System.from_units('sys', units=[*units, HXN])
     with warnings.catch_warnings():
         warnings.simplefilter('error', RuntimeWarning)
@@ -250,10 +261,9 @@ def internal_approach(hx):
     return _min_approach(_temperature(hx.ins[h]), hx.ins[h].H, hx.outs[h].H,
                          _temperature(hx.ins[c]), hx.ins[c].H, hx.outs[c].H)
 
-@pytest.mark.parametrize('name', list(CASES))
-def test_hxn_regression(name):
-    builder, doc_heat, doc_cool = CASES[name]
-    units, HXN, T_min_app = synthesize(builder)
+def check_network(name, units, HXN, T_min_app):
+    """Checks (i)-(v) of the module docstring on the simulated network."""
+    _, doc_heat, doc_cool = CASES[name]
     total = sum(abs(hx.heat_utilities[0].unit_duty) for hx in units)
     # (i) energy balance
     assert abs(HXN.energy_balance_percent_error) < EB_TOLERANCE, name
@@ -286,6 +296,32 @@ def test_hxn_regression(name):
     atol = ZERO_RTOL * total
     assert heat <= doc_heat * (1 + DOC_RTOL) + atol, (name, heat, doc_heat)
     assert cool <= doc_cool * (1 + DOC_RTOL) + atol, (name, cool, doc_cool)
+
+@pytest.mark.parametrize('name', list(CASES))
+def test_hxn_regression(name):
+    builder = CASES[name][0]
+    check_network(name, *synthesize(builder))
+
+@pytest.mark.parametrize('name', list(CASES))
+def test_hxn_regression_with_splitting(name):
+    # with stream splitting, every case passes the same checks; the cases
+    # whose MER needs splits reach it with them, and every other case gives
+    # the network synthesized without the option, bit for bit
+    builder = CASES[name][0]
+    units, HXN, T_min_app = synthesize(builder, stream_splitting=True)
+    check_network(name, units, HXN, T_min_app)
+    info = HXN.synthesis_info
+    if name in SPLIT_CASES:
+        assert info['status'] == 'mer', name
+        assert info['splits'] and HXN.new_splitters and HXN.new_mixers, name
+        return
+    default = synthesize(builder)[1]
+    assert info['status'] == default.synthesis_info['status'] == 'mer', name
+    assert info['splits'] == HXN.new_splitters == HXN.new_mixers == [], name
+    assert ([(hx.ID, float(hx.Q).hex()) for hx in HXN.new_HXs]
+            == [(hx.ID, float(hx.Q).hex()) for hx in default.new_HXs]), name
+    for key in ('refine_rounds', 'repaired'):
+        assert info[key] == default.synthesis_info[key], (name, key)
 
 if __name__ == '__main__':
     for name, (builder, *_) in CASES.items():
