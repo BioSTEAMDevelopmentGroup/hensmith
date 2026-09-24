@@ -676,6 +676,8 @@ class _Side:
     tolQ, tolP : float
         Heat and level tolerances.
     """
+    #: x_dT of a pair, as the search (`_Search`) computes it
+    max_duty = staticmethod(_max_duty)
 
     def __init__(self, name, musts, flexes, tolQ, tolP):
         self.name = name
@@ -1156,7 +1158,7 @@ class _Search:
                     continue
                 cf = s.flexes[j]
                 lim = min(rem_m[i], rem_f[j], 2. * tolQ)
-                if _max_duty(cm, a[i], cf, b[j], lim, tolP) > tolQ:
+                if s.max_duty(cm, a[i], cf, b[j], lim, tolP) > tolQ:
                     break
                 if abs(mu[j] - lam[i]) <= tolP and cf.slope_right(b[j]) == 0.:
                     break
@@ -1180,8 +1182,8 @@ class _Search:
             for j in open_f:
                 if mu[j] > lam[i] + tolP or not self._allowed(i, j):
                     continue
-                xd = _max_duty(cm, a[i], s.flexes[j], b[j],
-                               min(rem_m[i], rem_f[j]), tolP)
+                xd = s.max_duty(cm, a[i], s.flexes[j], b[j],
+                                min(rem_m[i], rem_f[j]), tolP)
                 if xd <= tolQ:
                     continue
                 xr = float(xres[j])
@@ -1343,7 +1345,9 @@ class _SidePlan:
     status ('trivial' | 'mer' | 'best_effort') and diagnostics. A split
     side (`hensmith._splitting`) has no pieces but `cells` (branch
     exchangers in parent coordinates), its `split` info, and `units` given
-    by the caller."""
+    by the caller; a split attempt without a candidate has status 'failed'
+    and only its `split` info and `work`, which `_plan_side` moves to its
+    best-effort plan."""
     __slots__ = ('pieces', 'gaps', 'status', 'proof', 'method', 'work',
                  'units', 'cells', 'split')
 
@@ -1395,10 +1399,15 @@ def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.,
             # own tolerance (Lemma P); beyond it the targets cannot be met
             if (proof['rule'] != 'cascade'
                     or -d.slack <= _splitting._preleak_max(side)):
-                sp = _splitting._split_side(side, d, proof, cap1, forbid,
+                sp = _splitting._split_side(side, proof, cap1, forbid,
                                             work_scale, 0., split)
-                if sp is not None:
+                if sp.status == 'mer':
                     return sp
+                # no candidate: best effort, keeping the attempt's info
+                be = _best_effort(side, proof, cap1, forbid, work_scale,
+                                  sp.work)
+                be.split = sp.split
+                return be
         return _best_effort(side, proof, cap1, forbid, work_scale, 0.)
     work = 0.
     pieces = method = None
@@ -1419,13 +1428,15 @@ def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.,
         be = _best_effort(side, None, cap1, forbid, work_scale, work)
         if split:
             from . import _splitting
-            # below R2's 1e-12 of the scale: no best-effort penalty R2
-            # would see is accepted without trying the split path
+            # 1e-3 tolQ, far below the heat closure the plan is held to
+            # (1e-12 of the scale): no best-effort penalty that closure
+            # would notice is accepted without trying the split path
             if be.penalty > _splitting._SPLIT_R_TOL * side.tolQ:
-                sp = _splitting._split_side(side, d, None, cap1, forbid,
+                sp = _splitting._split_side(side, None, cap1, forbid,
                                             work_scale, be.work, split)
-                if sp is not None:
+                if sp.status == 'mer':
                     return sp
+                be.work, be.split = sp.work, sp.split
         return be
     first = work
     pieces, w = _improve_units(side, pieces, first, cap1, forbid, work_scale)
@@ -2023,11 +2034,13 @@ class Plan:
         ``Q_hot - Q_hot_target`` (>= 0).
     info : dict
         ``sides`` (per side: status, method, work, proof, gaps, units, and
-        with `stream_splitting` also ``split``: None for an unsplit side,
-        else a dict with the chosen ``candidate``, its network
-        ``signature``, every ``candidates`` key or failure reason,
+        with `stream_splitting` also ``split``: None for a side that did
+        not try to split, else a dict with the chosen ``candidate``, its
+        network ``signature``, every ``candidates`` key or failure reason,
         ``stages``, ``branches``, ``preleak``, ``leak``, ``small`` (split
-        exchangers below `Qmin`, kept) and ``errors``),
+        exchangers below `Qmin`, kept) and ``errors``; a side whose
+        attempt found no candidate keeps its best effort, with
+        ``candidate`` and ``signature`` None),
         ``qmin_dropped`` (list of (side, hot, cold, Q)), ``dropped`` (matches
         removed by the safety net; always empty unless there is a bug),
         ``min_approach`` (on the knot curves), ``work``, ``scale``,

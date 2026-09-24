@@ -55,9 +55,14 @@ branch CP = ``f`` CP) and the approach limits see a split.
 ``tau = x``, at ``f (q - a)`` for every knot ``q`` of ``phi_i`` inside the
 must range and at ``g (q - b)`` for every knot ``q`` of ``psi_j`` inside the
 flex range: between these points both levels are affine in ``tau``.
-:func:`_cell_margin` evaluates the approach there. It is equivalent to the
-planner's ``_max_duty`` on branch-scaled curves; every cell of a split plan
-is verified this way before the plan is accepted.
+:func:`_cell_margin` evaluates the approach there, and every cell of a split
+plan is verified this way before the plan is accepted. It establishes (C)
+at ``tolP``; the planner's ``_max_duty`` does not quite: it takes linear
+slopes within a relative ``_SLOPE_EQ`` as parallel, so a converging pair may
+close by ``_SLOPE_EQ`` times its level span. The split path's searches
+therefore run on a `_StrictSide`, whose `_max_duty_strict` applies that
+shortcut only where the closure stays within ``tolP``: on branch-scaled
+curves, every piece they place passes `_cell_margin`.
 
 Vertical coupling
 -----------------
@@ -95,7 +100,8 @@ the cascade, and one `rules_violation` call at its pre-leaked root screens
 the split (`_pinch_split`); on a double pinch the same rule is applied at
 the cut that still fails. The branched side is an ordinary side for the
 planner's search: `_stage_s` plans it from its pre-leaked root with the
-first passes of the planner's DFS, unchanged, under a unit bound from the
+first passes of the planner's DFS, unchanged but for the strict max duty
+of Lemma 1 (a `_StrictSide`), under a unit bound from the
 best candidate so far and one work budget for all rules
 (`_SPLIT_S_WORK`). Its pieces become cells in parent coordinates
 (`_s_cells`); a flex branch the DFS left unused is folded into its used
@@ -167,8 +173,8 @@ one extent on all of its branches, the largest its cells allow, and the
 block is scaled back by the largest lambda (bisected) whose end node
 satisfies (R), by the same exact check as every node. 'T' completes the
 side with a DFS tail (`_tail`) from a node where the rules hold: the
-planner's own search from ``(a, b)`` at a fraction of its budgets, its
-must residuals swept as in Stage S. A tail never yields a node, so every
+planner's own search from ``(a, b)`` at a fraction of its budgets (on a
+`_StrictSide`, Lemma 1), its must residuals swept as in Stage S. A tail never yields a node, so every
 node of a core candidate is the pre-leaked root, a vertical block's
 closed-form end or a pinch block's accepted end.
 
@@ -189,7 +195,9 @@ Selection and records
 The previous refine round's pick is tried first and kept if its signature
 is not excluded; otherwise the smallest key wins among the candidates not
 excluded (a side's last candidate is never excluded). Each must's gap is
-its pre-leak plus its leak, so the side's penalty is truthful.
+its pre-leak plus its leak, so the side's penalty is truthful. A side with
+no candidate falls back to the planner's best effort, which keeps the
+attempt's info (candidate None, the reasons and the errors).
 `_split_records` turns the side plans into the plan's records: every
 split stage becomes a `Split`, branch enthalpies are parent-equivalent (a
 branch exchanger moves its branch by ``Q/f``), a mix is written with the
@@ -203,9 +211,10 @@ from itertools import accumulate, combinations
 import numpy as np
 
 from ._planner import (Exchanger, _APPROACH_TOL, _LevelCurve, _REL_Q,
-                       _SCHEDULE, _Search, _Side, _SidePlan, _THRESHOLD_TOL,
-                       _WORK_EVENT, _combine_cap, _improve_units, _max_duty,
-                       _merge, _units_guard)
+                       _SCHEDULE, _SLOPE_EQ, _Search, _Side, _SidePlan,
+                       _THRESHOLD_TOL, _WORK_EVENT, _combine_cap,
+                       _improve_units, _max_duty, _merge, _slope1,
+                       _units_guard)
 
 __all__ = ()
 
@@ -355,6 +364,47 @@ def _cell_margin(side, cell):
     touch = bool((low[:-1] & low[1:]
                   & (np.diff(tau[order]) > tolQ)).any())
     return margin, touch
+
+
+def _max_duty_strict(cm, a, cf, b, limit, tolP):
+    """
+    The planner's `_max_duty`, with its parallel shortcut only where it
+    holds: every duty satisfies (C) at `tolP`.
+
+    `_max_duty` takes two linear curves whose slopes agree within a
+    relative `_SLOPE_EQ` as parallel and returns `limit`, so that equal
+    slopes are not separated by rounding. A pair that converges (flex
+    slope ``sf`` above must slope ``sm``) then closes by up to ``_SLOPE_EQ
+    sf limit`` of level, beyond `tolP` over a long enough span (a branch
+    whose CP a cut rule set to its partner's, on data with CPs equal to
+    1e-9). Here the shortcut applies only if the gap at `limit`, ``g0 -
+    (sf - sm) limit``, is at least ``-tolP``; otherwise the duty is that of
+    any converging pair, ``max(g0, 0)/(sf - sm)`` (the gap closes to zero).
+    """
+    if limit > 0. and cm.linear and cf.linear:
+        sm, sf = _slope1(cm), _slope1(cf)
+        if sf * (1. - _SLOPE_EQ) <= sm < sf:
+            g0 = cm.at(a) - cf.at(b)
+            if g0 < -tolP:
+                return 0.
+            if g0 - (sf - sm) * limit >= -tolP:
+                return limit
+            return min(limit, max(g0, 0.) / (sf - sm))
+    return _max_duty(cm, a, cf, b, limit, tolP)
+
+
+class _StrictSide(_Side):
+    """A `_Side` whose search places only pieces that satisfy (C) at tolP
+    (`_max_duty_strict`)."""
+    max_duty = staticmethod(_max_duty_strict)
+
+
+def _strict(side):
+    """`side` for the split path's searches (`_StrictSide`)."""
+    if isinstance(side, _StrictSide):
+        return side
+    return _StrictSide(side.name, side.musts, side.flexes, side.tolQ,
+                       side.tolP)
 
 
 # %% Vertical coupling
@@ -720,17 +770,54 @@ class _SplitInvariantError(Exception):
     """
 
 
+class _ExactSide(_Side):
+    """A `_Side` whose residual arrays are exact to round-off (`_exact`)."""
+
+    @staticmethod
+    def _R(pieces, n, levels):
+        """Inclusive (level <= L) and exclusive (level < L) residual heat of
+        every stream at every level, piece by piece: a sloped piece adds
+        ``clip((L - lo)/(hi - lo), 0, 1) ln``, a flat one ``ln`` from its
+        level on (inclusive) or above it (exclusive). Each share lies in
+        ``[0, ln]``, so a stream's residual never exceeds its heat."""
+        own, lo, hi, ln = pieces
+        nL = levels.size
+        Ri, Re = np.zeros((n, nL)), np.zeros((n, nL))
+        if own.size == 0 or nL == 0:
+            return Ri, Re
+        w = hi - lo
+        flat = w <= 0.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            fi = np.clip((levels - lo[:, None]) / w[:, None], 0., 1.)
+        fe = fi.copy()
+        fi[flat] = levels >= lo[flat, None]
+        fe[flat] = levels > lo[flat, None]
+        np.add.at(Ri, own, fi * ln[:, None])
+        np.add.at(Re, own, fe * ln[:, None])
+        return Ri, Re
+
+
 def _exact(side):
     """
-    `side` with no heat tolerance in its residual arrays.
+    `side` with no heat tolerance in its residual arrays, which are exact
+    to round-off.
 
     `_Side.analyse` omits every stream with at most ``tolQ`` of residual
     heat: the search's tolerance. At a core node that would drop a stream's
     last sliver of heat (up to ``tolQ``, far more than round-off), move the
     coupling's breakpoints and misreport the slack of (R) by that much, so
     the core analyses its nodes exactly.
+
+    The search's residual arrays of a stream with several pieces are
+    cumulative sums of the pieces' slopes and offsets, evaluated as
+    ``slope sum * (L - offset sum)``. On a near-flat piece (a glide of
+    1e-7 K over a heat of 10 has a slope of 1e8) those sums cancel
+    catastrophically and the residual drifts with the level, beyond the
+    stream's own heat. The core's side (`_ExactSide`) adds each piece's
+    clipped share directly instead. The search keeps its arrays, so the
+    unsplit planner is unchanged.
     """
-    return _Side(side.name, side.musts, side.flexes, 0., side.tolP)
+    return _ExactSide(side.name, side.musts, side.flexes, 0., side.tolP)
 
 
 def _preleak_max(side):
@@ -1107,9 +1194,9 @@ def _vertical_block(side, a, b, prev=(), forbid=frozenset(), used=frozenset(),
 def _pinch_block(side, a, b, forbid=frozenset(), used=frozenset(),
                  viol=None):
     """
-    A pinch block from node ``(a, b)`` (design 2.4.4): Linnhoff and
-    Hindmarsh's pinch split at an outward violation of the rules, as one
-    block of the core.
+    A pinch block from node ``(a, b)`` (strategy 'L', see 'The core' in
+    the module docstring): Linnhoff and Hindmarsh's pinch split at an
+    outward violation of the rules, as one block of the core.
 
     Parameters
     ----------
@@ -1186,8 +1273,8 @@ def _pinch_block(side, a, b, forbid=frozenset(), used=frozenset(),
                 bm = cm if f == 1. else _branch_curve(cm, f, 'must')
                 bf = cf if g == 1. else _branch_curve(cf, g, 'flex')
                 work += _WORK_EVENT
-                x = _max_duty(bm, f * a[i], bf, g * b[j],
-                              min(f * rem, g * (Qf[j] - b[j])), tolP)
+                x = _max_duty_strict(bm, f * a[i], bf, g * b[j],
+                                     min(f * rem, g * (Qf[j] - b[j])), tolP)
                 hi = min(hi, x / f)
             if not hi > tolQ:
                 return None
@@ -1253,8 +1340,9 @@ def _pinch_block(side, a, b, forbid=frozenset(), used=frozenset(),
 
 def _tail(side, a, b, cap1=False, forbid=frozenset(), work_scale=1.):
     """
-    A DFS tail from core node ``(a, b)`` (design 2.4.5): the planner's
-    unsplit search completes the side from there.
+    A DFS tail from core node ``(a, b)`` (strategy 'T', see 'The core' in
+    the module docstring): the planner's unsplit search completes the side
+    from there, with the strict max duty of Lemma 1 (`_StrictSide`).
 
     Parameters
     ----------
@@ -1291,12 +1379,13 @@ def _tail(side, a, b, cap1=False, forbid=frozenset(), work_scale=1.):
     forbid = frozenset(forbid)
     scale = _SPLIT_TAIL_WORK * work_scale
     work, seen, pieces = 0., set(), None
+    ss = _strict(side)
     for mode, cap, extra, budget in _SCHEDULE[:_SPLIT_PASSES]:
         cap = _combine_cap(cap, cap1)
         if (mode, cap, extra) in seen:
             continue
         seen.add((mode, cap, extra))
-        srch = _Search(side, mode, cap, extra, budget * scale, forbid=forbid,
+        srch = _Search(ss, mode, cap, extra, budget * scale, forbid=forbid,
                        a0=a, b0=b)
         pieces = srch.run()
         work += srch.work
@@ -1304,10 +1393,10 @@ def _tail(side, a, b, cap1=False, forbid=frozenset(), work_scale=1.):
             break
     if pieces is None:
         return None, work
-    pieces, w = _improve_units(side, pieces, work, cap1, forbid, scale,
+    pieces, w = _improve_units(ss, pieces, work, cap1, forbid, scale,
                                a0=a, b0=b)
     work += w
-    pieces, w = _units_guard(side, pieces, cap1, forbid, scale, a0=a, b0=b)
+    pieces, w = _units_guard(ss, pieces, cap1, forbid, scale, a0=a, b0=b)
     work += w
     items = ([('must', i, 1., None) for i in range(side.M)]
              + [('flex', j, 1., None) for j in range(side.F)])
@@ -1396,7 +1485,7 @@ def _drive(side, a0, strategy, cap1=False, forbid=frozenset(), work_scale=1.,
         d = ex.analyse(a, b)
         if d.slack < lim:
             raise _SplitInvariantError(
-                f'{strategy}: core node (R): slack {d.slack!r} after '
+                f'core node (R): slack {d.slack!r} after '
                 f'{len(blocks)} blocks')
         viol = (side.rules_violation(a, b, side.analyse(a, b))
                 if pinch or tail else None)
@@ -1425,7 +1514,7 @@ def _drive(side, a0, strategy, cap1=False, forbid=frozenset(), work_scale=1.,
             used |= blk.pairs
         for i, x in blk.leak.items():
             leak[i] += x
-    return _Candidate(strategy, (1, _CORE_ORDER.index(strategy)), side, a0,
+    return _Candidate(strategy, (1, _CORE_ORDER.index(strategy)), side,
                       [c for blk in blocks for c in blk.cells], leak,
                       math.fsum(blk.work for blk in blocks) + lost, Qmin,
                       blocks)
@@ -1546,8 +1635,6 @@ class _Candidate:
         _CORE_ORDER)`` for the core.
     side : _Side
         The side.
-    a0 : sequence[float]
-        The pre-leaked root.
     cells : list[_Cell]
         The cells (stage keys set).
     leak_by_must : sequence[float], optional
@@ -1595,15 +1682,14 @@ class _Candidate:
     _SplitInvariantError
         If an exchanger fails (C) (`_cell_margin`).
     """
-    __slots__ = ('name', 'order', 'cells', 'a0', 'leak_by_must', 'work',
+    __slots__ = ('name', 'order', 'cells', 'leak_by_must', 'work',
                  'blocks', 'excluded', 'units', 'stages', 'branches',
                  'mixers', 'small', 'mixbad', 'touch', 'meta', 'signature')
 
-    def __init__(self, name, order, side, a0, cells, leak_by_must=None,
+    def __init__(self, name, order, side, cells, leak_by_must=None,
                  work=0., Qmin=0., blocks=()):
         self.name, self.order = name, order
         self.cells = list(cells)
-        self.a0 = [float(x) for x in a0]
         self.leak_by_must = ([0.] * side.M if leak_by_must is None
                              else [float(x) for x in leak_by_must])
         self.work = float(work)
@@ -1617,7 +1703,7 @@ class _Candidate:
             margin, t = _cell_margin(side, c)
             if not margin >= -tolP:
                 raise _SplitInvariantError(
-                    f'{name}: {c!r} fails (C) by {margin!r}')
+                    f'{c!r} fails (C) by {margin!r}')
             if c.x < Qmin:
                 small.append((*side.hot_cold(c.i, c.j), c.x))
             n_small += c.x < Qmin or min(c.f, c.g) < _SPLIT_MIN_FRACTION
@@ -1655,7 +1741,7 @@ class _Candidate:
         touching exchangers, units + extra branches + split stages, the most
         mixers on one stream, candidate order."""
         return (self.small, self.mixbad, self.touch,
-                self.units + (self.branches - self.stages) + self.stages,
+                self.units + self.branches,   # units + extra branches + stages
                 self.mixers, self.order)
 
     def __repr__(self):
@@ -1748,7 +1834,7 @@ def _cut_sets(side, a, b, L, cut, rule):
 
 def _cut_transport(dem, cap, rule):
     """
-    Branches that satisfy the pinch rule at a cut (design 2.3.2).
+    Branches that satisfy the pinch rule at a cut (module docstring, 'Stage S').
 
     Parameters
     ----------
@@ -1984,7 +2070,7 @@ def _split_items(items, M, split):
     The items (`_pinch_split`) after one cut: every item in `split`
     (``(role, local index) -> branch fractions``) becomes branches of its
     fraction times those. A branch below `_SPLIT_MIN_FRACTION` of its
-    parent merges into its largest sibling (MF9), and a parent left with
+    parent merges into its largest sibling (a realizable split), and a parent left with
     one branch is a trunk again. Keys are ``('S', parent, n)``, numbered per
     parent in item order.
     """
@@ -2034,12 +2120,12 @@ def _branched_side(side, items, a0):
         else:
             c = side.flexes[p]
             flexes.append(c if f == 1. else _branch_curve(c, f, 'flex'))
-    return _Side(side.name, musts, flexes, side.tolQ, side.tolP), a
+    return _StrictSide(side.name, musts, flexes, side.tolQ, side.tolP), a
 
 
 def _pinch_split(side, a0, proof, rule):
     """
-    The branched side of one Stage S rule (design 2.3.3).
+    The branched side of one Stage S rule (module docstring, 'Stage S').
 
     The rule's transport (`_cut_transport`) at the proof's cut splits the
     demands and capacities there into whole-side branches. By Lemma R the
@@ -2106,7 +2192,7 @@ def _pinch_split(side, a0, proof, rule):
         d = bside.analyse(a, [0.] * bside.F)
         if abs(d.slack - slack0) > 10. * side.tolQ:
             raise _SplitInvariantError(
-                f'S:{rule}: the branched root has slack {d.slack!r}, the '
+                f'the branched root has slack {d.slack!r}, the '
                 f'side {slack0!r}')
         v = bside.rules_violation(a, [0.] * bside.F, d)
         if v is None:
@@ -2168,7 +2254,7 @@ def _fold(items, M, used):
 
 def _s_cells(side, items, a0, pieces):
     """
-    Cells of a Stage S plan (design 2.3.4, steps 3-5): the DFS `pieces` of
+    Cells of a Stage S plan (module docstring, 'Stage S'): the DFS `pieces` of
     the branched side, merged (`_merge`), in parent coordinates, with the
     unused flex branches folded (`_fold`) and the residual swept.
 
@@ -2201,7 +2287,7 @@ def _s_cells(side, items, a0, pieces):
 
     The DFS completes a must within ``tolQ`` of heat. The residual of must
     item ``i'``, ``r = f (Qm_i - a0_i)`` less its duties, is swept so that
-    every must is served exactly (MF4): if ``|r| <= tolQ``, `r` is added to
+    every must is served exactly: if ``|r| <= tolQ``, `r` is added to
     the item's far-end cell, the later cells of that cell's flex item move
     with it (the flex stays a prefix), and the cells changed are verified
     (`_cell_margin`); otherwise, or if that fails, the plan is rejected.
@@ -2278,8 +2364,9 @@ def _s_search(bside, a0, cap1, forbid, work_scale, bound, room):
 
 def _s_candidate(name, n, side, items, a0, pieces, cap1, work, split,
                  errors, reasons):
-    """The Stage S candidate of DFS `pieces` (design 2.3.4, steps 3-7), or
-    None; its key or the reason is recorded in `reasons`."""
+    """The Stage S candidate of DFS `pieces` (converted by `_s_cells` and
+    verified by `_Candidate`), or None; its key or the reason is recorded
+    in `reasons`."""
     cells, why = _s_cells(side, items, a0, pieces)
     if cells is None:
         reasons[name] = why
@@ -2288,7 +2375,7 @@ def _s_candidate(name, n, side, items, a0, pieces, cap1, work, split,
         reasons[name] = 'repeated pair'
         return None
     try:
-        c = _Candidate(name, (0, n), side, a0, cells, None, work,
+        c = _Candidate(name, (0, n), side, cells, None, work,
                        split['Qmin'])
     except _SplitInvariantError as e:
         errors.append(f'{name}: {e}')
@@ -2303,7 +2390,7 @@ def _stage_s(side, a0, proof, cap1, forbid, work_scale, split, errors,
              reasons, only=None, skip=None):
     """
     Stage S candidates of a side: pinch splits planned by the unchanged
-    DFS (design 2.3.4).
+    DFS (module docstring, 'Stage S').
 
     Parameters
     ----------
@@ -2337,8 +2424,11 @@ def _stage_s(side, a0, proof, cap1, forbid, work_scale, split, errors,
 
     Returns
     -------
-    list[_Candidate]
+    cands : list[_Candidate]
         The candidates, excluded ones included (`_excluded`).
+    work : float
+        Work spent: the DFS passes of every rule (with or without a
+        candidate) and the winner's unit improvements.
 
     Notes
     -----
@@ -2410,7 +2500,7 @@ def _stage_s(side, a0, proof, cap1, forbid, work_scale, split, errors,
             runs[id(c)] = (bside, a0b, bforbid, items, pieces)
     live = [c for c in out if not c.excluded]
     if not live:
-        return out
+        return out, used
     # the winner's units, as `_plan_side` improves an unsplit plan
     best = min(live, key=_Candidate.key)
     bside, a0b, bforbid, items, pieces = runs[id(best)]
@@ -2425,7 +2515,7 @@ def _stage_s(side, a0, proof, cap1, forbid, work_scale, split, errors,
             out[out.index(best)] = c
         else:
             reasons[best.name] = best.key()
-    return out
+    return out, used + w1 + w2
 
 
 # %% Portfolio and selection
@@ -2436,28 +2526,31 @@ def _excluded(split, side_name, cand):
     return cand.signature in split['exclude'].get(side_name, ())
 
 
-def _side_plan(side, best, cands, reasons, a0, delta, errors, work, proof):
-    """The side plan of the chosen candidate `best`. Each must's gap is its
-    pre-leak plus its leak, so the penalty is truthful."""
+def _side_plan(side, best, reasons, a0, delta, errors, work, proof):
+    """The side plan of the chosen candidate `best` (None: no candidate).
+    Each must's gap is its pre-leak plus its leak, so the penalty is
+    truthful."""
+    if best is None:
+        info = dict(candidate=None, signature=None, candidates=reasons,
+                    stages=0, branches=0, preleak=delta, leak=0., small=[],
+                    errors=errors)
+        return _SidePlan([], list(side.Qm), 'failed', 'split-none', work,
+                         proof, split=info)
     gaps = [a0[i] + best.leak_by_must[i] for i in range(side.M)]
     info = dict(best.meta, signature=best.signature, candidates=reasons,
                 preleak=delta, errors=errors)
-    return _SidePlan([], gaps, 'mer', 'split-' + best.name,
-                     work + math.fsum(c.work for c in cands), proof,
+    return _SidePlan([], gaps, 'mer', 'split-' + best.name, work, proof,
                      cells=best.cells, split=info, units=best.units)
 
 
-def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
+def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     """
     Split plan of a side that no unsplit network serves at MER.
 
     Parameters
     ----------
     side : _Side
-        The side.
-    d : _Residual
-        The search's analysis of the root, which triggered the split. The
-        core analyses the root again, exactly (`_preleak_root`).
+        The side. The core analyses its root exactly (`_preleak_root`).
     proof : dict or None
         The root proof, kept in the side plan (it says why the side
         split), or None if the unsplit search left a penalty.
@@ -2476,11 +2569,15 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
 
     Returns
     -------
-    _SidePlan or None
-        A side plan with status 'mer', method ``'split-<candidate>'``, the
-        cells of the chosen candidate and the ``split`` info; None only if
-        no candidate exists: the root deficit exceeds `_preleak_max`, or
-        avoid_recycle's pairs left no candidate.
+    _SidePlan
+        If a candidate exists, a side plan with status 'mer', method
+        ``'split-<candidate>'``, the cells of the chosen candidate and the
+        ``split`` info. Otherwise (the root deficit exceeds `_preleak_max`,
+        or every generator failed, raised `_SplitInvariantError` or was
+        rejected by avoid_recycle's pairs) status 'failed', method
+        'split-none', no cells, and the ``split`` info of the attempt with
+        ``candidate`` None: the caller keeps it on its best-effort plan.
+        Either way the work is `work` plus the work spent here.
 
     Notes
     -----
@@ -2496,14 +2593,15 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
     `_SPLIT_FIRST_WINS`, the first live candidate wins. A generator that
     raises `_SplitInvariantError` is recorded in ``errors`` and the others
     remain. With `cap1`, a candidate repeating a pair is rejected
-    (`_repeats_a_pair`).
+    (`_repeats_a_pair`). The work spent is that of Stage S (every rule's
+    DFS passes, `_stage_s`) and of every core candidate.
     """
     delta, a0 = _preleak_root(side)
     core = delta <= _preleak_max(side)
     s_ok = core and proof is not None and proof['rule'] in ('outward',
                                                             'inward')
     prefer = split['prefer'].get(side.name)
-    cands, errors, reasons = [], [], {}
+    cands, errors, reasons, spent = [], [], {}, [work]
 
     def generate(name):
         try:
@@ -2516,6 +2614,7 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
         if c is None:
             reasons[name] = 'forbidden pairs'
             return None
+        spent.append(c.work)
         if cap1 and _repeats_a_pair(c.cells, side.tolQ):
             reasons[name] = 'repeated pair'
             return None
@@ -2525,10 +2624,15 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
         return c
 
     def stage_s(**kw):
-        cs = _stage_s(side, a0, proof, cap1, forbid, work_scale, split,
-                      errors, reasons, **kw)
+        cs, w = _stage_s(side, a0, proof, cap1, forbid, work_scale, split,
+                         errors, reasons, **kw)
+        spent.append(w)
         cands.extend(cs)
         return cs
+
+    def plan(best):
+        return _side_plan(side, best, reasons, a0, delta, errors,
+                          math.fsum(spent), proof)
     # the preferred candidate (stickiness), taken as is if it is live
     first = []
     if s_ok and prefer is not None and prefer[2:] in _SPLIT_RULES and (
@@ -2538,8 +2642,7 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
         first = [generate(prefer)]
     for c in first:
         if c is not None and not c.excluded:
-            return _side_plan(side, c, cands, reasons, a0, delta, errors,
-                              work, proof)
+            return plan(c)
     # the portfolio: Stage S, then the core
     if s_ok:
         stage_s(skip=prefer)
@@ -2551,10 +2654,9 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
                 if _SPLIT_FIRST_WINS and c is not None and not c.excluded:
                     break
     if not cands:
-        return None
+        return plan(None)
     live = [c for c in cands if not c.excluded] or cands
-    return _side_plan(side, min(live, key=_Candidate.key), cands, reasons,
-                      a0, delta, errors, work, proof)
+    return plan(min(live, key=_Candidate.key))
 
 
 # %% Plan records
