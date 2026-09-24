@@ -81,17 +81,87 @@ tolerance ``tolQ``: ``tolQ`` of heat can hide a knot ``tolQ/CP`` away in
 level, far more than ``tolP``. An interval over which no must position
 changes in floating point carries no must heat; it is folded into the next
 one (or, at the end, into the previous one).
+
+The core (the provable backstop)
+--------------------------------
+**Theorem V'.** Let a node satisfy (R) and let ``[t_s, t_e]`` be two
+consecutive breakpoints of its coupling. Take the must heats ``h_i =
+P_i(t_e) - P_i(t_s)``, the flex heats ``g_j = R_j(t_e) - R_j(t_s)`` and any
+transport ``q_ij >= 0`` with these row and column sums, and give cell
+``(i, j)`` the duty ``q_ij`` from ``(P_i(t_s), R_j(t_s))`` with fractions
+``q_ij / h_i`` and ``q_ij / g_j``. This elementary block is feasible and
+the node after it satisfies (R). *Proof.* No knot lies inside the interval,
+so every present must follows the same affine normalized profile, the must
+composite's quantile ``lam_M``, and every present flex follows ``lam_F``.
+In a cell both branches are at the same composite coordinate, so (C) reads
+``lam_M >= lam_F``: true at both ends by (R), hence throughout. The block
+consumes the lowest ``t_e - t_s`` of both composites, ``D' = max(0, D -
+Delta)`` and ``S' = max(0, S - Delta)``, and that map is monotone, so (R)
+holds after it. Flex heat is taken as prefixes. All branches of a stream
+span the same parent range, so every remix is isothermal.
+
+**Corollary C (coarsening).** A fixed-fraction block over several
+breakpoints consumes the same heats as the elementary chain it replaces,
+so it ends at the same node, where (R) is automatic. A cell is feasible iff
+its normalized profiles are, independently of its duty, so the block
+exists iff a transport exists on that compatibility graph; it is found by
+a search (feasibility is not monotone in ``t_e``) and verified cell by
+cell.
+
+**Node discipline.** A chain of vertical blocks runs on the breakpoints
+of one coupling, and every node is the coupling's closed-form positions at
+a breakpoint, never the start plus the duties, so round-off does not
+accumulate: the column imbalance of a transport (O(eps) of its duty) is a
+sub-``tolP`` level offset that the cells are verified with. Each node is
+checked, ``slack >= -_SPLIT_R_TOL tolQ``, by an exact analysis (`_exact`:
+the search's analysis omits a stream's last ``tolQ`` of residual heat).
+
+**Lemma P (pre-leak).** `_cascade`'s own tolerances can leave a root slack
+down to ``-(_THRESHOLD_TOL / _REL_Q + 0.1) tolQ``: a threshold deficit of
+up to ``_THRESHOLD_TOL`` of the scale, and 0.1 tolQ between near-equal
+minima. Removing the lowest ``delta = -slack`` of the must composite gives
+``D' = max(0, D - delta)`` with ``S`` unchanged, and ``S - D >= -delta``,
+so (R) holds at ``P(delta)`` (`_preleak_root`). That heat goes to the
+musts' utilities, consistent with the targets `_cascade` already set.
+
+**Recovery.** If a cell of an elementary block fails (C), a composite
+breakpoint hidden inside the interval is inserted and the block rebuilt.
+Otherwise the failure is position round-off (one ulp of heat moving a
+tiny-CP stream by more than ``tolP``): the failing must heat is attached
+to the must's series cell of the previous block if that re-verifies, else
+leaked to the must's utility if at most ``_SPLIT_R_TOL tolQ``, and recorded
+(a leak event, ``1e-14`` of the scale, is 100 times inside the planner's
+``1e-12`` heat closure); anything larger raises `_SplitInvariantError`.
+
+Candidates
+----------
+A candidate (:class:`_Candidate`) is one verified split plan of a side. Its
+key, smaller is better: exchangers below ``Qmin`` or with a fraction below
+`_SPLIT_MIN_FRACTION`; non-isothermal remixes that feed a process exchanger
+of the same stream, and curved streams with more than `_SPLIT_MIX_CAP`
+mixers; exchangers parallel at the minimum approach on sides with a curved
+stream; units + extra branches + split stages; the most mixers on one
+stream; the candidate order. Its signature holds no duty or position, so it
+identifies the same network across knot refinements and generators.
 """
 import math
-from collections import deque
+from collections import Counter, defaultdict, deque
 
 import numpy as np
 
-from ._planner import _LevelCurve
+from ._planner import (_LevelCurve, _REL_Q, _Side, _THRESHOLD_TOL,
+                       _WORK_EVENT)
 
 __all__ = ()
 
 _SPLIT_ULP = 8. * np.finfo(float).eps   # round-off, relative to max(X, 1)
+_SPLIT_R_TOL = 1e-3          # core nodes: (R) slack and leak cap, x tolQ
+_SPLIT_MIN_FRACTION = 1e-3   # smallest branch fraction of a coarsened block
+_SPLIT_COARSEN = True        # False: elementary vertical blocks only
+_SPLIT_MIX_CAP = 2           # mixers per curved stream and side (the key)
+_ISO_TOL = 10.               # isothermal remix, x tolQ
+_CORE_ORDER = ('V', 'LV', 'VT', 'LVT')   # candidate order of the core
+_CORE_STRATEGIES = ('V',)    # the core strategies `_drive` runs
 
 
 # %% Cells and branch curves
@@ -363,6 +433,21 @@ class _Coupling:
             return self.b.tolist()
         return self._flexes(np.array([float(min(t, self.X))]))[0].tolist()
 
+    def insert(self, t):
+        """Insert the breakpoint `t`, strictly between two breakpoints, with
+        its closed-form positions (kept monotone); returns its index."""
+        k = int(np.searchsorted(self.t, t))
+        if not (0 < k <= self.K and self.t[k - 1] < t < self.t[k]):
+            raise ValueError(f'{t!r} is not strictly inside an interval')
+        ts = np.array([float(t)])
+        pm = np.clip(self._musts(ts)[0], self.Pm[k - 1], self.Pm[k])
+        pf = np.clip(self._flexes(ts)[0], self.Pf[k - 1], self.Pf[k])
+        self.t = np.insert(self.t, k, float(t))
+        self.Pm = np.insert(self.Pm, k, pm, axis=0)
+        self.Pf = np.insert(self.Pf, k, pf, axis=0)
+        self.K += 1
+        return k
+
 
 # %% Transport
 
@@ -555,3 +640,688 @@ def _forest(q, order):
                     if e != c:
                         link(e, False)
     return q
+
+
+# %% Vertical core
+
+class _SplitInvariantError(Exception):
+    """
+    A core invariant failed: a node violates (R) beyond round-off, or a
+    vertical block cannot be completed within round-off. The strategy fails
+    and the other candidates remain. It is raised, never asserted, so that
+    the driver's catch sees it and ``python -O`` cannot strip it.
+    """
+
+
+def _exact(side):
+    """
+    `side` with no heat tolerance in its residual arrays.
+
+    `_Side.analyse` omits every stream with at most ``tolQ`` of residual
+    heat: the search's tolerance. At a core node that would drop a stream's
+    last sliver of heat (up to ``tolQ``, far more than round-off), move the
+    coupling's breakpoints and misreport the slack of (R) by that much, so
+    the core analyses its nodes exactly.
+    """
+    return _Side(side.name, side.musts, side.flexes, 0., side.tolP)
+
+
+def _preleak_max(side):
+    """Largest root deficit the core absorbs by a pre-leak: the cascade's
+    own tolerances (threshold ``_THRESHOLD_TOL`` of the scale, and 0.1 tolQ
+    between near-equal minima) plus round-off, ``_SPLIT_R_TOL tolQ``."""
+    return (_THRESHOLD_TOL / _REL_Q + 0.1 + _SPLIT_R_TOL) * side.tolQ
+
+
+def _preleak_root(side, d=None):
+    """
+    The pre-leaked root of a side (Lemma P).
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    d : _Residual, optional
+        The exact analysis of the root, ``_exact(side).analyse(0, 0)``.
+
+    Returns
+    -------
+    delta : float
+        ``max(0, -slack)`` at the root: the must heat the core leaves to
+        the musts' utilities (compare with `_preleak_max`).
+    a0 : list[float]
+        The must positions ``P(delta)`` of the vertical coupling at the
+        root: the lowest `delta` of the must composite (zeros if
+        ``delta = 0``).
+    """
+    z_m, z_f = [0.] * side.M, [0.] * side.F
+    if d is None:
+        d = _exact(side).analyse(z_m, z_f)
+    delta = max(0., -d.slack)
+    if not delta > 0.:
+        return 0., z_m
+    return delta, _Coupling(side, z_m, z_f, d).must_at(delta)
+
+
+class _Block:
+    """
+    One block of a core candidate.
+
+    Parameters
+    ----------
+    kind : {'vertical', 'pinch'}
+        How the block was built.
+    start, end : tuple[list[float], list[float]]
+        The nodes ``(a, b)`` before and after the block; `end` holds the
+        coupling's closed-form positions (never start plus sums).
+    cells : list[_Cell]
+        The block's cells.
+    cp : _Coupling, optional
+        The coupling of a vertical block; the next vertical block continues
+        on it from breakpoint `k`.
+    k : int, optional
+        Breakpoint of `cp` where the block ends.
+    span : int, optional
+        Number of coupling intervals the block covers (1: elementary).
+    leak : dict[int, float], optional
+        Must heat left to the must's utility (position round-off).
+    knots : int, optional
+        Hidden breakpoints inserted to complete the block.
+    work : float, optional
+        Work spent on the block.
+    """
+    __slots__ = ('kind', 'start', 'end', 'cells', 'pairs', 'cp', 'k', 'span',
+                 'leak', 'knots', 'work')
+
+    def __init__(self, kind, start, end, cells, cp=None, k=0, span=1,
+                 leak=None, knots=0, work=0.):
+        self.kind, self.start, self.end = kind, start, end
+        self.cells = cells
+        self.pairs = frozenset((c.i, c.j) for c in cells)
+        self.cp, self.k, self.span = cp, k, span
+        self.leak = {} if leak is None else leak
+        self.knots, self.work = knots, work
+
+
+class _Vertical:
+    """Vertical blocks on one coupling (see `_vertical_block`)."""
+
+    def __init__(self, side, cp, prev, forbid, used):
+        self.side, self.cp, self.prev = side, cp, prev
+        # continuations: the previous block's series cells, which merge
+        self.conts = ([(c.i, c.j) for c in prev.cells
+                       if c.f == 1. and c.g == 1.] if prev is not None else [])
+        self.used = frozenset(used)
+        self.forbid = frozenset(forbid) | (self.used - frozenset(self.conts))
+        self.tol = max(_SPLIT_R_TOL * side.tolQ,
+                       4. * (side.M + side.F) * cp.ulp)
+        self.work = 0.
+        self.knots = 0
+
+    def _margin(self, cell):
+        self.work += _WORK_EVENT
+        return _cell_margin(self.side, cell)[0]
+
+    def cells(self, ks, ke, coarse):
+        """
+        Cells of the block over breakpoints ``[ks, ke]``.
+
+        Returns ``(cells, bad)`` (`bad`: the cells failing (C)), or None if
+        no transport exists or, for a `coarse` block, if the block does not
+        verify or has a fraction below `_SPLIT_MIN_FRACTION`.
+        """
+        side, cp = self.side, self.cp
+        tolP = side.tolP
+        am, bf = cp.Pm[ks], cp.Pf[ks]
+        hm, gf = cp.Pm[ke] - am, cp.Pf[ke] - bf
+        musts, flexes = side.musts, side.flexes
+        rows = sorted((i for i in range(side.M) if hm[i] > 0.),
+                      key=lambda i: (musts[i].at(am[i]), i))
+        cols = sorted((j for j in range(side.F) if gf[j] > cp.ulp),
+                      key=lambda j: (flexes[j].at(bf[j]), j))
+        h = {i: float(hm[i]) for i in rows}
+        g = {j: float(gf[j]) for j in cols}
+        # the must heats are exact; round-off of the flex heats is balanced
+        # on the largest flex
+        gap = math.fsum(h.values()) - math.fsum(g.values())
+        if gap > self.tol:
+            if coarse:
+                return None
+            raise _SplitInvariantError(
+                f'vertical block: the flexes lack {gap!r} of heat')
+        if gap > 0. and g:
+            j = max(g, key=g.get)
+            g[j] += gap
+        a = {i: float(am[i]) for i in rows}
+        b = {j: float(bf[j]) for j in cols}
+        if coarse:   # Corollary C: normalized profiles, independent of duty
+            comp = {(i, j) for i in rows for j in cols
+                    if (i, j) not in self.forbid and self._margin(_Cell(
+                        i, j, h[i], a[i], b[j], 1., h[i] / g[j])) >= -tolP}
+        else:        # Theorem V': every pair
+            comp = {(i, j) for i in rows for j in cols}
+        forbid = self.forbid
+        while True:
+            q = _transport(h, g, comp, self.conts, forbid, self.tol)
+            if q is None:
+                return None
+            nm = Counter(i for i, _ in q)
+            nf = Counter(j for _, j in q)
+            # avoid_recycle: a used pair returns only as a series cell
+            again = {c for c in q if c in self.used
+                     and (nm[c[0]] > 1 or nf[c[1]] > 1)}
+            if not again:
+                break
+            forbid = forbid | again
+        col = defaultdict(list)
+        for (i, j), x in q.items():
+            col[j].append(x)
+        col = {j: math.fsum(xs) for j, xs in col.items()}
+        cells = [_Cell(i, j, x, a[i], b[j],
+                       1. if nm[i] == 1 else x / h[i],
+                       1. if nf[j] == 1 else x / col[j])
+                 for (i, j), x in q.items()]
+        bad = [c for c in cells if not self._margin(c) >= -tolP]
+        if coarse and (bad or any(min(c.f, c.g) < _SPLIT_MIN_FRACTION
+                                  for c in cells)):
+            return None
+        return cells, bad
+
+    def coarse(self, ks):
+        """The longest verified block from `ks` the search finds: ``t_e =
+        X`` first, then galloping (2, 4, 8, ... intervals) and bisection
+        between the last success and the first failure. Returns ``(cells,
+        ke)`` or None."""
+        K = self.cp.K
+        out = self.cells(ks, K, True)
+        if out is not None:
+            return out[0], K
+        good, lo, hi, step = None, ks + 1, K, 2
+        while ks + step < hi:
+            out = self.cells(ks, ks + step, True)
+            if out is None:
+                hi = ks + step
+                break
+            good, lo = (out[0], ks + step), ks + step
+            step *= 2
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            out = self.cells(ks, mid, True)
+            if out is None:
+                hi = mid
+            else:
+                good, lo = (out[0], mid), mid
+        return good
+
+    def elementary(self, ks):
+        """The elementary block ``[ks, ks + 1]`` with the recovery of a
+        failing cell: ``(cells, leak)``, or None if no transport exists
+        (forbidden pairs only)."""
+        while True:
+            out = self.cells(ks, ks + 1, False)
+            if out is None:
+                return None
+            cells, bad = out
+            if not bad:
+                return cells, {}
+            t = self._hidden(ks)
+            if t is None:
+                return self._round_off(ks, cells, bad)
+            self.cp.insert(t)
+            self.knots += 1
+
+    def _hidden(self, ks):
+        """The first composite breakpoint hidden strictly inside the
+        interval ``ks`` with must heat on both sides of it, or None."""
+        cp, d = self.cp, self.cp.d
+        t0, t1 = cp.t[ks], cp.t[ks + 1]
+        v = np.concatenate((d.De, d.Di, d.Se, d.Si))
+        for t in np.unique(v[(v > t0) & (v < t1)]).tolist():
+            pm = cp._musts(np.array([t]))[0]
+            if (pm > cp.Pm[ks]).any() and (pm < cp.Pm[ks + 1]).any():
+                return t
+        return None
+
+    def _round_off(self, ks, cells, bad):
+        """Position round-off: the must heat of the failing cells goes to the
+        must's series cell of the previous block (if that re-verifies), else
+        to the must's utility (a leak, at most ``_SPLIT_R_TOL tolQ``);
+        anything larger raises."""
+        side, cp = self.side, self.cp
+        drop = {id(c) for c in bad}
+        keep = [c for c in cells if id(c) not in drop]
+        lost = defaultdict(list)
+        for c in bad:
+            lost[c.i].append(c)
+        leak = {}
+        for i, cs in lost.items():
+            dl = math.fsum(c.x for c in cs)
+            if self._attach(ks, i, cs, dl, keep):
+                continue
+            if not dl <= _SPLIT_R_TOL * side.tolQ:
+                raise _SplitInvariantError(
+                    f'vertical block: must {i} fails (C) on {dl!r} of heat')
+            leak[i] = dl
+        rows, cols = defaultdict(list), defaultdict(list)
+        for c in keep:
+            rows[c.i].append(c)
+            cols[c.j].append(c)
+        for i, cs in rows.items():
+            if i in lost:   # the kept branches stop dl short of P_i(t_s)
+                dl = math.fsum(c.x for c in lost[i])
+                hi = math.fsum(c.x for c in cs)
+                for c in cs:
+                    c.a = float(cp.Pm[ks, i]) + dl
+                    c.f = 1. if len(cs) == 1 else c.x / hi
+        for j, cs in cols.items():
+            s = math.fsum(c.x for c in cs)
+            for c in cs:
+                c.g = 1. if len(cs) == 1 else c.x / s
+        for c in keep:
+            if not self._margin(c) >= -side.tolP:
+                raise _SplitInvariantError(
+                    f'vertical block: {c!r} fails (C) after a leak')
+        return keep, leak
+
+    def _attach(self, ks, i, cs, dl, keep):
+        """Attach must `i`'s failing heat `dl` (all of its cells here, on one
+        flex that keeps no other cell here) to its series cell of the
+        previous block, contiguous on both streams, if that re-verifies."""
+        p, cp = self.prev, self.cp
+        js = {c.j for c in cs}
+        if p is None or len(js) != 1 or any(c.i == i or c.j in js
+                                             for c in keep):
+            return False
+        mine = [c for c in p.cells if c.i == i]
+        if len(mine) != 1:
+            return False
+        pc = mine[0]
+        if not (pc.j in js and pc.f == 1. and pc.g == 1.
+                and abs(pc.a_end - cp.Pm[ks, i]) <= cp.ulp
+                and abs(pc.b_end - cp.Pf[ks, pc.j]) <= self.tol):
+            return False
+        x = pc.x
+        pc.x = x + dl
+        if self._margin(pc) >= -self.side.tolP:
+            return True
+        pc.x = x
+        return False
+
+
+def _vertical_block(side, a, b, prev=(), forbid=frozenset(), used=frozenset(),
+                    d=None):
+    """
+    The next vertical block from node ``(a, b)`` (Theorem V', Corollary C).
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    a, b : sequence[float]
+        The node; it satisfies (R).
+    prev : sequence[_Block], optional
+        The previous block, if any (a list of at most one). A vertical block
+        ending at ``(a, b)`` hands over its coupling, so a chain of vertical
+        blocks runs on the breakpoints of one coupling; its series cells are
+        preferred (continuations).
+    forbid : collection[tuple[int, int]], optional
+        Pairs never used.
+    used : collection[tuple[int, int]], optional
+        Pairs of earlier blocks (avoid_recycle): used again only as series
+        continuations of the previous block.
+    d : _Residual, optional
+        ``_exact(side).analyse(a, b)``, if already computed.
+
+    Returns
+    -------
+    _Block or None
+        None only if forbidden or used pairs leave no transport.
+
+    Raises
+    ------
+    _SplitInvariantError
+        If the elementary block cannot be completed within round-off, or the
+        block would make no progress.
+
+    Notes
+    -----
+    With `_SPLIT_COARSEN`, the block ending at ``X`` is tried first, then
+    a gallop and bisection over the breakpoints. Feasibility is not
+    monotone in the end, so this is a search: every coarsened block is
+    verified cell by cell and needs every fraction >= `_SPLIT_MIN_FRACTION`.
+    The elementary block needs no search. If one of its cells fails (C), a
+    composite breakpoint hidden inside the interval is inserted and the
+    block rebuilt; otherwise the failure is position round-off, handled by
+    `_Vertical._round_off`.
+    """
+    a = [float(x) for x in a]
+    b = [float(x) for x in b]
+    p = prev[-1] if len(prev) else None
+    if (p is not None and p.cp is not None and p.k < p.cp.K
+            and p.end[0] == a and p.end[1] == b):
+        cp, ks = p.cp, p.k
+    else:
+        if d is None:
+            d = _exact(side).analyse(a, b)
+        cp, ks = _Coupling(side, a, b, d), 0
+    if ks >= cp.K:
+        raise _SplitInvariantError('vertical block: no must heat at the node')
+    v = _Vertical(side, cp, p, forbid, used)
+    out = v.coarse(ks) if _SPLIT_COARSEN and cp.K - ks > 1 else None
+    if out is not None:
+        (cells, ke), leak = out, {}
+    else:
+        out = v.elementary(ks)
+        if out is None:
+            return None
+        (cells, leak), ke = out, ks + 1
+    if not leak and not (cp.Pm[ke] > cp.Pm[ks]).any():
+        raise _SplitInvariantError('vertical block: no progress')
+    return _Block('vertical', (a, b), (cp.Pm[ke].tolist(), cp.Pf[ke].tolist()),
+                  cells, cp, ke, ke - ks, leak, v.knots, v.work)
+
+
+def _key_block(blk, n):
+    """Stage keys ``('B', n, stream, branch)`` of the streams split in core
+    block `n` (a stream with one cell in the block is a trunk: None)."""
+    nm = Counter(c.i for c in blk.cells)
+    nf = Counter(c.j for c in blk.cells)
+    bm, bf = Counter(), Counter()
+    for c in blk.cells:
+        if nm[c.i] > 1:
+            c.km = ('B', n, c.i, bm[c.i])
+            bm[c.i] += 1
+        if nf[c.j] > 1:
+            c.kf = ('B', n, c.j, bf[c.j])
+            bf[c.j] += 1
+
+
+def _drive(side, a0, strategy, cap1=False, forbid=frozenset(), work_scale=1.,
+           Qmin=0.):
+    """
+    One core candidate from the pre-leaked root.
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    a0 : sequence[float]
+        The pre-leaked root (`_preleak_root`); the flexes start at 0.
+    strategy : str
+        One of `_CORE_STRATEGIES`.
+    cap1 : bool, optional
+        avoid_recycle: every pair in at most one exchanger.
+    forbid : collection[tuple[int, int]], optional
+        Pairs never used.
+    work_scale : float, optional
+        Scale of the search budgets.
+    Qmin : float, optional
+        Exchangers below this duty count as small in the key.
+
+    Returns
+    -------
+    _Candidate or None
+        None only if forbidden or used pairs leave no block.
+
+    Raises
+    ------
+    _SplitInvariantError
+        If a node violates (R) by more than ``_SPLIT_R_TOL tolQ`` (never an
+        assert) or a block cannot be completed.
+
+    Notes
+    -----
+    'V' is the chain of vertical blocks. Each node is the closed-form end
+    of the previous block, so (R) is inherited (Theorem V', Corollary C)
+    and round-off does not accumulate; it is checked anyway, exactly.
+    """
+    if strategy not in _CORE_STRATEGIES:
+        raise ValueError(f'core strategy {strategy!r} is not available')
+    ex = _exact(side)
+    lim = -_SPLIT_R_TOL * side.tolQ
+    a, b = [float(x) for x in a0], [0.] * side.F
+    blocks, used, leak = [], set(), [0.] * side.M
+    while any(x < q for x, q in zip(a, side.Qm)):
+        d = ex.analyse(a, b)
+        if d.slack < lim:
+            raise _SplitInvariantError(
+                f'{strategy}: core node (R): slack {d.slack!r} after '
+                f'{len(blocks)} blocks')
+        blk = _vertical_block(side, a, b, blocks[-1:], forbid, used, d)
+        if blk is None:
+            return None
+        _key_block(blk, len(blocks))
+        blocks.append(blk)
+        a, b = blk.end
+        if cap1:
+            used |= blk.pairs
+        for i, x in blk.leak.items():
+            leak[i] += x
+    return _Candidate(strategy, (1, _CORE_ORDER.index(strategy)), side, a0,
+                      [c for blk in blocks for c in blk.cells], leak,
+                      math.fsum(blk.work for blk in blocks), Qmin, blocks)
+
+
+# %% Candidates
+
+def _merge_cells(cells, tolQ):
+    """
+    Exchangers of a list of cells: consecutive cells with the same must,
+    flex and stage keys, contiguous on both streams (within `tolQ`), merge
+    into one (the planner's continuation rule). The cells are not modified.
+    """
+    out, last_m, last_f = [], {}, {}
+    for c in cells:
+        e = last_m.get((c.i, c.km))
+        if (e is not None and e is last_f.get((c.j, c.kf))
+                and abs(c.a - e.a_end) <= tolQ and abs(c.b - e.b_end) <= tolQ):
+            e.x += c.x
+            continue
+        e = _Cell(c.i, c.j, c.x, c.a, c.b, c.f, c.g, c.km, c.kf)
+        out.append(e)
+        last_m[c.i, c.km] = last_f[c.j, c.kf] = e
+    return out
+
+
+def _stages(cells):
+    """Split stages: ``{(role, stream, stage): {branch: [cells]}}`` with
+    role 'm' (must) or 'f' (flex)."""
+    out = {}
+    for c in cells:
+        if c.km is not None:
+            out.setdefault(('m', c.i, c.km[:-1]), {}).setdefault(
+                c.km[-1], []).append(c)
+        if c.kf is not None:
+            out.setdefault(('f', c.j, c.kf[:-1]), {}).setdefault(
+                c.kf[-1], []).append(c)
+    return out
+
+
+def _remix(role, branches, tolQ):
+    """Split position, mix position and isothermality of a stage (parent
+    positions). A must splits at its far end and mixes toward the pinch, a
+    flex splits at its pinch-side start and mixes at the far end; the mix
+    is isothermal if every branch ends within ``_ISO_TOL tolQ`` of it."""
+    cs = [c for cells in branches.values() for c in cells]
+    D = math.fsum(c.x for c in cs)
+    if role == 'm':
+        p0 = max(c.a_end for c in cs)
+        pm = p0 - D
+        ends = [p0 - math.fsum(c.x for c in cells) / cells[0].f
+                for cells in branches.values()]
+    else:
+        p0 = min(c.b for c in cs)
+        pm = p0 + D
+        ends = [p0 + math.fsum(c.x for c in cells) / cells[0].g
+                for cells in branches.values()]
+    return p0, pm, all(abs(e - pm) <= _ISO_TOL * tolQ for e in ends)
+
+
+def _sig(v):
+    """`v` rounded to 9 significant digits."""
+    return float(f'{v:.9g}')
+
+
+def _signature(side, merged, stages):
+    """Knot-independent identity of a split network (see `_Candidate`)."""
+    musts, flexes = side.musts, side.flexes
+    by_stream = defaultdict(list)
+    for (role, s, sid), br in stages.items():
+        cs = [c for cells in br.values() for c in cells]
+        start = min(c.a if role == 'm' else c.b for c in cs)
+        by_stream[role, s].append((start, sid))
+    ordinal = {}
+    for (role, s), lst in by_stream.items():
+        for n, (_, sid) in enumerate(sorted(lst)):
+            ordinal[role, s, sid] = n
+
+    def canon(role, item):
+        # a branch by its partners in position order and its fraction
+        bk, cs = item
+        if role == 'm':
+            return (tuple(flexes[c.j].stream for c in
+                          sorted(cs, key=lambda c: c.a)), _sig(cs[0].f), bk)
+        return (tuple(musts[c.i].stream for c in
+                      sorted(cs, key=lambda c: c.b)), _sig(cs[0].g), bk)
+    branch, fracs = {}, []
+    for (role, s, sid), br in stages.items():
+        ranked = sorted(br.items(), key=lambda item: canon(role, item))
+        for n, (bk, _) in enumerate(ranked):
+            branch[role, s, sid, bk] = n
+        stream = (musts if role == 'm' else flexes)[s].stream
+        fracs.append((role, stream, ordinal[role, s, sid],
+                      tuple(canon(role, item)[1] for item in ranked)))
+
+    def path(role, s, key):
+        if key is None:
+            return None
+        sid = key[:-1]
+        return ordinal[role, s, sid], branch[role, s, sid, key[-1]]
+    cells = [(musts[c.i].stream, flexes[c.j].stream, path('m', c.i, c.km),
+              path('f', c.j, c.kf)) for c in merged]
+    cells.sort(key=lambda r: (r[0], r[1], r[2] or (), r[3] or ()))
+    return tuple(cells), tuple(sorted(fracs))
+
+
+class _Candidate:
+    """
+    A split plan of one side: its cells, verified, with the selection key
+    and the network signature.
+
+    Parameters
+    ----------
+    name : str
+        Generator, e.g. 'V' or 'S:partner'.
+    order : tuple
+        Tie-break rank: ``(0, rule index)`` for Stage S, ``(1, index in
+        _CORE_ORDER)`` for the core.
+    side : _Side
+        The side.
+    a0 : sequence[float]
+        The pre-leaked root.
+    cells : list[_Cell]
+        The cells (stage keys set).
+    leak_by_must : sequence[float], optional
+        Must heat leaked by position round-off, per must.
+    work : float, optional
+        Work spent.
+    Qmin : float, optional
+        Exchangers below this duty count as small.
+    blocks : sequence[_Block], optional
+        The core blocks, if any.
+
+    Attributes
+    ----------
+    units : int
+        Exchangers (`_merge_cells`).
+    stages, branches : int
+        Split stages and their branches (one splitter and one mixer each).
+    mixers : int
+        The most split stages (mixers) on one stream.
+    small : int
+        Exchangers below `Qmin` or with a fraction below
+        `_SPLIT_MIN_FRACTION`.
+    mixbad : int
+        Non-isothermal remixes followed by a process exchanger of the same
+        stream (a must's always is), plus curved streams (more than two
+        knots) with more than `_SPLIT_MIX_CAP` mixers on the side.
+    touch : int
+        Exchangers parallel at the minimum approach along a segment,
+        counted only on sides with a curved stream.
+    meta : dict
+        ``candidate``, ``stages``, ``branches``, ``leak`` and ``small``
+        (``[(hot, cold, Q)]`` below `Qmin`) for the side's info.
+    signature : tuple
+        The sorted exchangers ``(must stream, flex stream, must branch,
+        flex branch)`` (a branch is ``(split ordinal on the stream, branch
+        ordinal)`` or None), and each split's fractions to 9 significant
+        digits. It holds no duty or position, so it identifies the same
+        network across knot refinements and generators.
+    excluded : bool
+        Set by the caller (exclusion by signature).
+
+    Raises
+    ------
+    _SplitInvariantError
+        If an exchanger fails (C) (`_cell_margin`).
+    """
+    __slots__ = ('name', 'order', 'cells', 'a0', 'leak_by_must', 'work',
+                 'blocks', 'excluded', 'units', 'stages', 'branches',
+                 'mixers', 'small', 'mixbad', 'touch', 'meta', 'signature')
+
+    def __init__(self, name, order, side, a0, cells, leak_by_must=None,
+                 work=0., Qmin=0., blocks=()):
+        self.name, self.order = name, order
+        self.cells = list(cells)
+        self.a0 = [float(x) for x in a0]
+        self.leak_by_must = ([0.] * side.M if leak_by_must is None
+                             else [float(x) for x in leak_by_must])
+        self.work = float(work)
+        self.blocks = list(blocks)
+        self.excluded = False
+        tolQ, tolP = side.tolQ, side.tolP
+        merged = _merge_cells(self.cells, tolQ)
+        curved = any(c.n > 2 for c in side.musts + side.flexes)
+        small, n_small, touch = [], 0, 0
+        for c in merged:
+            margin, t = _cell_margin(side, c)
+            if not margin >= -tolP:
+                raise _SplitInvariantError(
+                    f'{name}: {c!r} fails (C) by {margin!r}')
+            if c.x < Qmin:
+                small.append((*side.hot_cold(c.i, c.j), c.x))
+            n_small += c.x < Qmin or min(c.f, c.g) < _SPLIT_MIN_FRACTION
+            touch += curved and t
+        stages = _stages(merged)
+        mixers = Counter((role, s) for role, s, _ in stages)
+        mixbad = 0
+        for (role, s, _), br in stages.items():
+            p0, _, iso = _remix(role, br, tolQ)
+            if iso:
+                continue
+            inside = {id(c) for cs in br.values() for c in cs}
+            mixbad += role == 'm' or any(
+                c.j == s and id(c) not in inside and c.b > p0 for c in merged)
+        for (role, s), n in mixers.items():
+            curve = (side.musts if role == 'm' else side.flexes)[s]
+            mixbad += curve.n > 2 and n > _SPLIT_MIX_CAP
+        self.units = len(merged)
+        self.stages = len(stages)
+        self.branches = sum(len(br) for br in stages.values())
+        self.mixers = max(mixers.values(), default=0)
+        self.small, self.mixbad, self.touch = n_small, mixbad, touch
+        self.meta = dict(candidate=name, stages=self.stages,
+                         branches=self.branches,
+                         leak=math.fsum(self.leak_by_must), small=small)
+        self.signature = _signature(side, merged, stages)
+
+    def key(self):
+        """Selection key, smaller is better: small exchangers, bad remixes,
+        touching exchangers, units + extra branches + split stages, the most
+        mixers on one stream, candidate order."""
+        return (self.small, self.mixbad, self.touch,
+                self.units + (self.branches - self.stages) + self.stages,
+                self.mixers, self.order)
+
+    def __repr__(self):
+        return f'<_Candidate {self.name} key={self.key()}>'

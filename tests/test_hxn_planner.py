@@ -963,10 +963,16 @@ def sides_from(rows, dT):
     """The planner's sides of a constant-CP problem, built as in
     `plan_network`."""
     streams = streams_from(rows)
-    curves = P._stream_curves(
+    return sides_from_knots(
         [([min(s['T_in'], s['T_out']), max(s['T_in'], s['T_out'])],
           [0., s['CP'] * abs(s['T_in'] - s['T_out'])]) for s in streams],
         [s['kind'] == 'hot' for s in streams], dT)
+
+
+def sides_from_knots(knots, is_hot, dT):
+    """The planner's sides of a problem given by stream knots, built as in
+    `plan_network`."""
+    curves = P._stream_curves(knots, is_hot, dT)
     act = [c for c in curves if c is not None]
     scale = sum(c.duty for c in act)
     span = max(c.T[-1] for c in act) - min(c.T[0] for c in act)
@@ -1224,3 +1230,361 @@ def test_transport_forest():
         c = (rng.choice(list(h)), rng.choice(list(g)))
         q = SP._transport(h, g, {(i, j) for i in h for j in g}, [c])
         assert q[c] == pytest.approx(min(h[c[0]], g[c[1]]), rel=4 * eps)
+
+
+# %% 16. Vertical core (hensmith._splitting)
+
+NEAR_THRESHOLD = (10., [  # _cascade sets Qh = 0: below root slack -23.7 tolQ
+    ('H1', 'h', 200, 100, 2.), ('C1', 'c', 100, 190, 1.),
+    ('C2', 'c', 100, 190, 1. + 1e-9)])
+NEAR_DOUBLE_PINCH = (10., [  # nptel_t5_3, CP2 = 6 - 1.58e-11: -0.05 tolQ
+    ('1', 'h', 200, 65, 3.), ('2', 'h', 90, 30, 6. - 1.58e-11),
+    ('3', 'c', 30, 142, 3.5), ('4', 'c', 25, 130, 4.)])
+FAR_PAIR = [  # a balanced large-CP pair far below every other stream
+    ('HF', 'h', 0, -10, 1e4), ('CF', 'c', -50, -40, 1e4)]
+
+
+def jittered_problem(seed):
+    """A random problem whose stream temperatures are offset by 3e-8..1e-6 K
+    (more than tolP, less than tolQ/CP: FAR_PAIR sets the scale)."""
+    rng = random.Random(seed)
+    rows, dT = pinch_problem(rng) if seed % 2 == 0 else random_problem(rng)
+    jit = random.Random(10_000 + seed)
+    rows = [(n, k, Ti + jit.choice([0., 0., 3e-8, 1e-7, 4e-7, 1e-6]),
+             To + jit.choice([0., 0., 3e-8, 1e-7, 4e-7]), cp)
+            for n, k, Ti, To, cp in rows]
+    return rows + FAR_PAIR, dT
+
+
+def _verify_side_cells(side, cells, a0=None, leak=None):
+    """Independent check of the cells of a split side: every cell by
+    `_max_duty` and by direct evaluation on the branch-scaled curves; the
+    branches of every stage with one fraction each, summing to 1, contiguous
+    from the stage start; every must served exactly from `a0` (plus its
+    leak) and every flex used as a prefix."""
+    M, F = side.M, side.F
+    a0 = [0.] * M if a0 is None else list(a0)
+    leak = [0.] * M if leak is None else list(leak)
+    tolQ, tolP = side.tolQ, side.tolP
+    scale = max(side.duty, 1.)
+    for c in cells:
+        assert c.x > 0. and 0. < c.f <= 1. and 0. < c.g <= 1.
+        cm, cf = side.musts[c.i], side.flexes[c.j]
+        assert c.a + c.x / c.f <= cm.Q + tolQ
+        assert c.b + c.x / c.g <= cf.Q + tolQ
+        bm = SP._branch_curve(cm, c.f, 'must')
+        bf = SP._branch_curve(cf, c.g, 'flex')
+        am, bb = c.f * c.a, c.g * c.b
+        assert P._max_duty(bm, am, bf, bb, c.x, tolP) >= c.x - tolQ
+        ts = np.concatenate(([0., c.x], bm.qa - am, bf.qa - bb))
+        ts = ts[(ts >= 0.) & (ts <= c.x)]
+        assert (bm.at_many(am + ts) - bf.at_many(bb + ts)).min() >= -tolP
+    for role, n, Q in (('m', M, side.Qm), ('f', F, side.Qf)):
+        must = role == 'm'
+        for s in range(n):
+            items = {}
+            for c in cells:
+                if (c.i if must else c.j) == s:
+                    key = c.km if must else c.kf
+                    items.setdefault(('trunk', id(c)) if key is None
+                                     else key[:-1], []).append(c)
+            spans = []
+            for key, cs in items.items():
+                pos = [(c.a, c.a_end, c.f) if must else (c.b, c.b_end, c.g)
+                       for c in cs]
+                start = min(p[0] for p in pos)
+                if key[0] != 'trunk':
+                    branches = {}
+                    for c, p in zip(cs, pos):
+                        branches.setdefault((c.km if must else c.kf)[-1],
+                                            []).append(p)
+                    fr = [ps[0][2] for ps in branches.values()]
+                    assert abs(math.fsum(fr) - 1.) <= 1e-12
+                    for ps in branches.values():
+                        ps.sort()
+                        assert all(p[2] == ps[0][2] for p in ps)
+                        assert abs(ps[0][0] - start) <= tolQ
+                        for p, p2 in zip(ps, ps[1:]):
+                            assert abs(p2[0] - p[1]) <= tolQ
+                spans.append((start, math.fsum(c.x for c in cs)))
+            spans.sort()
+            end = a0[s] if must else 0.
+            for start, duty in spans:   # no overlap, no gap beyond leaks
+                assert -tolQ <= start - end <= tolQ + sum(leak)
+                end = start + duty
+            if must:
+                served = a0[s] + math.fsum(d for _, d in spans) + leak[s]
+                assert abs(served - Q[s]) <= 1e-12 * scale
+            else:
+                assert end <= Q[s] + tolQ
+
+
+def verify_core(side, cand, a0):
+    """A core candidate: exact cells, (R) at every node, no leak, no missed
+    knot, every must served."""
+    assert cand.blocks and cand.blocks[0].start[0] == list(a0)
+    for blk in cand.blocks:
+        assert residual_slack(side, *blk.end) >= -SP._SPLIT_R_TOL * side.tolQ
+    assert cand.blocks[-1].end[0] == side.Qm
+    assert cand.leak_by_must == [0.] * side.M
+    assert sum(blk.knots for blk in cand.blocks) == 0
+    _verify_side_cells(side, cand.cells, a0)
+
+
+def core_sides(rng):
+    """Sides (with musts and flexes) of 200 constant-CP problems, 50 with
+    point loads and 50 with temperatures closer than tolQ/CP, and of the
+    merged-breakpoint and near-tie cases."""
+    problems = []
+    for k in range(200):
+        rows, dT = pinch_problem(rng) if k % 2 else random_problem(rng)
+        problems.append(sides_from(rows, dT))
+    for _ in range(50):
+        kn, hot, dT = random_curve_problem(rng, flat_p=0.5)
+        problems.append(sides_from_knots(kn, hot, dT))
+    for seed in range(50):
+        problems.append(sides_from(*jittered_problem(seed)))
+    problems.append(sides_from(MERGED_BREAKPOINT, 10.))
+    for dT, rows in (NEAR_THRESHOLD, NEAR_DOUBLE_PINCH):
+        problems.append(sides_from(rows, dT))
+    return [s for sides in problems for s in sides.values() if s.M and s.F]
+
+
+def test_theorem_v_random(monkeypatch):
+    # Theorem V': from a node satisfying (R) (the root, pre-leaked when the
+    # cascade's tolerances left it slightly negative), the chain of
+    # elementary vertical blocks is feasible and every node satisfies (R)
+    monkeypatch.setattr(SP, '_SPLIT_COARSEN', False)
+    rng = random.Random(61)
+    checked = preleaked = skipped = 0
+    for side in core_sides(rng):
+        delta, a0 = SP._preleak_root(side)
+        if delta > SP._preleak_max(side):   # not a tolerance-level deficit
+            skipped += 1
+            continue
+        preleaked += delta > 0.
+        assert math.fsum(a0) == pytest.approx(delta, abs=1e-12 * side.duty)
+        verify_core(side, SP._drive(side, a0, 'V'), a0)
+        checked += 1
+    assert checked >= 360 and preleaked >= 2 and skipped == 0
+
+
+@pytest.mark.parametrize('coarsen', [True, False])
+def test_vertical_core_on_split_sides(monkeypatch, coarsen):
+    monkeypatch.setattr(SP, '_SPLIT_COARSEN', coarsen)
+    for side in split_sides():
+        delta, a0 = SP._preleak_root(side)
+        assert delta == 0.
+        cand = SP._drive(side, a0, 'V')
+        verify_core(side, cand, a0)
+        assert cand.name == 'V' and cand.meta['leak'] == 0.
+        for blk in cand.blocks:   # a coarsened block keeps usable fractions
+            assert blk.span == 1 or (coarsen and all(
+                min(c.f, c.g) >= SP._SPLIT_MIN_FRACTION for c in blk.cells))
+
+
+def test_vertical_core_from_the_preleaked_root():
+    # _cascade's own tolerances leave these roots slightly negative: V from
+    # the root fails its node check; V from P(delta) is exact (Lemma P)
+    for dT, rows in (NEAR_THRESHOLD, NEAR_DOUBLE_PINCH):
+        sides = [s for s in sides_from(rows, dT).values() if s.M and s.F]
+        neg = [s for s in sides if SP._preleak_root(s)[0] > 0.]
+        assert neg
+        for side in neg:
+            delta, a0 = SP._preleak_root(side)
+            assert SP._SPLIT_R_TOL * side.tolQ < delta <= SP._preleak_max(side)
+            assert delta == -side.analyse([0.] * side.M, [0.] * side.F).slack
+            with pytest.raises(SP._SplitInvariantError):
+                SP._drive(side, [0.] * side.M, 'V')
+            assert residual_slack(side, a0, [0.] * side.F) >= (
+                -SP._SPLIT_R_TOL * side.tolQ)
+            verify_core(side, SP._drive(side, a0, 'V'), a0)
+
+
+def test_coarsened_blocks_end_at_vertical_nodes(monkeypatch):
+    # Corollary C: a coarsened block ends where the elementary chain it
+    # replaces ends, so (R) there is inherited
+    rng = random.Random(62)
+    sides = split_sides() + [s for s in core_sides(rng)[::7]]
+    n_coarse = 0
+    for side in sides:
+        delta, a0 = SP._preleak_root(side)
+        if delta > SP._preleak_max(side):
+            continue
+        monkeypatch.setattr(SP, '_SPLIT_COARSEN', False)
+        fine = SP._drive(side, a0, 'V')
+        monkeypatch.setattr(SP, '_SPLIT_COARSEN', True)
+        coarse = SP._drive(side, a0, 'V')
+        verify_core(side, coarse, a0)
+        assert len(coarse.blocks) <= len(fine.blocks)
+        nodes = [np.array(blk.end[0] + blk.end[1]) for blk in fine.blocks]
+        z_f = [0.] * side.F
+        cp = SP._Coupling(side, a0, z_f, SP._exact(side).analyse(a0, z_f))
+        for blk in coarse.blocks:
+            end = np.array(blk.end[0] + blk.end[1])
+            assert min(np.abs(end - n).max() for n in nodes) <= side.tolQ
+            t = math.fsum(blk.end[0]) - math.fsum(a0)
+            assert_allclose(blk.end[0], cp.must_at(t), rtol=0.,
+                            atol=side.tolQ)
+            assert_allclose(blk.end[1], cp.flex_at(t), rtol=0.,
+                            atol=side.tolQ)
+        n_coarse += len(coarse.blocks) < len(fine.blocks)
+    assert n_coarse >= 10
+
+
+def test_core_node_check_is_exact(monkeypatch):
+    # flex 0 ends 5e-4 (< tolQ) above flex 1's start and the top level is
+    # tight: after the block that stops at flex 1's start, flex 0 keeps a
+    # sliver below tolQ, which the search's analysis omits (slack -tolQ/2);
+    # the core analyses its nodes exactly
+    monkeypatch.setattr(SP, '_SPLIT_COARSEN', False)
+    L = P._LevelCurve
+    side = P._Side('above', [L([0., 10.], [0., 10.])],
+                   [L([0., 5.], [0., 5.]), L([0., 5.], [4.9995, 9.9995])],
+                   1e-3, 1e-9)
+    cand = SP._drive(side, [0.], 'V')
+    verify_core(side, cand, [0.])
+    lim = -SP._SPLIT_R_TOL * side.tolQ
+    assert min(side.analyse(*blk.end).slack for blk in cand.blocks) < lim
+    assert min(SP._exact(side).analyse(*blk.end).slack
+               for blk in cand.blocks) >= lim
+
+
+def one_to_one_side():
+    """One must over one flex, far apart in level: one vertical block."""
+    return P._Side('above', [P._LevelCurve([0., 10.], [50., 60.])],
+                   [P._LevelCurve([0., 20.], [0., 10.])], 1e-9, 1e-9)
+
+
+def carrier(cp, k, cells=()):
+    """A finished vertical block ending at breakpoint `k` of `cp`."""
+    end = (cp.Pm[k].tolist(), cp.Pf[k].tolist())
+    return SP._Block('vertical', end, end, list(cells), cp=cp, k=k)
+
+
+def test_vertical_block_recovery(monkeypatch):
+    monkeypatch.setattr(SP, '_SPLIT_COARSEN', False)
+    # 1. missed knot: without the breakpoints of flex B's supply level (the
+    # musts reach it at t1, flex A at t2), elementary block 0 puts B 4e-7 K
+    # above the pinch against the musts at the pinch; the first hidden
+    # composite breakpoint is inserted and the block ends there
+    side = sides_from(MERGED_BREAKPOINT, 10.)['above']
+    z_m, z_f = [0.] * side.M, [0.] * side.F
+    cp = SP._Coupling(side, z_m, z_f)
+    t1, t2 = cp.t[1], cp.t[2]
+    assert t1 == pytest.approx(2. * 4e-7, rel=1e-6)
+    assert t2 == pytest.approx(3. * 4e-7, rel=1e-6)
+    cp.t, cp.K = np.delete(cp.t, [1, 2]), cp.K - 2
+    cp.Pm, cp.Pf = np.delete(cp.Pm, [1, 2], 0), np.delete(cp.Pf, [1, 2], 0)
+    blk = SP._vertical_block(side, z_m, z_f, [carrier(cp, 0)])
+    assert blk.knots == 1 and cp.t[blk.k] == t1 and blk.leak == {}
+    assert blk.cells and all(SP._cell_margin(side, c)[0] >= -side.tolP
+                             for c in blk.cells)
+    # 2. a cell failing (C) by position round-off is leaked when its heat is
+    # below _SPLIT_R_TOL tolQ, attached to the must's series cell in the
+    # previous block when that re-verifies, and raises otherwise
+    side = one_to_one_side()
+    tiny = 0.1 * SP._SPLIT_R_TOL * side.tolQ
+    margin = SP._cell_margin
+    monkeypatch.setattr(SP, '_cell_margin', lambda s, c: (
+        (-1., False) if c.x <= tiny else margin(s, c)))
+    cp = SP._Coupling(side, [0.], [0.])
+    cp.insert(tiny)
+    blk = SP._vertical_block(side, [0.], [0.], [carrier(cp, 0)])
+    assert blk.cells == [] and blk.leak == {0: tiny} and blk.k == 1
+    cp = SP._Coupling(side, [0.], [0.])
+    k = cp.insert(5.)
+    cp.insert(5. + tiny)
+    series = SP._Cell(0, 0, 5., 0., 0.)
+    blk = SP._vertical_block(side, [5.], [5.], [carrier(cp, k, [series])])
+    assert blk.cells == [] and blk.leak == {}
+    assert series.a_end == cp.Pm[k + 1, 0] and series.b_end == cp.Pf[k + 1, 0]
+    monkeypatch.setattr(SP, '_cell_margin', lambda s, c: (-1., False))
+    with pytest.raises(SP._SplitInvariantError):
+        SP._vertical_block(side, [0.], [0.])
+
+
+def test_vertical_block_forbid_and_used(monkeypatch):
+    monkeypatch.setattr(SP, '_SPLIT_COARSEN', False)
+    side = P._Side('above', [P._LevelCurve([0., 10.], [50., 60.])] * 2,
+                   [P._LevelCurve([0., 20.], [0., 10.])] * 2, 1e-9, 1e-9)
+    z = [0., 0.]
+    blk = SP._vertical_block(side, z, z, (), frozenset({(0, 0)}))
+    assert (0, 0) not in blk.pairs and blk.pairs
+    assert SP._vertical_block(side, z, z, (),
+                              frozenset({(0, 0), (0, 1)})) is None
+    # avoid_recycle: a used pair returns only as a series continuation
+    for s in split_sides():
+        cand = SP._drive(s, [0.] * s.M, 'V', cap1=True)
+        if cand is not None:
+            pairs = [(c.i, c.j) for c in SP._merge_cells(cand.cells, s.tolQ)]
+            assert len(pairs) == len(set(pairs))
+            _verify_side_cells(s, cand.cells)
+
+
+def key_side(curved=False):
+    musts = [P._LevelCurve([0., 10.], [50., 60.]) for _ in range(2)]
+    flexes = [P._LevelCurve([0., 20.], [0., 10.]) for _ in range(2)]
+    if curved:
+        flexes.append(P._LevelCurve([0., 5., 20.], [0., 1., 10.]))
+    for k, c in enumerate(musts + flexes):
+        c.stream = k
+    return P._Side('above', musts, flexes, 1e-9, 1e-9)
+
+
+def test_candidate_key_and_signature():
+    side = key_side()
+    B = SP._Cell
+
+    def cand(cells, name='V', order=(1, 0), **kw):
+        return SP._Candidate(name, order, side, [0., 0.], cells, **kw)
+    # must 0 in two branches (a V block), must 1 on a trunk to flex 1
+    split = [B(0, 0, 4., 0., 0., .4, .5, ('B', 0, 0, 0), ('B', 0, 0, 0)),
+             B(0, 1, 6., 0., 0., .6, 1., ('B', 0, 0, 1), None),
+             B(1, 0, 4., 0., 0., 1., .5, None, ('B', 0, 0, 1)),
+             B(1, 1, 6., 4., 6.)]
+    c = cand(split)
+    assert (c.units, c.stages, c.branches, c.mixers) == (4, 2, 4, 1)
+    assert c.key() == (0, 0, 0, 8, 1, (1, 0))
+    assert c.meta == dict(candidate='V', stages=2, branches=4, leak=0.,
+                          small=[])
+    # the same network under another name and branch numbering
+    swap = [B(0, 0, 4., 0., 0., .4, .5, ('B', 7, 0, 1), ('B', 7, 0, 1)),
+            B(0, 1, 6., 0., 0., .6, 1., ('B', 7, 0, 0), None),
+            B(1, 0, 4., 0., 0., 1., .5, None, ('B', 7, 0, 0)),
+            B(1, 1, 6., 4., 6.)]
+    assert cand(swap, 'LVT', (1, 3)).signature == c.signature
+    other = [B(0, 0, 3., 0., 0., .3, 3. / 7., ('B', 0, 0, 0), ('B', 0, 0, 0)),
+             B(0, 1, 7., 0., 0., .7, 1., ('B', 0, 0, 1), None),
+             B(1, 0, 4., 0., 0., 1., 4. / 7., None, ('B', 0, 0, 1)),
+             B(1, 1, 6., 4., 7.)]
+    assert cand(other).signature != c.signature
+    # series continuations merge into one unit; Qmin and tiny fractions
+    series = [B(1, 1, 3., 0., 0.), B(1, 1, 7., 3., 3.)]
+    c = cand(series, Qmin=8.)
+    assert c.units == 1 and c.small == 0 and c.meta['small'] == []
+    c = cand(series, Qmin=11.)
+    assert c.units == 1 and c.small == 1 and c.meta['small'] == [(1, 3, 10.)]
+    tiny = [B(0, 0, 1e-4, 0., 0., 1e-5, 1., ('B', 0, 0, 0), None),
+            B(0, 1, 10. - 1e-4, 0., 0., 1. - 1e-5, 1., ('B', 0, 0, 1), None)]
+    assert cand(tiny).small == 1
+    # a non-isothermal flex remix followed by an exchanger on that flex
+    remix = [B(0, 0, 2., 0., 0., 1., .25, None, ('B', 0, 0, 0)),
+             B(1, 0, 2., 0., 0., 1., .75, None, ('B', 0, 0, 1))]
+    assert cand(remix).mixbad == 0   # feeds only the flex's utility
+    assert cand(remix + [B(0, 0, 1., 2., 5.)]).mixbad == 1
+    iso = [B(0, 0, 2., 0., 0., 1., .5, None, ('B', 0, 0, 0)),
+           B(1, 0, 2., 0., 0., 1., .5, None, ('B', 0, 0, 1)),
+           B(0, 0, 1., 2., 4.)]
+    assert cand(iso).mixbad == 0
+    # touch counts only on a side with a curved stream
+    par = [B(0, 0, 5., 0., 0., .5, .5)]   # parallel at the minimum approach
+    side = P._Side('above', [P._LevelCurve([0., 20.], [0., 10.])],
+                   [P._LevelCurve([0., 20.], [0., 10.])], 1e-9, 1e-9)
+    assert SP._Candidate('V', (1, 0), side, [0.], par).touch == 0
+    side.flexes.append(P._LevelCurve([0., 5., 20.], [-9., -8., -1.]))
+    side = P._Side('above', side.musts, side.flexes, 1e-9, 1e-9)
+    assert SP._Candidate('V', (1, 0), side, [0.], par).touch == 1
+    # a cell that fails (C) is never accepted
+    with pytest.raises(SP._SplitInvariantError):
+        SP._Candidate('V', (1, 0), side, [0.], [B(0, 0, 5., 0., 1.)])
