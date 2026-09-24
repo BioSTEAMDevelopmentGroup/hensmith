@@ -767,8 +767,11 @@ class _Vertical:
         Cells of the block over breakpoints ``[ks, ke]``.
 
         Returns ``(cells, bad)`` (`bad`: the cells failing (C)), or None if
-        no transport exists or, for a `coarse` block, if the block does not
-        verify or has a fraction below `_SPLIT_MIN_FRACTION`.
+        forbidden or used pairs leave no transport or, for a `coarse` block,
+        if no transport exists on the compatible pairs, the block does not
+        verify or it has a fraction below `_SPLIT_MIN_FRACTION`. An
+        elementary block with no transport on all pairs contradicts Theorem
+        V' and raises `_SplitInvariantError`.
         """
         side, cp = self.side, self.cp
         tolP = side.tolP
@@ -779,6 +782,12 @@ class _Vertical:
                       key=lambda i: (musts[i].at(am[i]), i))
         cols = sorted((j for j in range(side.F) if gf[j] > cp.ulp),
                       key=lambda j: (flexes[j].at(bf[j]), j))
+        if rows and not cols and side.F:
+            # a sliver: the flex heat, equal to the must heat up to
+            # round-off, is shared by flexes with at most `ulp` each. It
+            # is round-off per flex, not in total, so the largest flex
+            # carries it (and the balance below)
+            cols = [int(np.argmax(gf))]
         h = {i: float(hm[i]) for i in rows}
         g = {j: float(gf[j]) for j in cols}
         # the must heats are exact; round-off of the flex heats is balanced
@@ -804,7 +813,13 @@ class _Vertical:
         while True:
             q = _transport(h, g, comp, self.conts, forbid, self.tol)
             if q is None:
-                return None
+                if coarse or forbid and _transport(
+                        h, g, comp, self.conts, tol=self.tol) is not None:
+                    return None   # forbidden or used pairs removed it
+                # Theorem V': on all pairs, a transport always exists
+                raise _SplitInvariantError(
+                    f'vertical block: no transport over breakpoints '
+                    f'[{ks}, {ke}] (must heats {h!r}, flex heats {g!r})')
             nm = Counter(i for i, _ in q)
             nf = Counter(j for _, j in q)
             # avoid_recycle: a used pair returns only as a series cell
@@ -855,8 +870,8 @@ class _Vertical:
 
     def elementary(self, ks):
         """The elementary block ``[ks, ks + 1]`` with the recovery of a
-        failing cell: ``(cells, leak)``, or None if no transport exists
-        (forbidden pairs only)."""
+        failing cell: ``(cells, leak)``, or None if forbidden or used pairs
+        leave no transport."""
         while True:
             out = self.cells(ks, ks + 1, False)
             if out is None:
@@ -980,8 +995,8 @@ def _vertical_block(side, a, b, prev=(), forbid=frozenset(), used=frozenset(),
     Raises
     ------
     _SplitInvariantError
-        If the elementary block cannot be completed within round-off, or the
-        block would make no progress.
+        If the elementary block has no transport on all pairs or cannot be
+        completed within round-off, or the block would make no progress.
 
     Notes
     -----
@@ -1243,8 +1258,9 @@ class _Candidate:
         `_SPLIT_MIN_FRACTION`.
     mixbad : int
         Non-isothermal remixes followed by a process exchanger of the same
-        stream (a must's always is), plus curved streams (more than two
-        knots) with more than `_SPLIT_MIX_CAP` mixers on the side.
+        stream (a must mixes toward the pinch, a flex away from it; a
+        utility does not count), plus curved streams (more than two knots)
+        with more than `_SPLIT_MIX_CAP` mixers on the side.
     touch : int
         Exchangers parallel at the minimum approach along a segment,
         counted only on sides with a curved stream.
@@ -1296,12 +1312,17 @@ class _Candidate:
         mixers = Counter((role, s) for role, s, _ in stages)
         mixbad = 0
         for (role, s, _), br in stages.items():
-            p0, _, iso = _remix(role, br, tolQ)
+            p0, pm, iso = _remix(role, br, tolQ)
             if iso:
                 continue
+            # an exchanger of the stream after the mix (a utility is not
+            # one): a must mixes toward the pinch, at `pm`, so a cell of it
+            # below `pm`; a flex mixes at its far end, so a cell of it
+            # outside the stage beyond its split start `p0`
             inside = {id(c) for cs in br.values() for c in cs}
-            mixbad += role == 'm' or any(
-                c.j == s and id(c) not in inside and c.b > p0 for c in merged)
+            mixbad += any(id(c) not in inside and (
+                c.i == s and c.a_end <= pm + tolQ if role == 'm'
+                else c.j == s and c.b > p0) for c in merged)
         for (role, s), n in mixers.items():
             curve = (side.musts if role == 'm' else side.flexes)[s]
             mixbad += curve.n > 2 and n > _SPLIT_MIX_CAP

@@ -1260,8 +1260,9 @@ def _verify_side_cells(side, cells, a0=None, leak=None):
     """Independent check of the cells of a split side: every cell by
     `_max_duty` and by direct evaluation on the branch-scaled curves; the
     branches of every stage with one fraction each, summing to 1, contiguous
-    from the stage start; every must served exactly from `a0` (plus its
-    leak) and every flex used as a prefix."""
+    from the stage's split end (a must's far end, a flex's start); every
+    must served exactly from `a0` (plus its leak) and every flex used as a
+    prefix."""
     M, F = side.M, side.F
     a0 = [0.] * M if a0 is None else list(a0)
     leak = [0.] * M if leak is None else list(leak)
@@ -1292,21 +1293,29 @@ def _verify_side_cells(side, cells, a0=None, leak=None):
             for key, cs in items.items():
                 pos = [(c.a, c.a_end, c.f) if must else (c.b, c.b_end, c.g)
                        for c in cs]
-                start = min(p[0] for p in pos)
-                if key[0] != 'trunk':
-                    branches = {}
-                    for c, p in zip(cs, pos):
-                        branches.setdefault((c.km if must else c.kf)[-1],
-                                            []).append(p)
-                    fr = [ps[0][2] for ps in branches.values()]
-                    assert abs(math.fsum(fr) - 1.) <= 1e-12
-                    for ps in branches.values():
-                        ps.sort()
-                        assert all(p[2] == ps[0][2] for p in ps)
-                        assert abs(ps[0][0] - start) <= tolQ
-                        for p, p2 in zip(ps, ps[1:]):
-                            assert abs(p2[0] - p[1]) <= tolQ
-                spans.append((start, math.fsum(c.x for c in cs)))
+                duty = math.fsum(c.x for c in cs)
+                if key[0] == 'trunk':
+                    spans.append((pos[0][0], duty))
+                    continue
+                # a must splits at its far end and mixes toward the pinch,
+                # a flex splits at its start and mixes at its far end (as
+                # in `_remix`): the branches share the split end
+                split = (max(p[1] for p in pos) if must
+                         else min(p[0] for p in pos))
+                branches = {}
+                for c, p in zip(cs, pos):
+                    branches.setdefault((c.km if must else c.kf)[-1],
+                                        []).append(p)
+                fr = [ps[0][2] for ps in branches.values()]
+                assert abs(math.fsum(fr) - 1.) <= 1e-12
+                for ps in branches.values():
+                    ps.sort()
+                    assert all(p[2] == ps[0][2] for p in ps)
+                    assert abs((ps[-1][1] if must else ps[0][0])
+                               - split) <= tolQ
+                    for p, p2 in zip(ps, ps[1:]):
+                        assert abs(p2[0] - p[1]) <= tolQ
+                spans.append((split - duty if must else split, duty))
             spans.sort()
             end = a0[s] if must else 0.
             for start, duty in spans:   # no overlap, no gap beyond leaks
@@ -1329,6 +1338,24 @@ def verify_core(side, cand, a0):
     assert cand.leak_by_must == [0.] * side.M
     assert sum(blk.knots for blk in cand.blocks) == 0
     _verify_side_cells(side, cand.cells, a0)
+
+
+def test_verify_side_cells_anchors_stages_like_remix():
+    # a must splits at its far end and mixes toward the pinch (`_remix`):
+    # its branches share their far end (10), not their start
+    L, B = P._LevelCurve, SP._Cell
+    side = P._Side('above', [L([0., 10.], [50., 60.])],
+                   [L([0., 20.], [0., 10.])] * 2, 1e-9, 1e-9)
+    far = [B(0, 0, 3., 4., 0., .5, 1., ('B', 0, 0, 0)),
+           B(0, 1, 5., 0., 0., .5, 1., ('B', 0, 0, 1)),
+           B(0, 0, 2., 0., 3.)]
+    assert not SP._remix('m', SP._stages(far)['m', 0, ('B', 0, 0)], 1e-9)[2]
+    _verify_side_cells(side, far)
+    near = [B(0, 0, 3., 0., 0., .5, 1., ('B', 0, 0, 0)),
+            B(0, 1, 5., 0., 0., .5, 1., ('B', 0, 0, 1)),
+            B(0, 0, 2., 8., 3.)]
+    with pytest.raises(AssertionError):
+        _verify_side_cells(side, near)
 
 
 def core_sides(rng):
@@ -1522,6 +1549,59 @@ def test_vertical_block_forbid_and_used(monkeypatch):
             _verify_side_cells(s, cand.cells)
 
 
+def test_vertical_block_on_a_round_off_sliver(monkeypatch):
+    # must 1 starts o ulp above must 0, so the first interval holds o ulp
+    # of must heat, shared by two flexes with at most one ulp each: the
+    # flex heat is round-off, yet it still needs a column
+    monkeypatch.setattr(SP, '_SPLIT_COARSEN', False)
+    L = P._LevelCurve
+    u = 20. * SP._SPLIT_ULP
+    for o in (1.2, 1.5, 1.9, 2.5, 3.5):
+        side = P._Side('above', [L([0., 10.], [0., 10.]),
+                                 L([0., 10. - o * u], [o * u, 10.])],
+                       [L([0., 10.], [0., 10.])] * 2, 1e-9, 1e-9)
+        cp = SP._Coupling(side, [0., 0.], [0., 0.])
+        assert cp.Pm[1, 0] > cp.ulp and cp.Pm[1, 1] == 0.
+        assert (o >= 2.) == (cp.Pf[1] > cp.ulp).all()
+        verify_core(side, SP._drive(side, [0., 0.], 'V'), [0., 0.])
+    # a vertical block with no transport is None only when forbidden or
+    # used pairs removed the transport; otherwise it is a failed invariant
+    side = one_to_one_side()
+    monkeypatch.setattr(SP, '_transport', lambda *args, **kw: None)
+    with pytest.raises(SP._SplitInvariantError, match='no transport'):
+        SP._vertical_block(side, [0.], [0.])
+
+
+def test_coarsened_block_keeps_the_minimum_fraction(monkeypatch):
+    # flex 1 carries 0.005 of heat parallel to flex 0 up to level 10, so
+    # every block over that range sends must 0 to flex 1 with a fraction
+    # near 5e-4 < _SPLIT_MIN_FRACTION. The block to X verifies cell by cell
+    # but is rejected for that fraction: elementary blocks cover the range
+    # and one coarsened block the rest
+    monkeypatch.setattr(SP, '_SPLIT_COARSEN', True)
+    L = P._LevelCurve
+    lv = [float(x) for x in range(0, 21, 2)]
+    side = P._Side('above', [L([0., 20.005], [1., 21.])],
+                   [L(lv, lv), L([0., .005], [0., 10.])], 1e-9, 1e-9)
+    cp = SP._Coupling(side, [0.], [0., 0.])
+    tiny = lambda blk: min(min(c.f, c.g) for c in blk.cells)
+    cand = SP._drive(side, [0.], 'V')
+    verify_core(side, cand, [0.])
+    *low, top = cand.blocks
+    assert len(low) == int(np.searchsorted(cp.t, 10.005 - 1e-9))
+    for blk in low:
+        assert blk.span == 1 and {c.j for c in blk.cells} == {0, 1}
+        assert tiny(blk) < SP._SPLIT_MIN_FRACTION
+    assert top.span > 1 and top.end[0] == side.Qm
+    assert {c.j for c in top.cells} == {0} and tiny(top) == 1.
+    # without the minimum fraction, the block to X is taken
+    monkeypatch.setattr(SP, '_SPLIT_MIN_FRACTION', 0.)
+    cand = SP._drive(side, [0.], 'V')
+    verify_core(side, cand, [0.])
+    assert [blk.span for blk in cand.blocks] == [cp.K]
+    assert tiny(cand.blocks[0]) < 1e-3
+
+
 def key_side(curved=False):
     musts = [P._LevelCurve([0., 10.], [50., 60.]) for _ in range(2)]
     flexes = [P._LevelCurve([0., 20.], [0., 10.]) for _ in range(2)]
@@ -1577,6 +1657,12 @@ def test_candidate_key_and_signature():
            B(1, 0, 2., 0., 0., 1., .5, None, ('B', 0, 0, 1)),
            B(0, 0, 1., 2., 4.)]
     assert cand(iso).mixbad == 0
+    # a must splits at its far end (10) and mixes toward the pinch (2):
+    # bad only if an exchanger of that must follows the mix
+    remix = [B(0, 0, 3., 4., 0., .5, 1., ('B', 0, 0, 0), None),
+             B(0, 1, 5., 0., 0., .5, 1., ('B', 0, 0, 1), None)]
+    assert cand(remix).mixbad == 0   # feeds only the must's utility
+    assert cand(remix + [B(0, 0, 2., 0., 3.)]).mixbad == 1
     # touch counts only on a side with a curved stream
     par = [B(0, 0, 5., 0., 0., .5, .5)]   # parallel at the minimum approach
     side = P._Side('above', [P._LevelCurve([0., 20.], [0., 10.])],
