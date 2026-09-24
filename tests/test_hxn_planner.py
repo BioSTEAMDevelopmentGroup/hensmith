@@ -1278,7 +1278,13 @@ def _verify_side_cells(side, cells, a0=None, leak=None):
         bm = SP._branch_curve(cm, c.f, 'must')
         bf = SP._branch_curve(cf, c.g, 'flex')
         am, bb = c.f * c.a, c.g * c.b
-        assert P._max_duty(bm, am, bf, bb, c.x, tolP) >= c.x - tolQ
+        # (C) by _max_duty against the flex lowered by tolP: its linear
+        # case stops at the zero crossing of the approach, which is
+        # ill-conditioned when a near-parallel cell closes to 0 (a relative
+        # slope difference just above _SLOPE_EQ moves the crossing far more
+        # than tolQ per ulp of level)
+        low = P._LevelCurve(bf.q, [y - tolP for y in bf.y], role='flex')
+        assert P._max_duty(bm, am, low, bb, c.x, 0.) >= c.x - tolQ
         ts = np.concatenate(([0., c.x], bm.qa - am, bf.qa - bb))
         ts = ts[(ts >= 0.) & (ts <= c.x)]
         assert (bm.at_many(am + ts) - bf.at_many(bb + ts)).min() >= -tolP
@@ -2035,7 +2041,8 @@ def test_exhausted_schedule_splits(monkeypatch):
     assert infos
     for name, sp in infos.items():
         s = net['plan'].info['sides'][name]
-        assert s['proof'] is None and s['method'] == 'split-V'
+        assert s['proof'] is None and s['method'] in {
+            'split-' + n for n in SP._CORE_STRATEGIES}
         # the best effort's work is counted once
         assert s['work'] > off['plan'].info['sides'][name]['work']
 
@@ -2091,10 +2098,18 @@ def test_split_exclusion_by_signature(monkeypatch):
                  _split_exclude={name: {sp['signature']}})
     assert pr['signature'] == sp2['signature']
     assert pr['candidates'][sp['candidate']] == 'excluded'
-    # the core alone (Stage S off): one core candidate; excluding its
-    # signature still returns it (a side's last candidate is never
-    # excluded)
+    # the core alone (Stage S off), its four strategies: LV and LVT build
+    # one network here, so excluding the pick excludes both
     monkeypatch.setattr(SP, '_SPLIT_RULES', ())
+    name, sp = plan()
+    assert set(sp['candidates']) == set(SP._CORE_STRATEGIES)
+    assert sp['candidate'] == 'LV'
+    _, sp2 = plan(_split_exclude={name: {sp['signature']}})
+    assert sp2['candidates']['LV'] == sp2['candidates']['LVT'] == 'excluded'
+    assert sp2['candidate'] == 'VT' and sp2['signature'] != sp['signature']
+    # one core candidate: excluding its signature still returns it (a
+    # side's last candidate is never excluded)
+    monkeypatch.setattr(SP, '_CORE_STRATEGIES', ('V',))
     name, sp = plan()
     sig = sp['signature']
     name2, sp2 = plan(_split_exclude={name: {sig}})
@@ -2551,7 +2566,7 @@ def test_stage_s_budget(monkeypatch):
     assert net['status'] == 'mer'
     check_split_network(streams, dT, net)
     (_, sp), = split_infos(net['plan']).items()
-    assert sp['candidate'] == 'V'
+    assert sp['candidate'] in SP._CORE_STRATEGIES
     reasons = [sp['candidates'][n] for n in S_NAMES]
     assert 'budget' in reasons
     assert set(reasons) <= {'budget', 'no split', 'same split'}
@@ -2652,3 +2667,236 @@ def test_stage_s_unit_bound_and_improvement(monkeypatch):
             pieces, 0.))
         b0, _ = best('7sp3_dt20F', 'above')
     assert (b0.key()[3], b.key()[3]) == (8, 7) and b.name == b0.name
+
+
+# %% 20. Core pinch blocks and DFS tails (hensmith._splitting)
+
+def test_search_b0_default_is_identical(monkeypatch):
+    # _Search gains the flex frontiers b0 (and _improve_units/_units_guard
+    # pass a0 and b0 through): at the default every search is today's,
+    # and from a mid-plan node (a, b) the search plans the rest from there
+    rng = random.Random(71)
+    n_mid = 0
+    for k in range(40):
+        rows, dT = pinch_problem(rng) if k % 2 else random_problem(rng)
+        for side in sides_from(rows, dT).values():
+            if not (side.M and side.F):
+                continue
+            z_f = [0.] * side.F
+            runs = [P._Search(side, 'restricted', 3, False, 3000., **kw).run()
+                    for kw in ({}, dict(b0=None), dict(b0=z_f))]
+            assert runs[0] == runs[1] == runs[2] and z_f == [0.] * side.F
+            pieces = runs[0]
+            if not pieces:
+                continue
+            args = (side, pieces, 100., False, frozenset(), 1.)
+            assert (P._improve_units(*args) == P._improve_units(
+                *args, a0=None, b0=None))
+            # the node after the first piece
+            i, j, _, _, x = pieces[0]
+            a, b = [0.] * side.M, list(z_f)
+            a[i], b[j] = min(x, side.Qm[i]), min(x, side.Qf[j])
+            rest = P._Search(side, 'full', None, True, 3000., a0=a,
+                             b0=b).run()
+            if rest is None:
+                continue
+            n_mid += 1
+            front = list(b)
+            for i2, j2, a2, b2, x2 in rest:   # every flex a prefix from b
+                assert b2 == front[j2] and x2 > 0.
+                front[j2] = min(b2 + x2, side.Qf[j2])
+            for i2 in range(side.M):   # every must served from a
+                duty = math.fsum(p[4] for p in rest if p[0] == i2)
+                assert abs(a[i2] + duty - side.Qm[i2]) <= side.tolQ
+    assert n_mid >= 20
+    # the unit searches start from (a0, b0)
+    seen = []
+
+    class Spy(P._Search):
+        def __init__(self, *args, **kw):
+            seen.append((kw.get('a0'), kw.get('b0')))
+            super().__init__(*args, **kw)
+    monkeypatch.setattr(P, '_Search', Spy)
+    monkeypatch.setattr(P, '_GUARD_FACTOR', 0)   # run the guard
+    a, b = [1.] * side.M, [2.] * side.F
+    P._improve_units(side, pieces, 100., False, frozenset(), 1., a0=a, b0=b)
+    P._units_guard(side, pieces, False, frozenset(), 1., a0=a, b0=b)
+    assert seen and all(s == (a, b) for s in seen)
+
+
+def pinch_side(m2, cp_flex, Q_flex):
+    """A side 'above' (tolerances 1e-9): musts m0 and m1 (CP 1, levels 0 to
+    10) at the tight root level 0, a third must `m2` = (heat, lowest level,
+    highest level) above it, and one flex over levels 0 to `Q_flex/cp_flex`.
+    The rules fail outward at level 0 (two musts, one flex)."""
+    L = P._LevelCurve
+    Q2, lo, hi = m2
+    return P._Side('above', [L([0., 10.], [0., 10.], 0),
+                             L([0., 10.], [0., 10.], 1),
+                             L([0., Q2], [lo, hi], 2)],
+                   [L([0., Q_flex], [0., Q_flex / cp_flex], 3)], 1e-9, 1e-9)
+
+
+def check_pinch_block(side, blk, a, b):
+    """A pinch block from (a, b): exact cells, isothermal must branches,
+    CP-based flex fractions (each branch of CP at least its must branch's),
+    and (R) at its end node within `_SPLIT_R_TOL tolQ`."""
+    lim = -SP._SPLIT_R_TOL * side.tolQ
+    assert blk.kind == 'pinch' and blk.start == (a, b)
+    v = side.rules_violation(a, b, side.analyse(a, b))
+    assert v['rule'] == 'outward'
+    dem, cap = map(dict, SP._cut_sets(side, a, b, v['level'], v['cut'],
+                                      'outward'))
+    a2, b2 = blk.end
+    assert SP._exact(side).analyse(a2, b2).slack >= lim
+    assert residual_slack(side, a2, b2) >= lim
+    # tick-off: a must ends exactly at its end or more than tolQ short
+    assert all(x == q or x < q - side.tolQ for x, q in zip(a2, side.Qm))
+    fg = Counter()
+    for c in blk.cells:
+        assert c.a == a[c.i] and c.b == b[c.j] and c.x > 0.
+        assert SP._cell_margin(side, c)[0] >= -side.tolP
+        assert abs(c.a_end - a2[c.i]) <= side.tolQ   # isothermal
+        assert c.g * cap[c.j] >= c.f * dem[c.i] * (1. - 1e-12)
+        fg['m', c.i] += c.f
+        fg['f', c.j] += c.g
+    assert all(abs(s - 1.) <= 1e-12 for s in fg.values())
+    for j in range(side.F):
+        duty = math.fsum(c.x for c in blk.cells if c.j == j)
+        assert abs(b[j] + duty - b2[j]) <= side.tolQ
+
+
+TICK_OFF = (10., [  # H1 splits 0.7/0.3 and (f 400)/f rounds to 400 - 6e-14:
+    # without the tick-off, H1 would stop 6e-14 short of its end
+    ('H1', 'h', 200, 100, 4.), ('C1', 'c', 90, 190, 3.5),
+    ('C2', 'c', 90, 190, 1.5)])
+
+
+def test_pinch_block_acceptance():
+    lim = -SP._SPLIT_R_TOL * 1e-9
+    # the number rule (two hot, one cold) and the CP rule (one hot, two
+    # cold): lambda = 1 and every must ticks off, exactly
+    for dT, rows in (TWO_HOT_ONE_COLD, ONE_HOT_TWO_COLD, TICK_OFF):
+        side = sides_from(rows, dT)['above']
+        z_m, z_f = [0.] * side.M, [0.] * side.F
+        blk = SP._pinch_block(side, z_m, z_f)
+        check_pinch_block(side, blk, z_m, z_f)
+        assert blk.end[0] == side.Qm   # tick-off: exactly the must ends
+        assert len(blk.cells) == 2 and blk.leak == {}
+        assert SP._pinch_block(side, z_m, z_f, forbid={(0, 0)}) is None
+        assert SP._pinch_block(side, z_m, z_f, used={(0, 0)}) is None
+        # no pinch block where the rules do not fail outward
+        assert SP._pinch_block(side, z_m, z_f, viol=dict(
+            rule='inward', level=0., cut='+')) is None
+    # lambda < 1: at lambda = 1 the flex heat left above level 40/7 misses
+    # m2 (levels 5 to 7), so (R) fails; the largest lambda is 0.875
+    side = pinch_side((5., 5., 7.), 3.5, 70.)
+    z_m, z_f = [0.] * 3, [0.]
+    assert SP._exact(side).analyse([10., 10., 0.], [20.]).slack < lim
+    blk = SP._pinch_block(side, z_m, z_f)
+    check_pinch_block(side, blk, z_m, z_f)
+    lam = blk.end[0][0] / 10.
+    assert blk.end[0][1] == blk.end[0][0] and blk.end[0][2] == 0.
+    assert abs(lam - 0.875) <= 1e-8
+    assert [(c.f, c.g) for c in blk.cells] == [(1., .5), (1., .5)]
+    # below _SPLIT_LAMBDA_MIN: m2 starts 1e-6 above the cut, so any lambda
+    # above 2.5e-7 strands it; no block, and LV falls back to V there
+    side = pinch_side((5., 1e-6, 2.), 5., 100.)
+    assert side.rules_violation(z_m, z_f, side.analyse(z_m, z_f))[
+        'rule'] == 'outward'
+    assert SP._pinch_block(side, z_m, z_f) is None
+    cand = SP._drive(side, z_m, 'LV')
+    verify_core(side, cand, z_m)
+    assert {blk.kind for blk in cand.blocks} == {'vertical'}
+
+
+def test_tail_sweeps_the_residual():
+    # the DFS closes must 0 on flex 0, which is 5e-10 (tolQ/2) short: the
+    # tail sweeps the residual into the cell, so the must is served exactly
+    L = P._LevelCurve
+    side = P._Side('above', [L([0., 10.], [0., 10.], 0)],
+                   [L([0., 10. - 5e-10], [0., 5.], 1),
+                    L([0., 10.], [5., 15.], 2)], 1e-9, 1e-9)
+    blk, work = SP._tail(side, [0.], [0., 0.])
+    assert work > 0. and blk.kind == 'tail' and blk.start == ([0.], [0., 0.])
+    (c,) = blk.cells
+    assert (c.i, c.j, c.x, c.a, c.b, c.f, c.g) == (0, 0, 10., 0., 0., 1., 1.)
+    assert SP._cell_margin(side, c)[0] >= 0.
+    assert blk.end == ([10.], [10. - 5e-10, 0.])
+    # a tail from a node where the search fails returns None
+    blk, work = SP._tail(side, [0.], [10. - 5e-10, 0.])
+    assert blk is None and work > 0.
+
+
+CLEAN_PRELEAK = (10., [  # C1 ends 5e-8 K above H1 (12.5 tolQ): _cascade sets
+    # Qh = 0, the rules fail at the root and hold at the pre-leaked root
+    ('H1', 'h', 200, 100, 1.), ('H2', 'h', 150, 100, 2.),
+    ('C1', 'c', 90, 190 + 5e-8, 1.), ('C2', 'c', 90, 140, 2.)])
+
+
+def core_problem_sides():
+    """Split sides of the SPLIT dict, the merged-breakpoint case, five
+    constant-CP corpus cases and the near-threshold, near-double-pinch and
+    clean pre-leaked cases (pre-leaked roots)."""
+    sides = split_sides()
+    for name in ('8sp1_dt20F', 'smith2005_exr18_5_nine_stream',
+                 'crude_fractionation_ph11c2', 'fs_22sp_ph',
+                 'cgm_unbalanced10'):
+        dT, rows = corpus_problem(name)
+        sides += [s for s in sides_from(rows, dT).values() if s.M and s.F]
+    for dT, rows in (NEAR_THRESHOLD, NEAR_DOUBLE_PINCH, CLEAN_PRELEAK):
+        sides += [s for s in sides_from(rows, dT).values() if s.M and s.F]
+    return sides
+
+
+def test_core_strategies_reach_mer():
+    # every core strategy is MER and exact from the pre-leaked root: pinch
+    # blocks (L) only where the rules fail outward, at most M + F of them;
+    # a DFS tail (T) only at a rule-clean node other than the unleaked
+    # root, and always last
+    rng = random.Random(72)
+    sides = core_problem_sides() + core_sides(rng)[::6]
+    size = Counter()
+    n_pinch = n_tail = n_part = n_root_tail = 0
+    for side in sides:
+        delta, a0 = SP._preleak_root(side)
+        if delta > SP._preleak_max(side):
+            continue
+        cands = {}
+        for strategy in SP._CORE_STRATEGIES:
+            cand = cands[strategy] = SP._drive(side, a0, strategy)
+            verify_core(side, cand, a0)
+            assert cand.name == strategy and cand.meta['leak'] == 0.
+            kinds = [blk.kind for blk in cand.blocks]
+            assert 'pinch' not in kinds or 'L' in strategy
+            assert 'tail' not in kinds[:-1]
+            assert 'tail' not in kinds or 'T' in strategy
+            assert kinds.count('pinch') <= side.M + side.F
+            for blk in cand.blocks:
+                a, b = blk.start
+                v = side.rules_violation(a, b, side.analyse(a, b))
+                if blk.kind == 'pinch':
+                    check_pinch_block(side, blk, a, b)
+                    # a must that stops short of its end
+                    n_part += any(0. < x - a0x < q - a0x - side.tolQ
+                                 for x, a0x, q in zip(blk.end[0], a,
+                                                      side.Qm))
+                elif blk.kind == 'tail':
+                    assert v is None and (blk is not cand.blocks[0]
+                                          or any(a0))
+                    assert all(c.f == c.g == 1. and c.km is c.kf is None
+                               for c in blk.cells)
+                    n_root_tail += blk is cand.blocks[0]
+            n_pinch += 'pinch' in kinds
+            n_tail += 'tail' in kinds
+        for s, c in cands.items():
+            size[s] += c.key()[3]
+        # where no strategy builds a pinch block or a tail, all are V
+        if all(blk.kind == 'vertical' for c in cands.values()
+               for blk in c.blocks):
+            assert len({c.signature for c in cands.values()}) == 1
+    assert n_pinch >= 20 and n_tail >= 20 and n_part >= 10
+    assert n_root_tail >= 1
+    # pinch blocks and tails shrink the networks (units + extra branches
+    # + split stages, summed over the sides)
+    assert size['LVT'] < size['LV'] < size['V'] and size['VT'] < size['V']

@@ -159,6 +159,19 @@ leaked to the must's utility if at most ``_SPLIT_R_TOL tolQ``, and recorded
 (a leak event, ``1e-14`` of the scale, is 100 times inside the planner's
 ``1e-12`` heat closure); anything larger raises `_SplitInvariantError`.
 
+**Strategies.** The driver (`_drive`) builds one candidate per strategy of
+`_CORE_STRATEGIES`. 'V' chains vertical blocks. 'L' adds pinch blocks
+(`_pinch_block`) where the rules fail outward: Linnhoff and Hindmarsh's
+pinch split of the cut (the 'mincell' CP transport). Each must advances by
+one extent on all of its branches, the largest its cells allow, and the
+block is scaled back by the largest lambda (bisected) whose end node
+satisfies (R), by the same exact check as every node. 'T' completes the
+side with a DFS tail (`_tail`) from a node where the rules hold: the
+planner's own search from ``(a, b)`` at a fraction of its budgets, its
+must residuals swept as in Stage S. A tail never yields a node, so every
+node of a core candidate is the pre-leaked root, a vertical block's
+closed-form end or a pinch block's accepted end.
+
 Candidates
 ----------
 A candidate (:class:`_Candidate`) is one verified split plan of a side. Its
@@ -191,8 +204,8 @@ import numpy as np
 
 from ._planner import (Exchanger, _APPROACH_TOL, _LevelCurve, _REL_Q,
                        _SCHEDULE, _Search, _Side, _SidePlan, _THRESHOLD_TOL,
-                       _WORK_EVENT, _combine_cap, _improve_units, _merge,
-                       _units_guard)
+                       _WORK_EVENT, _combine_cap, _improve_units, _max_duty,
+                       _merge, _units_guard)
 
 __all__ = ()
 
@@ -203,11 +216,15 @@ _SPLIT_COARSEN = True        # False: elementary vertical blocks only
 _SPLIT_MIX_CAP = 2           # mixers per curved stream and side (the key)
 _ISO_TOL = 10.               # isothermal remix, x tolQ
 _CORE_ORDER = ('V', 'LV', 'VT', 'LVT')   # candidate order of the core
-_CORE_STRATEGIES = ('V',)    # the core strategies `_drive` runs
+_CORE_STRATEGIES = _CORE_ORDER   # the core strategies `_drive` runs
+_SPLIT_BISECT = 30           # pinch block: bisection steps on lambda
+_SPLIT_LAMBDA_MIN = 1e-3     # pinch block: smallest lambda accepted
+_SPLIT_TAIL_WORK = 0.2       # core tail: share of the search budgets
+_SPLIT_TAIL_TRIES = 3        # core tails per strategy
 _SPLIT_RULES = ('partner', 'demand', 'mincell', 'nw-rho-desc', 'nw-rho-asc',
                 'nw-exact-desc', 'nw-exact-asc')   # Stage S, in order
 _SPLIT_CUTS = 3              # cuts per Stage S rule (double pinches)
-_SPLIT_PASSES = 3            # Stage S: the first `_SCHEDULE` passes
+_SPLIT_PASSES = 3            # Stage S and tails: first `_SCHEDULE` passes
 _SPLIT_S_WORK = 30000.       # Stage S: work of all rules on a side
 _SPLIT_FIRST_WINS = False    # True: the first live candidate wins (runtime)
 _MINCELL_WORK = 20000        # search nodes of one 'mincell' transport
@@ -759,8 +776,9 @@ class _Block:
 
     Parameters
     ----------
-    kind : {'vertical', 'pinch'}
-        How the block was built.
+    kind : {'vertical', 'pinch', 'tail'}
+        How the block was built (`_vertical_block`, `_pinch_block`,
+        `_tail`).
     start, end : tuple[list[float], list[float]]
         The nodes ``(a, b)`` before and after the block; `end` holds the
         coupling's closed-form positions (never start plus sums).
@@ -1086,6 +1104,222 @@ def _vertical_block(side, a, b, prev=(), forbid=frozenset(), used=frozenset(),
                   cells, cp, ke, ke - ks, leak, v.knots, v.work)
 
 
+def _pinch_block(side, a, b, forbid=frozenset(), used=frozenset(),
+                 viol=None):
+    """
+    A pinch block from node ``(a, b)`` (design 2.4.4): Linnhoff and
+    Hindmarsh's pinch split at an outward violation of the rules, as one
+    block of the core.
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    a, b : sequence[float]
+        The node; it satisfies (R).
+    forbid : collection[tuple[int, int]], optional
+        Pairs never used.
+    used : collection[tuple[int, int]], optional
+        Pairs of earlier blocks (avoid_recycle), not used again.
+    viol : dict, optional
+        ``side.rules_violation`` at the node (on the search's analysis), if
+        already computed.
+
+    Returns
+    -------
+    _Block or None
+        None if the rules do not fail outward at the node, a demand at the
+        cut is flat, no transport serves the cut with every pair allowed
+        and every demand moving by more than ``tolQ``, or no lambda of at
+        least `_SPLIT_LAMBDA_MIN` is accepted.
+
+    Notes
+    -----
+    At the violating cut (`_cut_sets`) the CP transport is 'mincell', else
+    'nw-rho-desc' (`_cut_transport`). A cell ``(i, j, load)`` is a branch
+    of must ``i`` of fraction ``f = load / m_i`` facing a branch of flex
+    ``j`` of fraction ``g = load / sum load_j`` (`_cut_fractions`), so the
+    flex branch's CP is at least the must branch's. Every cell starts at
+    the node. Must ``i`` advances by one extent ``h_i`` on all of its
+    branches, so its remix is isothermal: the smallest over its cells of
+    ``x_max / f``, with ``x_max`` the planner's `_max_duty` on the
+    branch-scaled curves (Lemma B), capped by the must's residual and the
+    flex branch's room ``g (Qf_j - b_j)``. A must within ``tolQ`` of its
+    end ticks off: ``h_i`` is its residual exactly, its last cell takes
+    the residual less its other cells, and its node is its end. The flex
+    branches end at different positions: a non-isothermal remix, which
+    the key counts if the flex has a later exchanger.
+
+    The block is accepted at lambda = 1, else at the largest lambda found
+    by `_SPLIT_BISECT` bisection steps, with the cells scaled to ``lambda
+    f h_i``, if every cell passes (C) (`_cell_margin`) and the end node,
+    in parent coordinates (a split leaves the composites unchanged, Lemma
+    R), satisfies (R) within ``_SPLIT_R_TOL tolQ`` by an exact analysis
+    (`_exact`, as the driver checks its nodes). Every accepted lambda is
+    checked, so nothing depends on monotonicity in lambda.
+    """
+    a = [float(x) for x in a]
+    b = [float(x) for x in b]
+    if viol is None:
+        viol = side.rules_violation(a, b, side.analyse(a, b))
+    if viol is None or viol['rule'] != 'outward':
+        return None
+    sets = _cut_sets(side, a, b, viol['level'], viol['cut'], 'outward')
+    if sets is None:
+        return None
+    tolQ, tolP = side.tolQ, side.tolP
+    Qm, Qf = side.Qm, side.Qf
+    ex = _exact(side)
+    lim = -_SPLIT_R_TOL * tolQ
+    no = frozenset(forbid) | frozenset(used)
+    work = 0.
+
+    def extents(rows):
+        # h_i (tick-offs exact) or None if a demand cannot move
+        nonlocal work
+        h, tick = {}, {}
+        for i, cs in rows.items():
+            cm, rem = side.musts[i], Qm[i] - a[i]
+            hi = rem
+            for j, f, g in cs:
+                cf = side.flexes[j]
+                bm = cm if f == 1. else _branch_curve(cm, f, 'must')
+                bf = cf if g == 1. else _branch_curve(cf, g, 'flex')
+                work += _WORK_EVENT
+                x = _max_duty(bm, f * a[i], bf, g * b[j],
+                              min(f * rem, g * (Qf[j] - b[j])), tolP)
+                hi = min(hi, x / f)
+            if not hi > tolQ:
+                return None
+            tick[i] = hi >= rem - tolQ
+            h[i] = rem if tick[i] else hi
+        return h, tick
+
+    def at(rows, h, tick, lam):
+        # the cells and end node at `lam`, or None if not accepted
+        nonlocal work
+        cells, a2, b2 = [], list(a), list(b)
+        for i, cs in rows.items():
+            if lam == 1. and tick[i]:
+                xs = [f * h[i] for _, f, _ in cs]
+                xs[-1] = h[i] - math.fsum(xs[:-1])
+                a2[i] = Qm[i]
+            else:
+                t = lam * h[i]
+                xs = [f * t for _, f, _ in cs]
+                a2[i] = min(a[i] + t, Qm[i])
+            cells += [_Cell(i, j, x, a[i], b[j], f, g)
+                      for (j, f, g), x in zip(cs, xs)]
+        for j in {c.j for c in cells}:
+            b2[j] = min(b[j] + math.fsum(c.x for c in cells if c.j == j),
+                        Qf[j])
+        work += 1. + _WORK_EVENT * len(cells)
+        if not all(c.x > 0. and _cell_margin(side, c)[0] >= -tolP
+                   for c in cells):
+            return None
+        if not ex.analyse(a2, b2).slack >= lim:
+            return None
+        return cells, a2, b2
+    tried = []
+    for rule in ('mincell', 'nw-rho-desc'):
+        loads = _cut_transport(*sets, rule)
+        if not loads or loads in tried:
+            continue
+        tried.append(loads)
+        if any((i, j) in no for i, j, _ in loads):
+            continue
+        rows = defaultdict(list)   # must -> [(flex, f, g)], in order
+        for (i, j, _), (f, g) in zip(loads, _cut_fractions(loads)):
+            rows[i].append((j, f, g))
+        ext = extents(rows)
+        if ext is None:
+            continue
+        res = at(rows, *ext, 1.)
+        if res is None:
+            lo, hi = 0., 1.
+            for _ in range(_SPLIT_BISECT):
+                mid = 0.5 * (lo + hi)
+                r = at(rows, *ext, mid)
+                if r is None:
+                    hi = mid
+                else:
+                    lo, res = mid, r
+            if res is None or lo < _SPLIT_LAMBDA_MIN:
+                continue
+        cells, a2, b2 = res
+        return _Block('pinch', (a, b), (a2, b2), cells, work=work)
+    return None
+
+
+def _tail(side, a, b, cap1=False, forbid=frozenset(), work_scale=1.):
+    """
+    A DFS tail from core node ``(a, b)`` (design 2.4.5): the planner's
+    unsplit search completes the side from there.
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    a, b : sequence[float]
+        The node: it satisfies (R) and the pinch rules.
+    cap1 : bool, optional
+        avoid_recycle: every pair in at most one exchanger.
+    forbid : collection[tuple[int, int]], optional
+        Pairs never used (with `cap1`, also those of the earlier blocks).
+    work_scale : float, optional
+        Scale of the search budgets.
+
+    Returns
+    -------
+    block : _Block or None
+        The tail as the candidate's last block (kind 'tail', unsplit cells,
+        ending with every must at its end), or None.
+    work : float
+        Work spent.
+
+    Notes
+    -----
+    As `_plan_side`, but from ``(a, b)`` and at `_SPLIT_TAIL_WORK` of the
+    budgets: the first `_SPLIT_PASSES` passes of `_SCHEDULE`, then
+    `_improve_units` and `_units_guard` on the first success. The DFS
+    completes a must within ``tolQ``; its residual is swept into its
+    far-end cell as in Stage S (`_s_cells`, with every item a trunk), so
+    every must is served exactly, or the tail is rejected. A tail returns
+    a complete plan or nothing, never a node.
+    """
+    a, b = [float(x) for x in a], [float(x) for x in b]
+    forbid = frozenset(forbid)
+    scale = _SPLIT_TAIL_WORK * work_scale
+    work, seen, pieces = 0., set(), None
+    for mode, cap, extra, budget in _SCHEDULE[:_SPLIT_PASSES]:
+        cap = _combine_cap(cap, cap1)
+        if (mode, cap, extra) in seen:
+            continue
+        seen.add((mode, cap, extra))
+        srch = _Search(side, mode, cap, extra, budget * scale, forbid=forbid,
+                       a0=a, b0=b)
+        pieces = srch.run()
+        work += srch.work
+        if pieces is not None:
+            break
+    if pieces is None:
+        return None, work
+    pieces, w = _improve_units(side, pieces, work, cap1, forbid, scale,
+                               a0=a, b0=b)
+    work += w
+    pieces, w = _units_guard(side, pieces, cap1, forbid, scale, a0=a, b0=b)
+    work += w
+    items = ([('must', i, 1., None) for i in range(side.M)]
+             + [('flex', j, 1., None) for j in range(side.F)])
+    cells, _ = _s_cells(side, items, a, pieces)
+    if cells is None:
+        return None, work
+    b2 = [min(b[j] + math.fsum(c.x for c in cells if c.j == j), side.Qf[j])
+          for j in range(side.F)]
+    return _Block('tail', (a, b), (list(side.Qm), b2), cells,
+                  work=work), work
+
+
 def _key_block(blk, n):
     """Stage keys ``('B', n, stream, branch)`` of the streams split in core
     block `n` (a stream with one cell in the block is a trunk: None)."""
@@ -1139,6 +1373,15 @@ def _drive(side, a0, strategy, cap1=False, forbid=frozenset(), work_scale=1.,
     'V' is the chain of vertical blocks. Each node is the closed-form end
     of the previous block, so (R) is inherited (Theorem V', Corollary C)
     and round-off does not accumulate; it is checked anyway, exactly.
+
+    'L' adds pinch blocks (`_pinch_block`) at nodes where the pinch rules
+    fail outward, at most ``M + F`` of them; a vertical block serves every
+    node without one. A pinch block ends at a node accepted by the same
+    exact check. 'T' tries a DFS tail (`_tail`) at nodes where the rules
+    hold, other than the unleaked root (where the unsplit search already
+    failed; a pre-leaked root qualifies), at most `_SPLIT_TAIL_TRIES`
+    times; a tail that succeeds completes the candidate as its last block.
+    The rules are checked on the search's analysis, as the DFS sees them.
     """
     if strategy not in _CORE_STRATEGIES:
         raise ValueError(f'core strategy {strategy!r} is not available')
@@ -1146,13 +1389,33 @@ def _drive(side, a0, strategy, cap1=False, forbid=frozenset(), work_scale=1.,
     lim = -_SPLIT_R_TOL * side.tolQ
     a, b = [float(x) for x in a0], [0.] * side.F
     blocks, used, leak = [], set(), [0.] * side.M
+    pinch, tail = 'L' in strategy, 'T' in strategy
+    n_pinch = tries = 0
+    lost = 0.   # work of the failed tails
     while any(x < q for x, q in zip(a, side.Qm)):
         d = ex.analyse(a, b)
         if d.slack < lim:
             raise _SplitInvariantError(
                 f'{strategy}: core node (R): slack {d.slack!r} after '
                 f'{len(blocks)} blocks')
-        blk = _vertical_block(side, a, b, blocks[-1:], forbid, used, d)
+        viol = (side.rules_violation(a, b, side.analyse(a, b))
+                if pinch or tail else None)
+        if (tail and viol is None and (blocks or any(a0))
+                and tries < _SPLIT_TAIL_TRIES):
+            tries += 1
+            blk, w = _tail(side, a, b, cap1, frozenset(forbid) | used,
+                           work_scale)
+            if blk is not None:
+                blocks.append(blk)
+                break
+            lost += w
+        blk = None
+        if (pinch and viol is not None and viol['rule'] == 'outward'
+                and n_pinch < side.M + side.F):
+            blk = _pinch_block(side, a, b, forbid, used, viol)
+            n_pinch += blk is not None
+        if blk is None:
+            blk = _vertical_block(side, a, b, blocks[-1:], forbid, used, d)
         if blk is None:
             return None
         _key_block(blk, len(blocks))
@@ -1164,7 +1427,8 @@ def _drive(side, a0, strategy, cap1=False, forbid=frozenset(), work_scale=1.,
             leak[i] += x
     return _Candidate(strategy, (1, _CORE_ORDER.index(strategy)), side, a0,
                       [c for blk in blocks for c in blk.cells], leak,
-                      math.fsum(blk.work for blk in blocks), Qmin, blocks)
+                      math.fsum(blk.work for blk in blocks) + lost, Qmin,
+                      blocks)
 
 
 # %% Candidates

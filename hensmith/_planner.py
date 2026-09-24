@@ -967,11 +967,14 @@ class _Search:
         (i, j) pairs that may not be used.
     a0 : list[float], optional
         Initial must frontiers (gaps at the pinch end; best effort).
+    b0 : list[float], optional
+        Initial flex frontiers (default: the pinch). With `a0`, a node of
+        a stream-splitting core candidate that the search completes.
     """
 
     def __init__(self, side, mode='restricted', cap=None, extra=False,
                  budget=1000., unit_bound=math.inf, min_piece=None,
-                 forbid=frozenset(), a0=None):
+                 forbid=frozenset(), a0=None, b0=None):
         self.side = side
         self.mode = mode
         self.cap = cap
@@ -981,6 +984,7 @@ class _Search:
         self.min_piece = min_piece
         self.forbid = forbid
         self.a0 = a0
+        self.b0 = b0
         self.work = 0.
         self.exhausted = False
         self.failed = {}
@@ -990,7 +994,7 @@ class _Search:
         """Return the pieces ``(i, j, a0, b0, x)`` of an MER plan or None."""
         s = self.side
         a = list(self.a0) if self.a0 is not None else [0.] * s.M
-        b = [0.] * s.F
+        b = list(self.b0) if self.b0 is not None else [0.] * s.F
         self.last_m = [None] * s.M
         self.last_f = [None] * s.F
         self.pairs = defaultdict(int)
@@ -1431,10 +1435,11 @@ def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.,
     return _SidePlan(pieces, [0.] * M, 'mer', method, work)
 
 
-def _improve_units(side, pieces, first, cap1, forbid, work_scale, a0=None):
+def _improve_units(side, pieces, first, cap1, forbid, work_scale, a0=None,
+                   b0=None):
     """Branch and bound on the number of exchangers: the same search with a
     unit bound one below the incumbent, restricted then full mode, from the
-    must frontiers `a0` (default: the pinch)."""
+    must and flex frontiers `a0` and `b0` (default: the pinch)."""
     U = _count_units(pieces)
     step = min(_UNITS_WORK_MAX, max(_UNITS_WORK_MIN, 3. * first)) * work_scale
     total = _UNITS_WORK_TOTAL * work_scale
@@ -1444,7 +1449,7 @@ def _improve_units(side, pieces, first, cap1, forbid, work_scale, a0=None):
         found = None
         for mode in ('restricted', 'full'):
             srch = _Search(side, mode, cap, False, min(step, total - used),
-                           unit_bound=U - 1, forbid=forbid, a0=a0)
+                           unit_bound=U - 1, forbid=forbid, a0=a0, b0=b0)
             res = srch.run()
             used += srch.work
             if res is not None:
@@ -1458,11 +1463,12 @@ def _improve_units(side, pieces, first, cap1, forbid, work_scale, a0=None):
     return pieces, used
 
 
-def _units_guard(side, pieces, cap1, forbid, work_scale, a0=None):
+def _units_guard(side, pieces, cap1, forbid, work_scale, a0=None, b0=None):
     """If a side's MER plan has more than ``3 (M + F)`` units, rerun the
     last two passes coarse to fine with a minimum piece size and keep the
     MER plan with the fewest units (MER always wins over the unit count).
-    The searches start from the must frontiers `a0` (default: the pinch)."""
+    The searches start from the must and flex frontiers `a0` and `b0`
+    (default: the pinch)."""
     U = _count_units(pieces)
     if U <= _GUARD_FACTOR * (side.M + side.F):
         return pieces, 0.
@@ -1475,7 +1481,7 @@ def _units_guard(side, pieces, cap1, forbid, work_scale, a0=None):
             srch = _Search(side, mode, _combine_cap(cap, cap1), extra,
                            _GUARD_WORK * work_scale,
                            min_piece=lambda i, j, thr=thr: thr, forbid=forbid,
-                           a0=a0)
+                           a0=a0, b0=b0)
             res = srch.run()
             used += srch.work
             if res is not None:
