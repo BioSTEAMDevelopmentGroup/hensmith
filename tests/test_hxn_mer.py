@@ -246,7 +246,6 @@ Kemp, I. C. (2007). Pinch Analysis and Process Integration, 2nd ed.
 Butterworth-Heinemann.
 """
 import contextlib
-import heapq
 import math
 import re
 import time
@@ -257,6 +256,7 @@ import pytest
 import biosteam as bst
 import thermosteam as tmo
 from hensmith import HeatExchangerNetwork, _planner, _splitting, hxn_synthesis
+from hensmith._heat_exchanger_network import _network_path
 from hensmith._planner import plan_network
 from hensmith.hxn_synthesis import problem_table
 from hxn_mer_cases import NO_SPLIT, SPLIT, Q_UNITS, T_UNITS
@@ -1395,38 +1395,6 @@ def _converge(system):
     system.converge()
     for unit in system.units: unit._summary()
 
-def _connection_path(units, cycles):
-    """The simulation path of `units` along the connections of the life
-    `cycles`, and the streams to tear: a topological order (ties by the
-    order of `units`) that places, where the connections form a cycle, the
-    unit with the fewest unplaced feeders next (the rule of the facility's
-    `_network_path`)."""
-    position = {u: n for n, u in enumerate(units)}
-    successors = {u: [] for u in units}
-    waiting = {u: 0 for u in units}
-    for lc in cycles:
-        for up, port, down, _ in lc.connections():
-            successors[up].append((down, up.outs[port]))
-            waiting[down] += 1
-    ready = [position[u] for u in units if not waiting[u]]
-    heapq.heapify(ready)
-    placed = {}
-    while len(placed) < len(units):
-        if ready:
-            unit = units[heapq.heappop(ready)]
-            if unit in placed: continue
-        else:
-            unit = min((u for u in units if u not in placed),
-                       key=lambda u: (waiting[u], position[u]))
-        placed[unit] = len(placed)
-        for other, _ in successors[unit]:
-            waiting[other] -= 1
-            if not waiting[other] and other not in placed:
-                heapq.heappush(ready, position[other])
-    path = sorted(units, key=placed.__getitem__)
-    recycles = [s for u in units for other, s in successors[u] if placed[other] <= placed[u]]
-    return path, recycles
-
 _WIRED = {}
 
 def _wired_split_network(case, cached=False):
@@ -1469,7 +1437,7 @@ def _wired_split_network(case, cached=False):
                 down.ins[down_port] = up.outs[up_port]
         splitters = [u for split in info['splits'] for u in split.splitters]
         mixers = [split.mixer for split in info['splits']]
-        path, recycles = _connection_path(new_HXs + utils + splitters + mixers, cycles)
+        path, recycles = _network_path(new_HXs + utils + splitters + mixers, cycles)
         system = bst.System('mer_wired', path, recycle=recycles or None)
         system.set_tolerance(method='fixedpoint', subsystems=True, mol=1e-9, rmol=1e-12,
                              T=1e-8, rT=1e-12, maxiter=200)

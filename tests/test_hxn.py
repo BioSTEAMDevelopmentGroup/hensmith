@@ -84,6 +84,30 @@ def test_cache_network_duplicate_IDs():
     simulate_cached(sys, HXN)
     assert_same_results(network_results(HXN), fresh)
 
+def test_cache_network_from_before_stream_splitting_synthesizes_again():
+    # a network cached by a facility from before stream splitting (no
+    # synthesis options or stage scales, life cycles without an entry port
+    # or splits; e.g. hensmith reloaded in a live session) cannot be
+    # reused: the facility synthesizes a new network instead of failing
+    sys, HXN, feed = build_system()
+    HXN.cache_network = True
+    sys.simulate()
+    network = HXN.HXN_sys
+    del HXN._synthesis_options, HXN._stage_scales
+    for life_cycle in HXN.stream_life_cycles:
+        del life_cycle.entry, life_cycle.splits
+    feed.F_mol *= 1.05
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        sys.simulate()
+    assert HXN.HXN_sys is not network
+    assert HXN._synthesis_options == (False,)
+    assert all(lc.entry is not None for lc in HXN.stream_life_cycles)
+    again = network_results(HXN)
+    HXN.cache_network = False
+    sys.simulate()
+    assert_same_results(again, network_results(HXN))
+
 def assert_no_phantom_utility_exchangers(HXN):
     """Every utility exchanger either has exactly no duty, and so no design
     and no cost, or a real duty, and a cost; a duty at the level of flash
@@ -2572,11 +2596,10 @@ def test_stream_splitting_is_off_by_default():
     assert not any(lc.splits for lc in HXN.stream_life_cycles)
     assert set(HXN.HXN_sys.units) == set(HXN.new_HXs + HXN.new_HX_utils)
 
-#: IDs of the units of a split (design 4.5)
-SPLIT_UNIT_IDS = {
-    bst.Splitter: re.compile(r'^Split_\d+_(hs|cs)(_\d+)?(_b\d+)?$'),
-    bst.Mixer: re.compile(r'^Mix_\d+_(hs|cs)(_\d+)?$'),
-}
+#: IDs of the units of a split (design 4.5), as the strict checker has them
+SPLIT_UNIT_IDS = {kind: pattern
+                  for kind, pattern, _ in test_hxn_mer._NETWORK_UNITS
+                  if kind in (bst.Splitter, bst.Mixer)}
 
 def test_split_network_units_and_ids():
     # smith2005_ex18_2 splits a hot stream at its inlet: the facility holds
@@ -2606,6 +2629,42 @@ def test_split_network_units_and_ids():
     total = total_duty(units)
     assert_allclose(actual_loads(HXN), mer_targets(units, dT),
                     atol=1e-6 * total)
+
+def test_stream_life_cycles_csv(tmp_path, monkeypatch):
+    # one row per stage with the stage's own inlet and outlet enthalpies;
+    # a stream that splits at its inlet (smith2005_ex18_2) first gets a row
+    # for its splitter chain at the whole stream's inlet enthalpy, so that
+    # no row mixes the whole stream with a branch (unsplit, the first
+    # stage's inlet is the stream's, exactly)
+    import csv
+    HXN = test_hxn_mer._network(
+        test_hxn_mer._case('smith2005_ex18_2_split'), True)['HXN']
+    monkeypatch.chdir(tmp_path)
+    HXN.save_stream_life_cycles_as_csv()
+    path, = tmp_path.glob('HXN-*.csv')
+    with open(path, newline='') as file:
+        header, *rows = [row for row in csv.reader(file) if row]
+    assert header == ['Stream', 'Type', 'Original unit', 'HXN unit',
+                      'H_in (kJ/hr)', 'H_out (kJ/hr)', 'T_in (C)', 'T_out (C)']
+    expected, split_entries = [], 0
+    for lc in HXN.stream_life_cycles:
+        j = lc.index
+        stages = [(s.unit.ID, s.H_in, s.H_out) for s in lc.life_cycle]
+        entry = lc.entry.unit
+        if isinstance(entry, bst.Splitter):
+            split_entries += 1
+            stages.insert(0, (entry.ID, lc.H_in, lc.H_in))
+        else:
+            assert stages[0][1] == lc.H_in
+        last = len(stages) - 1
+        expected += [[j, 'Cold' if lc.cold else 'Hot', ID, H_in, H_out,
+                      HXN.inlet_Ts[j] - 273.15 if n == 0 else None,
+                      HXN.outlet_Ts[j] - 273.15 if n == last else None]
+                     for n, (ID, H_in, H_out) in enumerate(stages)]
+    assert split_entries == 1
+    def number(x): return None if x == '' else float(x)
+    assert [[int(r[0]), r[1], r[3], *map(number, r[4:])]
+            for r in rows] == expected
 
 @pytest.mark.parametrize('name', LIFE_CYCLE_CASES)
 def test_split_stage_fractions(name):
@@ -2670,8 +2729,15 @@ def test_split_network_registers_no_intermediate_streams():
             for s in (*u.ins, *u.outs):
                 assert flowsheet.stream.data[s.ID] is s, (u.ID, s.ID)
         assert set(bst.main_flowsheet.stream.data) == before
-    # the doctest system needs no split: nothing changes with the keyword
+    # the doctest system needs no split: with the keyword, its network is
+    # the one without it, bit for bit (design R3)
     sys, HXN, feed = build_system()
+    sys.simulate()
+    def network(HXN):
+        return ([(hx.ID, hx.Q) for hx in HXN.new_HXs],
+                [(hx.ID, hx.Q) for hx in HXN.new_HX_utils],
+                HXN.synthesis_info['refine_rounds'])
+    unsplit = network(HXN)
     HXN.stream_splitting = True
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
@@ -2680,6 +2746,7 @@ def test_split_network_registers_no_intermediate_streams():
     info = HXN.synthesis_info
     assert info['status'] == 'mer' and info['splits'] == []
     assert HXN.new_splitters == HXN.new_mixers == []
+    assert network(HXN) == unsplit
 
 def force_split(monkeypatch, name):
     """Plan side `name` ('above' or 'below') with stream splits although an
@@ -2887,33 +2954,55 @@ def branch_limits(HXN):
                            * (H_in + share * (H_out - H_in))))
     return limits
 
-@pytest.mark.parametrize('name', SPLIT_CASES)
+@pytest.mark.parametrize('name', [*SPLIT_CASES, 'crude_fractionation_ph11c2'])
 def test_cached_split_network(monkeypatch, name):
     # the cached network serves feeds 10 % larger and smaller with the same
     # units: each stream enters at its entry port (smith2005_ex18_2 splits
     # at its inlet), the pre-copy moves the new flows through the splitters
-    # (at their unchanged splits) and the mixers (summed) without running a
-    # mixer (its PH flash runs only in the guarded convergence), every
-    # branch limit is f times its whole-stream restore, and the network
-    # scales exactly; a changed stream_splitting synthesizes a new network
+    # (at their unchanged splits; crude_fractionation_ph11c2 has four-branch
+    # splitter chains and a stream split twice, below and then above the
+    # pinch) and the mixers (summed) without running a mixer (its PH flash
+    # runs only in the guarded convergence), every branch limit is f times
+    # its whole-stream restore, and the network scales exactly; a changed
+    # stream_splitting synthesizes a new network (on the small cases: the
+    # crude's unsplit synthesis runs the best-effort search)
     units, dT = corpus_units(name)
     sys, HXN, problems = split_facility(units, dT, 'sys_split_cache')
     assert not problems, '\n'.join(problems)
     network = HXN.HXN_sys
     members = list(network.units)
-    # the streams of the split streams (none of them a tear stream, whose
-    # consumer the path-order pre-copy runs before its producer: there, as
-    # without splits, only the convergence brings the new flows)
-    streams = []
+    # the streams of the split streams, but for those that the path-order
+    # pre-copy leaves at their old flows: the outlets of a tear stream's
+    # consumer (which it runs before the tear's producer) and all that
+    # follows them on their stream (there, as without splits, only the
+    # convergence brings the new flows)
+    recycles = network.recycle or []
+    if not isinstance(recycles, list): recycles = [recycles]
+    tears = {id(s) for s in recycles}
+    def outlets(unit, port):
+        # the outlets of `unit` on the stream that enters it at `port`
+        if isinstance(unit, (bst.Splitter, bst.Mixer)): return unit.outs
+        return [unit.outs[port]]
+    streams, stale = [], set()
     for lc in HXN.stream_life_cycles:
         if not lc.splits: continue
         unit, index = lc.entry
+        streams.append(unit.ins[index])
+        for up, port, down, down_port in lc.connections(): # in flow order
+            s = up.outs[port]
+            if id(s) in tears or id(s) in stale:
+                stale.update(map(id, outlets(down, down_port)))
+            streams.append(s)
         last = lc.life_cycle[-1]
-        streams += [unit.ins[index], last.unit.outs[last.index],
-                    *[up.outs[port] for up, port, *_ in lc.connections()]]
-    recycles = network.recycle or []
-    if not isinstance(recycles, list): recycles = [recycles]
-    assert streams and not {id(s) for s in streams} & {id(s) for s in recycles}
+        streams.append(last.unit.outs[last.index])
+    streams = [s for s in streams if id(s) not in stale]
+    assert streams
+    if name not in SPLIT_CASES:
+        # an element of a splitter chain, and a split fed by a mixer
+        assert any(isinstance(s.source, bst.Splitter)
+                   and re.search(r'_b\d+$', s.source.ID) for s in streams)
+        assert any(isinstance(s.source, bst.Mixer)
+                   and isinstance(s.sink, bst.Splitter) for s in streams)
     flows = [s.mol.copy() for s in streams]
     Q = {hx.ID: hx.Q for hx in HXN.new_HXs}
     splits = [u.split.copy() for u in HXN.new_splitters]
@@ -2966,6 +3055,7 @@ def test_cached_split_network(monkeypatch, name):
         assert_feasible(HXN, dT)
     for s, F in zip(feeds, F_mol): s.F_mol = F
     monkeypatch.undo()
+    if name not in SPLIT_CASES: return
     # without splitting, then with it again: a new synthesis each time
     HXN.stream_splitting = False
     simulate_strictly(sys)
@@ -3003,19 +3093,35 @@ def test_move_flows_moves_flows_only(monkeypatch):
     assert 0. < two_phase.vapor_fraction < 1.
     def failing(self): raise RuntimeError(f'{self.ID} was run')
     monkeypatch.setattr(bst.Mixer, '_run', failing)
-    # all flows 10 % larger, then only the vapor's
+    def split(s): return np.array([s.imol['g'], s.imol['l']])
+    # all flows 10 % larger, then only the vapor's, each time with a new
+    # feed state, which the splitter's outlets take
     for streams in ((feed, liquid, vapor), (vapor,)):
+        phase_flows = split(two_phase)
         for s in streams: s.F_mol *= 1.1
+        feed.T += 5.
+        feed.P *= 1.1
         states = [(m.outs[0].T, m.outs[0].P) for m in mixers]
         for u in (splitter, *mixers): _move_flows(u)
         assert_allclose(splitter.outs[0].mol, 0.3 * feed.mol, rtol=1e-15)
         assert_allclose(splitter.outs[1].mol, 0.7 * feed.mol, rtol=1e-15)
-        assert all(s.T == feed.T for s in splitter.outs)
+        assert all((s.T, s.P) == (feed.T, feed.P) for s in splitter.outs)
         for m, state in zip(mixers, states):
             s = m.outs[0]
             assert (s.T, s.P) == state
             assert_allclose(s.mol, sum([i.mol for i in m.ins]), rtol=1e-15)
-        assert isinstance(two_phase, bst.MultiStream)
+        if len(streams) == 3:
+            # every inlet 10 % larger: so is each phase of the two-phase
+            # outlet (the PH flash's split, kept)
+            assert_allclose(split(two_phase), 1.1 * phase_flows,
+                            rtol=1e-14)
+        else:
+            # the inlet flows, split between the phases at the outlet's T
+            # and P (thermosteam's TP flash gives all liquid here, although
+            # T lies between the bubble and dew points)
+            flashed = two_phase.copy()
+            flashed.vle(T=two_phase.T, P=two_phase.P)
+            assert_allclose(split(two_phase), split(flashed), rtol=1e-9)
 
 def test_split_avoid_recycle_facility():
     # r002's only unsplit MER network matches H1 twice with C3, so with
@@ -3046,28 +3152,39 @@ def test_repair_on_split_plan(monkeypatch):
                                                        **kwargs))
     monkeypatch.setattr(hxn_synthesis, '_MAX_REFINE', 0)
     monkeypatch.setattr(hxn_synthesis, '_MAX_SPLIT_RETRY', 0)
-    repair, shrunk = hxn_synthesis._repair, []
-    def spy(plan, duties, *args):
+    repair, realize = hxn_synthesis._repair, hxn_synthesis._realize
+    shrunk, realized = [], {}
+    def repairing(plan, duties, *args):
         duties, changes = repair(plan, duties, *args)
-        shrunk.extend((plan.exchangers[n], *change)
-                      for n, *change in changes)
+        shrunk.extend((plan, n, *change) for n, *change in changes)
         return duties, changes
-    monkeypatch.setattr(hxn_synthesis, '_repair', spy)
+    def realizing(plan, *args):
+        # the units by exchanger index of the plan's last realization
+        result = realized[id(plan)] = realize(plan, *args)
+        return result
+    monkeypatch.setattr(hxn_synthesis, '_repair', repairing)
+    monkeypatch.setattr(hxn_synthesis, '_realize', realizing)
     units, dT = test_hxn_mer._build(DRIFT_CASE)
     sys, HXN, problems = split_facility(units, dT, 'sys_split_repair')
     info = HXN.synthesis_info
     assert info['refine_rounds'] == 0 and info['splits']
+    exchangers = [plan.exchangers[n] for plan, n, *_ in shrunk]
     assert info['repaired'] == [
         dict(side=e.side, hot=e.hot, cold=e.cold, Q_plan=before, Q=after)
-        for e, before, after in shrunk]
-    assert any(e.hot_frac < 1. or e.cold_frac < 1. for e, *_ in shrunk)
-    assert all(0. < after < before for _, before, after in shrunk)
+        for e, (*_, before, after) in zip(exchangers, shrunk)]
+    assert any(e.hot_frac < 1. or e.cold_frac < 1. for e in exchangers)
+    assert all(0. < after < before for *_, before, after in shrunk)
     total = total_duty(units)
-    branch_Q = [stage.unit.Q for lc in HXN.stream_life_cycles
-                for stage in lc.life_cycle if stage.branch is not None]
-    for e, before, after in shrunk:
-        if e.hot_frac < 1. or e.cold_frac < 1.:
-            assert min(abs(Q - after) for Q in branch_Q) <= 1e-12 * total
+    # each branch exchanger that `_repair` shrank is realized, as a branch
+    # stage of its hot or cold stream in the network, with the repaired duty
+    for e, (plan, n, before, after) in zip(exchangers, shrunk):
+        if e.hot_frac == 1. and e.cold_frac == 1.: continue
+        hx = realized[id(plan)][0][n]
+        assert hx in HXN.new_HXs
+        assert abs(hx.Q - after) <= 1e-12 * total, hx.ID
+        assert any(stage.unit is hx and stage.branch is not None
+                   for j in (e.hot, e.cold)
+                   for stage in HXN.stream_life_cycles[j].life_cycle), hx.ID
     assert info['status'] == 'best_effort'
     assert_feasible(HXN, dT)
     assert_allclose(actual_loads(HXN), [info['Q_hot_plan'], info['Q_cold_plan']],

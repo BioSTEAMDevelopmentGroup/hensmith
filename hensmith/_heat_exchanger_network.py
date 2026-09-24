@@ -178,15 +178,14 @@ class HeatExchangerNetwork(bst.Facility):
 
     Notes
     -----
-    The network is synthesized without stream splits (unless
-    `stream_splitting`) by
-    :func:`~hensmith.hxn_synthesis.synthesize_network`: a problem table on
-    the streams' temperature-enthalpy curves gives the minimum energy
-    requirement (MER) targets, and a planner builds each side of the pinch
-    from the pinch outward [1]_ [2]_, keeping `T_min_app` everywhere inside
-    every exchanger on the exact stream states. It reaches the targets
-    whenever its search finds an unsplit network that does; the same pair
-    of streams may then be matched more than once (IDs with a suffix
+    Unless `stream_splitting`, the network is synthesized without stream
+    splits by :func:`~hensmith.hxn_synthesis.synthesize_network`: a problem
+    table on the streams' temperature-enthalpy curves gives the minimum
+    energy requirement (MER) targets, and a planner builds each side of the
+    pinch from the pinch outward [1]_ [2]_, keeping `T_min_app` everywhere
+    inside every exchanger on the exact stream states. It reaches the
+    targets whenever its search finds an unsplit network that does; the same
+    pair of streams may then be matched more than once (IDs with a suffix
     ``_<n>``, e.g. ``HX_3_2_cs_2``), since series alternation can replace a
     split. Where the pinch design rules prove that MER needs stream
     splitting, the network is a best-effort one close to the targets, or,
@@ -203,22 +202,21 @@ class HeatExchangerNetwork(bst.Facility):
     to the HeatExchangerNetwork object. Each stream passes its exchangers in
     series (where it splits, its branches run in parallel from a splitter
     chain to a mixer); the network is simulated as a `System` (`HXN_sys`)
-    whose path follows the streams, with the loops that repeated matches
-    can form torn
-    and converged to a tight tolerance (every exchanger starts at its
-    planned state, so the loops are at their fixed point after one pass).
+    whose path follows the streams, with the loops that repeated matches can
+    form torn and converged to a tight tolerance (every exchanger starts at
+    its planned state, so the loops are at their fixed point after one
+    pass).
 
     With `cache_network`, a network is reused while the set of heat
     exchangers and `stream_splitting` are the same: each process exchanger
     keeps, as its enthalpy limit, the share of the stream's duty it had at
-    synthesis (on the stream that the plan serves completely on that side
-    of the pinch; its partner transfers that share, but never past its own
+    synthesis (on the stream that the plan serves completely on that side of
+    the pinch; its partner transfers that share, but never past its own
     outlet, and takes the rest to its utility), and the utility exchangers
     bring every stream to its new outlet. The splitters keep their
-    fractions, so a branch exchanger's limit is its branch's fraction of
-    the whole stream's. If the cached network does not
-    reproduce the outlets, or its energy balance is off, the network is
-    synthesized again.
+    fractions, so a branch exchanger's limit is its branch's fraction of the
+    whole stream's. If the cached network does not reproduce the outlets, or
+    its energy balance is off, the network is synthesized again.
 
     Every utility exchanger is designed and costed by biosteam as usual. A
     stream that its process exchangers bring to its outlet (within 1e-9 of
@@ -407,10 +405,11 @@ class HeatExchangerNetwork(bst.Facility):
         hx_utils = self._get_original_heat_utilties()
         use_cached_network = False
         # A network synthesized with other options (stream splitting on or
-        # off) is never reused.
+        # off), or by a facility from before stream splitting (no options
+        # recorded; its life cycles have no entry port), is never reused.
         if (self.cache_network and hasattr(self, 'original_heat_utils')
                 and hasattr(self, '_stage_fractions')
-                and getattr(self, '_synthesis_options', (False,))
+                and getattr(self, '_synthesis_options', None)
                     == (self.stream_splitting,)):
             # Units are a stable key to compare whether system has changed configuration.
             hu_by_unit = {hu.unit: hu for hu in hx_utils}
@@ -428,8 +427,7 @@ class HeatExchangerNetwork(bst.Facility):
                 new_HXs = self.new_HXs
                 new_HX_utils = self.new_HX_utils
                 stage_fractions = self._stage_fractions
-                # (none in a network cached before stream splitting existed)
-                stage_scales = getattr(self, '_stage_scales', {})
+                stage_scales = self._stage_scales
                 for i, life_cycle in enumerate(stream_life_cycles):
                     hx = hxs[i]
                     s_util_in = hx.ins[0]
@@ -490,7 +488,6 @@ class HeatExchangerNetwork(bst.Facility):
                                    self.force_ideal_thermo, self.avoid_recycle,
                                    self.sort_hus_by_T, info=synthesis_info,
                                    stream_splitting=self.stream_splitting)
-                self._synthesis_options = (self.stream_splitting,)
                 new_HXs = HXs_hot_side + HXs_cold_side
                 # the realized splits (none without stream splitting)
                 splits = synthesis_info.get('splits', ())
@@ -533,9 +530,11 @@ class HeatExchangerNetwork(bst.Facility):
                 # first one take the whole duty. A branch stage (fraction f
                 # of the flow) has f times the whole stream's limit: its
                 # share is that of the whole stream's limit (on the parent
-                # basis), and f is kept in `_stage_scales`.
+                # basis), and f is kept in `_stage_scales`. The options the
+                # network was synthesized with are the cache's key.
                 self._stage_fractions = stage_fractions = {}
                 self._stage_scales = stage_scales = {}
+                self._synthesis_options = (self.stream_splitting,)
                 for i, life_cycle in enumerate(stream_life_cycles):
                     hx = hx_heat_utils_rearranged[i].unit
                     H_in = hx.ins[0].H
@@ -768,7 +767,7 @@ class HeatExchangerNetwork(bst.Facility):
         self.original_hxs = original_hxs
         return original_hxs
     
-    def save_stream_life_cycles_as_csv(self): # pragma: no cover
+    def save_stream_life_cycles_as_csv(self):
         if not hasattr(self, 'stream_life_cycles'):
             self.stream_life_cycles = self._get_stream_life_cycles()
         stream_life_cycles = self.stream_life_cycles
@@ -781,39 +780,32 @@ class HeatExchangerNetwork(bst.Facility):
         filename = 'HXN-%s_%s.%s.%s.%s.%s.csv'%(self.system.ID, dateTimeObj.year,
                                                 dateTimeObj.month, dateTimeObj.day,
                                                 dateTimeObj.hour, dateTimeObj.minute)
-        csvWriter = csv.writer(open(filename, 'w'), delimiter=',')
-        csvWriter.writerow(['Stream', 'Type', 'Original unit', 'HXN unit', 'H_in (kJ/hr)',
-                            'H_out (kJ/hr)', 'T_in (C)', 'T_out (C)'])
-        stream, streamtype, original_unit, hxn_unit, H_in, H_out, T_in, T_out =\
-            0, 0, 0, 0, 0, 0, 0, 0
-            
         inlet_Ts = self.inlet_Ts
         outlet_Ts = self.outlet_Ts
-        for life_cycle in stream_life_cycles:
-            stream = life_cycle.index
-            streamtype = 'Cold' if life_cycle.cold else 'Hot'
-            stage_no = 0
-            stages = life_cycle.life_cycle
-            len_stages = len(stages)
-            for stage in stages:
+        with open(filename, 'w', newline='') as file:
+            csvWriter = csv.writer(file, delimiter=',')
+            csvWriter.writerow(['Stream', 'Type', 'Original unit', 'HXN unit',
+                                'H_in (kJ/hr)', 'H_out (kJ/hr)', 'T_in (C)',
+                                'T_out (C)'])
+            for life_cycle in stream_life_cycles:
+                stream = life_cycle.index
+                streamtype = 'Cold' if life_cycle.cold else 'Hot'
                 original_unit = original_hxs[stream][0].ID
                 if original_hxs[stream][1]:
-                     original_unit+= ' - ' + original_hxs[stream][1]
-                
-                hxn_unit = stage.unit
-                hxn_unit_ID = hxn_unit.ID
-                H_in = stage.H_in
-                H_out = stage.H_out
-                T_in, T_out = None, None
-                if stage_no == 0:
-                    # the whole stream's inlet (its first stage may be a
-                    # branch of a split)
+                    original_unit += ' - ' + original_hxs[stream][1]
+                # One row per stage, at its own enthalpies. A stream that
+                # splits at its inlet enters its splitter chain first, which
+                # gets a row at the whole stream's inlet enthalpy (its first
+                # stage is then a branch: a fraction of the flow).
+                rows = [(stage.unit.ID, stage.H_in, stage.H_out)
+                        for stage in life_cycle.life_cycle]
+                entry = life_cycle.entry.unit
+                if isinstance(entry, bst.Splitter):
                     H_in = life_cycle.H_in
-                    T_in = inlet_Ts[stream] - 273.15
-                if stage_no == len_stages - 1:
-                    T_out = outlet_Ts[stream] - 273.15
-                    
-                row = [stream, streamtype, original_unit, hxn_unit_ID,
-                       H_in, H_out, T_in, T_out]
-                csvWriter.writerow(row)
-                stage_no += 1
+                    rows.insert(0, (entry.ID, H_in, H_in))
+                last = len(rows) - 1
+                for n, (ID, H_in, H_out) in enumerate(rows):
+                    T_in = inlet_Ts[stream] - 273.15 if n == 0 else None
+                    T_out = outlet_Ts[stream] - 273.15 if n == last else None
+                    csvWriter.writerow([stream, streamtype, original_unit, ID,
+                                        H_in, H_out, T_in, T_out])
