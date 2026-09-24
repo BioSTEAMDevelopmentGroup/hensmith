@@ -709,6 +709,9 @@ class HeatExchangerNetwork(bst.Facility):
                 H_out = stage.H_out
                 T_in, T_out = None, None
                 if stage_no == 0:
+                    # the whole stream's inlet (its first stage may be a
+                    # branch of a split)
+                    H_in = life_cycle.H_in
                     T_in = inlet_Ts[stream] - 273.15
                 if stage_no == len_stages - 1:
                     T_out = outlet_Ts[stream] - 273.15

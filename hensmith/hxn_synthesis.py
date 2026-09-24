@@ -46,6 +46,61 @@ def _stream_ports(unit):
     if match: return (int(match.group(1)),)
     return None
 
+#: An inlet port, ``unit.ins[index]`` (see `StreamLifeCycle.entry`).
+_Port = namedtuple('_Port', ('unit', 'index'))
+
+def _flow_order(trunk, splits, branches):
+    """
+    A life cycle with splits in flow order: ``(None, stage)`` for every
+    stage of `trunk` (the stages on the whole flow, in flow order, the
+    utility last) and ``(split, branches[k])`` for split k of `splits` (in
+    flow order; `branches[k]` holds the stages of each of its branches),
+    placed after ``split.position`` trunk process stages and before the
+    utility.
+    """
+    flow, k = [], 0
+    for t, stage in enumerate(trunk):
+        utility = isinstance(stage.unit, bst.HXutility)
+        while k < len(splits) and (utility or splits[k].position <= t):
+            flow.append((splits[k], branches[k]))
+            k += 1
+        flow.append((None, stage))
+    flow.extend(zip(splits[k:], branches[k:]))
+    return flow
+
+def _split_flow(stages, splits, flow_order, index):
+    """
+    Tag the `stages` of stream `index` on the branches of its `splits` (in
+    flow order) with their branch and fraction, sort the others (the
+    trunk) by `flow_order` with the utility last, and return
+    `_flow_order`'s flow of them.
+    """
+    tags = {id(hx): (k, b, f) for k, split in enumerate(splits)
+            for b, (f, hxs) in enumerate(zip(split.fractions, split.branches))
+            for hx in hxs}
+    tagged, trunk = {}, []
+    for stage in stages:
+        if id(stage.unit) in tags: tagged[id(stage.unit)] = stage
+        else: trunk.append(stage)
+    branches = []
+    for split in splits:
+        branches.append([])
+        for hxs in split.branches:
+            branch = []
+            for hx in hxs:
+                stage = tagged.get(id(hx))
+                if stage is None:
+                    raise ValueError(f'{hx.ID} of split {split!r} does '
+                                     f'not carry stream {index}')
+                k, b, stage.fraction = tags[id(hx)]
+                stage.branch = (k, b)
+                branch.append(stage)
+            branches[-1].append(branch)
+    trunk.sort(key=flow_order)
+    utilities = [s for s in trunk if isinstance(s.unit, bst.HXutility)]
+    trunk = [s for s in trunk if not isinstance(s.unit, bst.HXutility)]
+    return _flow_order(trunk + utilities, splits, branches)
+
 class LifeStage:
     """
     One stage of a stream's passage through the synthesized network: the
@@ -59,6 +114,13 @@ class LifeStage:
     index : int
         Position of the stream in `unit.ins` / `unit.outs` (0 or 1 for an
         `HXprocess`; always 0 for an `HXutility`).
+    branch : tuple[int, int], optional
+        ``(k, b)`` for a stage on branch b of the stream's split k (see
+        `StreamLifeCycle.splits`); None (the default) for a stage on the
+        whole flow.
+    fraction : float, optional
+        Fraction of the stream's flow through this stage: that of its
+        branch, 1 (the default) on the whole flow.
 
     Attributes
     ----------
@@ -67,15 +129,18 @@ class LifeStage:
     s_out : Stream
         `unit.outs[index]`, the stream leaving this stage.
     H_in : float
-        Enthalpy of `s_in` [kJ/hr], read from the stream when accessed.
+        Enthalpy of `s_in` [kJ/hr], read from the stream when accessed
+        (on a branch, the branch's: `fraction` of the whole flow's).
     H_out : float
         Enthalpy of `s_out` [kJ/hr], read from the stream when accessed.
 
     """
-        
-    def __init__(self, unit, index):
+
+    def __init__(self, unit, index, branch=None, fraction=1.):
         self.unit = unit
         self.index = index
+        self.branch = branch
+        self.fraction = fraction
     
     @property
     def s_in(self): return self.unit.ins[self.index]
@@ -89,14 +154,19 @@ class LifeStage:
     @property
     def H_out(self): return self.s_out.H
     
+    def _branch_info(self):
+        branch = self.branch
+        if branch is None: return ''
+        return f", branch {branch}, fraction {self.fraction:.4g}"
+
     def _info(self, N_tabs=1):
         tabs = N_tabs*'\t'
-        return (f"{type(self).__name__}: {self.unit.ID}\n"
+        return (f"{type(self).__name__}: {self.unit.ID}{self._branch_info()}\n"
                 + tabs + f"H_in = {self.H_in:.3g} kJ/hr\n"
                 + tabs + f"H_out = {self.H_out:.3g} kJ/hr")
 
     def __repr__(self):
-        return (f"<{type(self).__name__}: {repr(self.unit)}, H_in = {round(self.H_in, 4):.3g} kJ/hr, H_out = {round(self.H_out, 4):.3g} kJ/hr>")
+        return (f"<{type(self).__name__}: {repr(self.unit)}{self._branch_info()}, H_in = {round(self.H_in, 4):.3g} kJ/hr, H_out = {round(self.H_out, 4):.3g} kJ/hr>")
         
     def show(self):
         print(self._info())
@@ -138,6 +208,21 @@ class StreamLifeCycle:
         ``'s_<index>'``, the prefix of the stream's copies in the network.
     life_cycle : list[LifeStage] or None
         Stages in flow order, set by `get_life_cycle`; None until then.
+        Where the stream splits, the stages of every branch follow those
+        before the split, branch by branch (see `get_life_cycle`).
+    splits : list[StreamSplit]
+        The stream's splits in flow order, set by `get_life_cycle`; empty
+        for an unsplit stream. Split k's branch stages have ``branch ==
+        (k, b)``.
+    entry : tuple[Unit, int] or None
+        ``(unit, index)``, a named tuple: the inlet port `unit.ins[index]`
+        where the whole stream enters the network, i.e. the first
+        splitter of its first split if it splits at its inlet, else its
+        first stage's. None until `get_life_cycle` runs.
+    H_in : float
+        Enthalpy of the stream at `entry` [kJ/hr], read from the stream
+        when accessed: the whole flow's inlet, equal to the first stage's
+        `H_in` unless the stream splits at its inlet.
 
     Notes
     -----
@@ -147,13 +232,20 @@ class StreamLifeCycle:
     `plot_pinch_diagram` draws them.
 
     """
-    
+
     def __init__(self, index, cold):
         self.index = index
         self.name = 's_%s'%index
         self.cold = cold
         self.life_cycle = None
-        
+        self.splits = []
+        self.entry = None
+
+    @property
+    def H_in(self):
+        unit, index = self.entry
+        return unit.ins[index].H
+
     def get_relevant_units(self, index, new_HXs, new_HX_utils):
         """
         Return the process and utility exchangers (two lists) that carry
@@ -169,7 +261,7 @@ class StreamLifeCycle:
         new_HX_utils_relevant = [hx for hx in new_HX_utils if relevant(hx)]
         return new_HXs_relevant, new_HX_utils_relevant
         
-    def get_life_cycle(self, new_HXs, new_HX_utils):
+    def get_life_cycle(self, new_HXs, new_HX_utils, splits=None):
         """
         Build and return the list of `LifeStage` objects for this stream.
 
@@ -179,6 +271,11 @@ class StreamLifeCycle:
             Process exchangers of the synthesized network.
         new_HX_utils : list[HXutility]
             Utility exchangers of the synthesized network.
+        splits : list[StreamSplit], optional
+            Splits of the network (``info['splits']`` of
+            `synthesize_network`); those of other streams are ignored.
+            Without any split of this stream, the life cycle is built
+            exactly as for an unsplit network.
 
         Returns
         -------
@@ -193,6 +290,22 @@ class StreamLifeCycle:
             stages only) put the stream's first side of the pinch first
             (cold-side stages for a cold stream, hot-side stages for a hot
             one) and the utility last. Also stored as `life_cycle`.
+
+            With splits, only the trunk stages (those on the whole flow,
+            which pass the stream's enthalpies in order) are sorted so;
+            the exchangers of split k's branches (``StreamSplit.branches``,
+            by identity) follow the first ``StreamSplit.position`` trunk
+            process stages, branch by branch and each branch in flow
+            order, as stages with ``branch == (k, b)`` and the branch's
+            `fraction`; the utility stays last. Enthalpies of different
+            branches are never compared. The stream's splits are stored,
+            in flow order, as `splits`, and its entry port as `entry`.
+
+        Raises
+        ------
+        ValueError
+            If an exchanger of one of the stream's splits does not carry
+            the stream.
 
         """
         index = self.index
@@ -217,16 +330,108 @@ class StreamLifeCycle:
             if isinstance(stage.unit, bst.HXutility): rank = 2
             else: rank = 0 if first_side in ID else 1
             return (sign * stage.H_in, rank)
-        life_cycle.sort(key=flow_order)
+        splits = [split for split in splits or () if split.stream == index]
+        if splits:
+            # flow order: by position, then (consecutive splits) by the
+            # enthalpy where they split
+            splits.sort(key=lambda split: (split.position,
+                                           sign * split.H_split))
+            flow = _split_flow(life_cycle, splits, flow_order, index)
+            life_cycle = [stage for split, part in flow
+                          for stage in ([part] if split is None
+                                        else [s for b in part for s in b])]
+        else:
+            life_cycle.sort(key=flow_order)
+            flow = [(None, stage) for stage in life_cycle[:1]]
         self.life_cycle = life_cycle
+        self.splits = splits
+        if flow:
+            split, part = flow[0]
+            self.entry = (_Port(part.unit, part.index) if split is None
+                          else _Port(split.splitters[0], 0))
+        else:
+            self.entry = None
         return life_cycle
-        
+
+    def _flow(self):
+        """The life cycle in flow order as ``(None, stage)`` for every trunk
+        stage and ``(split, branches)`` for every split, `branches` being
+        the stages of each of its branches (see `_flow_order`)."""
+        splits = self.splits
+        branches = [[[] for hxs in split.branches] for split in splits]
+        trunk = []
+        for stage in self.life_cycle:
+            branch = stage.branch
+            if branch is None: trunk.append(stage)
+            else: branches[branch[0]][branch[1]].append(stage)
+        return _flow_order(trunk, splits, branches)
+
+    def connections(self):
+        """
+        Yield the stream's connections in flow order, as ``(up_unit,
+        up_port, down_unit, down_port)``: ``up_unit.outs[up_port]`` feeds
+        ``down_unit.ins[down_port]``. Wiring every connection of every
+        life cycle joins the network.
+
+        For an unsplit stream, these are its consecutive stages. At a
+        split: the stage before it feeds the first splitter (port 0);
+        splitter c's second outlet feeds splitter c + 1; the outlet of
+        branch b (``StreamSplit.outlet``) feeds the branch's first stage,
+        or inlet b of the mixer for a branch without exchangers (a
+        bypass); each branch stage feeds the next, the last one mixer
+        inlet b; the mixer's outlet feeds the next stage (or the next
+        split's first splitter).
+        """
+        up = None # (unit, port) feeding the next node
+        for split, part in self._flow():
+            if split is None:
+                if up is not None: yield (*up, part.unit, part.index)
+                up = (part.unit, part.index)
+                continue
+            splitters = split.splitters
+            if up is not None: yield (*up, splitters[0], 0)
+            for a, b in zip(splitters, splitters[1:]): yield (a, 1, b, 0)
+            for b, stages in enumerate(part):
+                end = split.outlet(b)
+                for stage in stages:
+                    yield (*end, stage.unit, stage.index)
+                    end = (stage.unit, stage.index)
+                yield (*end, split.mixer, b)
+            up = (split.mixer, 0)
+
+    def stage_pairs(self):
+        """
+        Yield the pairs ``(a, b)`` of stages where the stream flows from
+        `a` into `b` directly or through splitters and mixers only: for an
+        unsplit stream, its consecutive stages. The stage before a split
+        precedes the first stage of every branch, and the last stage of
+        every branch the stage after the split; a bypass carries the stages
+        before its split past it. Stages on sibling branches make no pair.
+        """
+        frontier = [] # the stages whose outflow reaches the next node
+        for split, part in self._flow():
+            if split is None:
+                for stage in frontier: yield stage, part
+                frontier = [part]
+                continue
+            ends = []
+            for stages in part:
+                if stages:
+                    for stage in frontier: yield stage, stages[0]
+                    yield from zip(stages, stages[1:])
+                    last = [stages[-1]]
+                else: # a bypass
+                    last = frontier
+                ends.extend([stage for stage in last
+                             if not any(stage is end for end in ends)])
+            frontier = ends
+
     def __repr__(self):
         life_cycle = self.life_cycle
         cold = self.cold
         if not self.life_cycle:
             return 'Not initialized; run StreamLifeCycle.get_life_cycle or\
-                  HX_Network.get_stream_life_cycles first.' 
+                  HX_Network.get_stream_life_cycles first.'
         else:
             index = self.index
             name = 'Stream_%s'%index
@@ -235,8 +440,12 @@ class StreamLifeCycle:
             for LifeStage in life_cycle:
                 line = '\t\t' + repr(LifeStage) + '\n'
                 rep += line
-            rep = '<StreamLifeCycle: ' + name + ', ' + strtype  + '\n\tlife_cycle = [\n' +  rep[:-1] + '\n\t]>'
-            return rep
+            rep = '<StreamLifeCycle: ' + name + ', ' + strtype  + '\n\tlife_cycle = [\n' +  rep[:-1] + '\n\t]'
+            for k, split in enumerate(self.splits):
+                fractions = ', '.join(f'{f:.4g}' for f in split.fractions)
+                rep += (f'\n\tsplit {k}: {len(split.fractions)} branches '
+                        f'({fractions})')
+            return rep + '>'
         
     def show(self):
         """Print the life cycle, one stage per line."""
@@ -1998,15 +2207,25 @@ def _order_exchanger_columns(hxs, stream_life_cycles):
     a topological sort (Kahn's algorithm, ties broken by the given order)
     yields a consistent layout. Contradictory constraints, which would need a
     stream to flow backwards, fall back to the given order.
+
+    Exchangers left out of `hxs` pass the precedence on: two requested
+    exchangers of a stream are ordered whenever the stream flows from one
+    to the other. A life cycle with splits orders its exchangers by
+    `StreamLifeCycle.stage_pairs`, so the exchangers of sibling branches
+    are not ordered by that stream.
     """
     hxs = list(hxs)
     position = {hx: i for i, hx in enumerate(hxs)}
     successors = {hx: [] for hx in hxs}
     N_predecessors = {hx: 0 for hx in hxs}
     for life_cycle in stream_life_cycles:
-        stages = [i.unit for i in life_cycle.life_cycle if i.unit in position]
-        if not life_cycle.cold: stages.reverse()
-        for a, b in zip(stages, stages[1:]):
+        if getattr(life_cycle, 'splits', None):
+            pairs = _split_precedence(life_cycle, position)
+        else:
+            stages = [i.unit for i in life_cycle.life_cycle if i.unit in position]
+            if not life_cycle.cold: stages.reverse()
+            pairs = zip(stages, stages[1:])
+        for a, b in pairs:
             if b not in successors[a]:
                 successors[a].append(b)
                 N_predecessors[b] += 1
@@ -2020,6 +2239,31 @@ def _order_exchanger_columns(hxs, stream_life_cycles):
             N_predecessors[other] -= 1
             if not N_predecessors[other]: heapq.heappush(ready, position[other])
     return ordered if len(ordered) == len(hxs) else hxs
+
+def _split_precedence(life_cycle, requested):
+    """
+    Pairs ``(a, b)`` of `requested` exchangers of a life cycle with splits
+    where column `a` goes left of column `b`: the stream flows from `a` to
+    `b` (from `b` to `a` for a hot stream), through `stage_pairs` and the
+    stages not requested. Each requested stage is paired with the nearest
+    requested stages downstream, which gives the same precedence as their
+    transitive closure.
+    """
+    successors = {}
+    for a, b in life_cycle.stage_pairs():
+        successors.setdefault(id(a), []).append(b)
+    pairs = []
+    for stage in life_cycle.life_cycle:
+        if stage.unit not in requested: continue
+        seen, stack = set(), list(successors.get(id(stage), ()))
+        while stack:
+            other = stack.pop()
+            if id(other) in seen: continue
+            seen.add(id(other))
+            if other.unit in requested: pairs.append((stage.unit, other.unit))
+            else: stack.extend(successors.get(id(other), ()))
+    if not life_cycle.cold: pairs = [(b, a) for a, b in pairs]
+    return pairs
 
 def _format_H(H):
     mantissa, exponent = f'{H:.2e}'.split('e')
@@ -2109,10 +2353,14 @@ def plot_pinch_diagram(stream_life_cycles, inlet_Ts, outlet_Ts,
     Notes
     -----
     Temperatures are shown in degC and heat flows in kJ/hr at the inlet and
-    outlet of each stream. Exchanger columns on each side of the pinch are
+    outlet of each stream (of its whole flow, `StreamLifeCycle.H_in` and
+    its utility's outlet). Exchanger columns on each side of the pinch are
     ordered so that each stream meets them in flow direction whenever the
-    network allows it. Stream labels read '<unit> - <auxiliary> (<stream>)'
-    next to the stream index at the inlet.
+    network allows it; the exchangers of a split stream's branches are
+    ordinary columns, with their branch duties, and sibling branches are
+    not ordered by that stream (splits are not drawn). Stream labels read
+    '<unit> - <auxiliary> (<stream>)' next to the stream index at the
+    inlet.
 
     Examples
     --------
@@ -2141,8 +2389,9 @@ def plot_pinch_diagram(stream_life_cycles, inlet_Ts, outlet_Ts,
 
     """
     import matplotlib.pyplot as plt
-    # Artists carry stable gids ('HX:<ID>', 'Util:<ID>', 'Label:<index>')
-    # so the drawing can be checked structurally in tests.
+    # Artists carry stable gids ('HX:<ID>', 'Util:<ID>', 'Label:<index>',
+    # 'H_in:<index>', 'H_out:<index>') so the drawing can be checked
+    # structurally in tests.
     show_labels = show_units or show_auxiliary_units or show_stream_IDs
     if show_labels and original_hxs is None:
         raise ValueError('original_hxs is required to label streams with '
@@ -2209,7 +2458,8 @@ def plot_pinch_diagram(stream_life_cycles, inlet_Ts, outlet_Ts,
         color = cold_color if cold else hot_color
         yi = y[index]
         stages = life_cycle.life_cycle # never empty: each stream has a utility stage
-        H_in = stages[0].H_in
+        # the whole stream's inlet, also where its first stage is a branch
+        H_in = life_cycle.H_in
         H_out = stages[-1].H_out
         T_in = inlet_Ts[index] - 273.15
         T_out = outlet_Ts[index] - 273.15
@@ -2217,14 +2467,17 @@ def plot_pinch_diagram(stream_life_cycles, inlet_Ts, outlet_Ts,
         T_left, H_left, T_right, H_right = (
             (T_in, H_in, T_out, H_out) if cold else (T_out, H_out, T_in, H_in)
         )
+        gid_left, gid_right = ('H_in:', 'H_out:') if cold else ('H_out:', 'H_in:')
         x_in, x_out, sign = (x_start, x_end, 1) if cold else (x_end, x_start, -1)
         ax.annotate('', xy=(x_out, yi), xytext=(x_in, yi),
                     arrowprops=dict(arrowstyle='-|>', color=color, lw=1.2,
                                     shrinkA=0, shrinkB=0), zorder=2)
         ax.text(x_start - 1.3, yi, f'{T_left:.1f}', color=color, **value_kwargs)
-        ax.text(x_start - 0.6, yi, _format_H(H_left), color=color, **value_kwargs)
+        ax.text(x_start - 0.6, yi, _format_H(H_left), color=color,
+                gid=gid_left + str(index), **value_kwargs)
         ax.text(x_end + 0.6, yi, f'{T_right:.1f}', color=color, **value_kwargs)
-        ax.text(x_end + 1.3, yi, _format_H(H_right), color=color, **value_kwargs)
+        ax.text(x_end + 1.3, yi, _format_H(H_right), color=color,
+                gid=gid_right + str(index), **value_kwargs)
         # Index and label share a baseline above the stream, clear of the
         # exchanger circles
         y_text = yi + 0.25

@@ -2202,5 +2202,288 @@ def test_split_realization_failure_merges_the_split(monkeypatch):
                             rtol=1e-14)
     assert len(hs + cs) == len(plan.exchangers) - len(branch)
 
+# ---------------------------------------------------------------------------
+# Stream splitting: life cycles through splits, pinch diagram
+# ---------------------------------------------------------------------------
+
+from hensmith.hxn_synthesis import LifeStage, StreamSplit, _format_H
+
+#: Synthesized split networks: a hot stream split at its inlet (smith), a
+#: split as the last node (rtB05), four-branch chains split below and then
+#: above the pinch with no trunk exchanger between (crude), and splits of
+#: several streams, one of them after a trunk exchanger (rtB03).
+LIFE_CYCLE_CASES = [*SPLIT_CASES, 'crude_fractionation_ph11c2',
+                    'rtB03_above_hot_vapors']
+
+def split_life_cycles(result, info):
+    """The life cycle of every stream of a synthesized split network (the
+    result and info of `split_synthesis`); every stream is given all the
+    splits, and keeps its own."""
+    hs, cs, utils = result[:3]
+    streams_inlet, cold_indices = result[9], result[12]
+    cycles = []
+    for i in range(len(streams_inlet)):
+        lc = StreamLifeCycle(i, i in cold_indices)
+        lc.get_life_cycle(hs + cs, utils, splits=info['splits'])
+        cycles.append(lc)
+    return cycles
+
+def _is_exchanger(unit):
+    return isinstance(unit, (bst.HXprocess, bst.HXutility))
+
+def _downstream(connections):
+    """Every unit's set of units downstream of it along `connections`."""
+    successors = {}
+    for up, _, down, _ in connections:
+        successors.setdefault(up, []).append(down)
+    reach = {}
+    for unit in successors:
+        seen, stack = set(), list(successors[unit])
+        while stack:
+            other = stack.pop()
+            if other in seen: continue
+            seen.add(other)
+            stack.extend(successors.get(other, ()))
+        reach[unit] = seen
+    return reach
+
+def _contracted(connections, is_exchanger=_is_exchanger):
+    """Exchanger pairs joined by `connections` through splitters and mixers
+    only."""
+    successors = {}
+    for up, _, down, _ in connections:
+        successors.setdefault(up, []).append(down)
+    pairs = set()
+    for unit in successors:
+        if not is_exchanger(unit): continue
+        stack = list(successors[unit])
+        while stack:
+            other = stack.pop()
+            if is_exchanger(other): pairs.add((unit, other))
+            else: stack.extend(successors.get(other, ()))
+    return pairs
+
+@pytest.mark.parametrize('name', LIFE_CYCLE_CASES)
+def test_split_life_cycles(name):
+    # a stream's life cycle through its splits: its stages in the order of
+    # `stream_HXs` (trunk exchangers, every split's branches branch by
+    # branch, each in flow order), branch stages tagged with their split and
+    # fraction, the full-flow inlet at the entry port (the splitter chain
+    # where the stream splits at its inlet), and connections that wire every
+    # outlet to the next unit's planned inlet, each port once
+    result, info, curves, dT = split_synthesis(name, 'lc_' + name)
+    stream_HXs = result[10]
+    streams_inlet = result[9]
+    splits = info['splits']
+    cycles = split_life_cycles(result, info)
+    assert {sp for lc in cycles for sp in lc.splits} == set(splits)
+    for lc in cycles:
+        i = lc.index
+        stages = lc.life_cycle
+        units = [s.unit for s in stages]
+        assert units == stream_HXs[i]
+        # the stream's own splits, in flow order
+        def first(sp): return units.index(sp.branches[0][0])
+        assert lc.splits == sorted([sp for sp in splits if sp.stream == i],
+                                   key=first)
+        tags = {hx: ((k, b), f) for k, sp in enumerate(lc.splits)
+                for b, (f, hxs) in enumerate(zip(sp.fractions, sp.branches))
+                for hx in hxs}
+        for stage in stages:
+            assert (stage.branch, stage.fraction) == tags.get(stage.unit,
+                                                              (None, 1.))
+        # one line per stage (with its enthalpies), then one per split
+        text = repr(lc)
+        assert text.count(' kJ/hr') == 2 * len(stages)
+        for k, sp in enumerate(lc.splits):
+            fractions = ', '.join(f'{f:.4g}' for f in sp.fractions)
+            assert (f'\n\tsplit {k}: {len(sp.fractions)} branches '
+                    f'({fractions})') in text
+        assert text.count('\tsplit ') == len(lc.splits)
+        duty = abs(curves[i].H_out - curves[i].H_in)
+        assert abs(lc.H_in - curves[i].H_in) <= 1e-9 * duty
+        entry = lc.entry.unit.ins[lc.entry.index]
+        assert_allclose(entry.F_mol, streams_inlet[i].F_mol, rtol=1e-14)
+        connections = list(lc.connections())
+        pairs = [(a.unit, b.unit) for a, b in lc.stage_pairs()]
+        assert len(pairs) == len(set(pairs))
+        if not lc.splits:
+            # exactly the consecutive stages, as before splitting
+            assert lc.entry == (stages[0].unit, stages[0].index)
+            assert lc.H_in == stages[0].H_in
+            assert connections == [(a.unit, a.index, b.unit, b.index)
+                                   for a, b in zip(stages, stages[1:])]
+            assert pairs == list(zip(units, units[1:]))
+            continue
+        if lc.splits[0].position == 0:
+            assert lc.entry == (lc.splits[0].splitters[0], 0)
+            assert_allclose(stages[0].H_in, stages[0].fraction * lc.H_in,
+                            rtol=1e-12)
+        else:
+            assert lc.entry == (stages[0].unit, stages[0].index)
+            assert lc.H_in == stages[0].H_in
+        for stage in stages:
+            assert_allclose(stage.s_in.F_mol, stage.fraction * entry.F_mol,
+                            rtol=1e-12)
+        # every inlet port is fed once but the entry, every outlet port
+        # feeds once but the utility's
+        splitters = [u for sp in lc.splits for u in sp.splitters]
+        mixers = [sp.mixer for sp in lc.splits]
+        inlets = {(s.unit, s.index) for s in stages}
+        inlets.update((u, 0) for u in splitters)
+        inlets.update((sp.mixer, b) for sp in lc.splits
+                      for b in range(len(sp.fractions)))
+        outlets = {(s.unit, s.index) for s in stages}
+        outlets.update((u, p) for u in splitters for p in (0, 1))
+        outlets.update((u, 0) for u in mixers)
+        fed = [(down, pi) for _, _, down, pi in connections]
+        feeding = [(up, po) for up, po, _, _ in connections]
+        assert len(fed) == len(set(fed)) and len(feeding) == len(set(feeding))
+        assert set(fed) == inlets - {tuple(lc.entry)}
+        assert set(feeding) == outlets - {(units[-1], 0)}
+        # wiring by the plan: each outlet carries the next inlet's flow and
+        # enthalpy
+        for up, po, down, pi in connections:
+            s_out, s_in = up.outs[po], down.ins[pi]
+            assert_allclose(s_out.F_mol, s_in.F_mol, rtol=1e-12)
+            assert abs(s_out.H - s_in.H) <= 1e-9 * duty, (up.ID, down.ID)
+        # the exchangers' precedence runs through the splitters and mixers
+        # (none between sibling branches)
+        assert set(pairs) == _contracted(connections)
+    if name.startswith('smith'):
+        # the hot stream splits at its inlet and re-joins before its
+        # trunk exchanger and its cooler
+        lc = cycles[2]
+        assert [(u.ID, po, d.ID, pi) for u, po, d, pi in lc.connections()
+                ] == [('Split_2_hs', 0, 'HX_1_2_hs', 1),
+                      ('HX_1_2_hs', 1, 'Mix_2_hs', 0),
+                      ('Split_2_hs', 1, 'HX_0_2_hs', 1),
+                      ('HX_0_2_hs', 1, 'Mix_2_hs', 1),
+                      ('Mix_2_hs', 0, 'HX_2_1_cs', 0),
+                      ('HX_2_1_cs', 0, 'Util_2_cs', 0)]
+        assert [(a.unit.ID, b.unit.ID) for a, b in lc.stage_pairs()] == [
+            ('HX_1_2_hs', 'HX_2_1_cs'), ('HX_0_2_hs', 'HX_2_1_cs'),
+            ('HX_2_1_cs', 'Util_2_cs')]
+        # a split whose branch holds an exchanger of another stream
+        (sp,) = lc.splits
+        other = next(u for u in result[2] if u.ID == 'Util_0_hs')
+        bad = StreamSplit(2, sp.side, sp.index, sp.fractions, sp.splitters,
+                          sp.mixer, [sp.branches[0], [other]], sp.position,
+                          sp.isothermal, sp.H_split, sp.H_mix)
+        with pytest.raises(ValueError, match='does not carry stream 2'):
+            StreamLifeCycle(2, False).get_life_cycle(
+                result[0] + result[1], result[2], splits=[bad])
+    elif name.startswith('crude'):
+        # the chain of four branches below the pinch re-joins into the
+        # chain above it
+        lc = cycles[1]
+        IDs = [(u.ID, po, d.ID, pi) for u, po, d, pi in lc.connections()]
+        assert IDs[:3] == [('Split_1_cs', 1, 'Split_1_cs_b2', 0),
+                           ('Split_1_cs_b2', 1, 'Split_1_cs_b3', 0),
+                           ('Split_1_cs', 0, 'HX_2_1_cs', 1)]
+        assert ('Split_1_cs_b3', 1, 'HX_7_1_cs', 1) in IDs
+        assert ('Mix_1_cs', 0, 'Split_1_hs', 0) in IDs
+        assert IDs[-1] == ('Mix_1_hs', 0, 'Util_1_hs', 0)
+
+def fake_split_life_cycle(cold=True):
+    """A hand-built life cycle of stream 7 (units are names): trunk
+    exchanger A; split 1 into B1 and a bypass; split 2, right after it,
+    into C1 -> C2, D1 and a bypass; trunk exchanger E; utility U."""
+    lc = StreamLifeCycle(7, cold)
+    lc.splits = [
+        StreamSplit(7, 'below', 1, (.6, .4), ['S1'], 'M1', [['B1'], []], 1,
+                    True, 0., 0.),
+        StreamSplit(7, 'above', 1, (.5, .3, .2), ['S2', 'S2_b2'], 'M2',
+                    [['C1', 'C2'], ['D1'], []], 1, False, 0., 0.),
+    ]
+    lc.life_cycle = [LifeStage('A', 0), LifeStage('B1', 1, (0, 0), .6),
+                     LifeStage('C1', 0, (1, 0), .5),
+                     LifeStage('C2', 1, (1, 0), .5),
+                     LifeStage('D1', 0, (1, 1), .3), LifeStage('E', 0),
+                     LifeStage('U', 0)]
+    return lc
+
+def test_life_cycle_connections_through_bypasses():
+    # a bypass wires its splitter outlet to its mixer inlet, and carries
+    # the precedence of the stages before the split past it; consecutive
+    # splits chain their mixer into the next splitter
+    lc = fake_split_life_cycle()
+    assert list(lc.connections()) == [
+        ('A', 0, 'S1', 0), ('S1', 0, 'B1', 1), ('B1', 1, 'M1', 0),
+        ('S1', 1, 'M1', 1), ('M1', 0, 'S2', 0), ('S2', 1, 'S2_b2', 0),
+        ('S2', 0, 'C1', 0), ('C1', 0, 'C2', 1), ('C2', 1, 'M2', 0),
+        ('S2_b2', 0, 'D1', 0), ('D1', 0, 'M2', 1), ('S2_b2', 1, 'M2', 2),
+        ('M2', 0, 'E', 0), ('E', 0, 'U', 0)]
+    pairs = [(a.unit, b.unit) for a, b in lc.stage_pairs()]
+    assert pairs == [('A', 'B1'), ('B1', 'C1'), ('A', 'C1'), ('C1', 'C2'),
+                     ('B1', 'D1'), ('A', 'D1'), ('C2', 'E'), ('D1', 'E'),
+                     ('B1', 'E'), ('A', 'E'), ('E', 'U')]
+    assert set(pairs) == _contracted(lc.connections(),
+                                     lambda u: not u.startswith(('S', 'M')))
+    assert lc.entry is None   # set by get_life_cycle only
+
+@pytest.mark.parametrize('cold', [True, False])
+def test_split_exchanger_columns(cold):
+    # columns follow the flow through splits (right to left for a hot
+    # stream), with precedence carried through the stages left out, and
+    # none between sibling branches, which keep the given order
+    from hensmith.hxn_synthesis import _order_exchanger_columns
+    lc = fake_split_life_cycle(cold)
+    def order(*hxs):
+        return _order_exchanger_columns(list(hxs), [lc])
+    def flow(*hxs): return list(hxs) if cold else list(reversed(hxs))
+    assert order('D1', 'C1') == ['D1', 'C1']
+    assert order('C2', 'D1') == ['C2', 'D1']
+    assert order('C2', 'A') == flow('A', 'C2')
+    assert order('E', 'B1', 'A') == flow('A', 'B1', 'E')
+    assert order('E', 'C2', 'D1', 'B1') == (['B1', 'C2', 'D1', 'E'] if cold
+                                            else ['E', 'C2', 'D1', 'B1'])
+    assert order('C2', 'C1') == flow('C1', 'C2')
+
+@pytest.mark.parametrize('name', ['smith2005_ex18_2_split',
+                                  'crude_fractionation_ph11c2'])
+def test_split_network_pinch_diagram(name):
+    # the diagram of a split network: branch exchangers are columns, the H
+    # labels are the full-flow inlet and outlet of the stream (not those of
+    # its first branch stage, where it splits at its inlet), and the
+    # columns of a split life cycle follow the flow between its non-sibling
+    # exchangers only
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from hensmith.hxn_synthesis import _order_exchanger_columns
+    result, info, curves, dT = split_synthesis(name, 'diagram_' + name)
+    hs, cs, T_in, T_out = result[0], result[1], result[4], result[5]
+    cycles = split_life_cycles(result, info)
+    fig, ax = hxn_synthesis.plot_pinch_diagram(
+        cycles, T_in, T_out, hs, cs, show_units=False,
+        show_auxiliary_units=False, show_stream_IDs=False)
+    try:
+        assert {a.get_gid() for a in _gid_artists(ax, 'HX:')} == {
+            'HX:' + hx.ID for hx in hs + cs}
+        texts = {a.get_gid(): a.get_text() for a in ax.texts if a.get_gid()}
+        for lc in cycles:
+            i = lc.index
+            assert texts[f'H_in:{i}'] == _format_H(lc.H_in)
+            assert texts[f'H_out:{i}'] == _format_H(lc.life_cycle[-1].H_out)
+        at_inlet = [lc for lc in cycles
+                    if lc.splits and lc.entry.unit is lc.splits[0].splitters[0]]
+        assert at_inlet
+        for lc in at_inlet:
+            assert _format_H(lc.life_cycle[0].H_in) != _format_H(lc.H_in)
+    finally:
+        plt.close(fig)
+    for lc in cycles:
+        if not lc.splits: continue
+        reach = _downstream(lc.connections())
+        process = [s.unit for s in lc.life_cycle
+                   if isinstance(s.unit, bst.HXprocess)]
+        for a, b in itertools.combinations(process, 2):
+            if b in reach[a]: expected = [a, b] if lc.cold else [b, a]
+            else: expected = None   # siblings: the given order
+            for given in ([a, b], [b, a]):
+                assert _order_exchanger_columns(given, [lc]) == (
+                    expected or given), (a.ID, b.ID)
+
 if __name__ == '__main__':
     pytest.main([__file__, '-q', '-p', 'no:cacheprovider'])
