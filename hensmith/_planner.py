@@ -2148,9 +2148,11 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
     _split_exclude : dict[str, set[tuple]], optional
         Private (the refine loop): per side, network signatures a split
         candidate may not have unless it is the side's last candidate.
-    _split_prefer : dict[str, str], optional
-        Private (the refine loop): per side, the candidate tried first
-        (the previous round's pick).
+    _split_prefer : dict[str, tuple[str, tuple]], optional
+        Private (the refine loop): per side, the previous round's pick as
+        ``(candidate name, network signature)``. That candidate is tried
+        first and taken as is if it is live and plans the same network;
+        otherwise the side's whole portfolio runs.
 
     Returns
     -------

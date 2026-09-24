@@ -2565,7 +2565,8 @@ def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     split : dict
         ``Qmin`` (exchangers below it count as small in the key; none is
         dropped), ``exclude`` (per side, excluded network signatures) and
-        ``prefer`` (per side, the candidate tried first).
+        ``prefer`` (per side, the previous round's pick as ``(candidate
+        name, network signature)``, tried first).
 
     Returns
     -------
@@ -2586,7 +2587,8 @@ def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     `_SPLIT_RULES`) if the root proof is a pinch rule ('outward' or
     'inward'), then the core (`_CORE_STRATEGIES`). The preferred candidate
     (the previous refine round's pick) is generated first and taken as is
-    unless its signature is excluded. Otherwise every generator runs (the
+    while it plans the same network (its signature is the preferred one),
+    unless that signature is excluded. Otherwise every generator runs (the
     preferred one is not run again) and the smallest `_Candidate.key` wins
     among the candidates not excluded or, if all are excluded, among all
     of them: a side's last candidate is never excluded. With
@@ -2600,7 +2602,7 @@ def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     core = delta <= _preleak_max(side)
     s_ok = core and proof is not None and proof['rule'] in ('outward',
                                                             'inward')
-    prefer = split['prefer'].get(side.name)
+    prefer, signature = split['prefer'].get(side.name, (None, None))
     cands, errors, reasons, spent = [], [], {}, [work]
 
     def generate(name):
@@ -2633,7 +2635,9 @@ def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     def plan(best):
         return _side_plan(side, best, reasons, a0, delta, errors,
                           math.fsum(spent), proof)
-    # the preferred candidate (stickiness), taken as is if it is live
+    # the preferred candidate (stickiness), taken as is if it is live and
+    # its network unchanged (a generator can plan another network on
+    # refined knots, which competes with the whole portfolio)
     first = []
     if s_ok and prefer is not None and prefer[2:] in _SPLIT_RULES and (
             prefer.startswith('S:')):
@@ -2641,7 +2645,7 @@ def _split_side(side, proof, cap1, forbid, work_scale, work, split):
     elif core and prefer in _CORE_STRATEGIES:
         first = [generate(prefer)]
     for c in first:
-        if c is not None and not c.excluded:
+        if c is not None and not c.excluded and c.signature == signature:
             return plan(c)
     # the portfolio: Stage S, then the core
     if s_ok:

@@ -2287,16 +2287,24 @@ def test_split_exclusion_by_signature(monkeypatch):
         ex.add(last['signature'])
     assert len(ex) >= 3 and not any(
         isinstance(k, tuple) for k in last['candidates'].values())
-    # stickiness: a live preferred Stage S candidate is taken first, alone
-    _, pr = plan(_split_prefer={name: sp2['candidate']})
+    # stickiness: a live preferred Stage S candidate that plans the same
+    # network as before (its signature) is taken first, alone
+    _, pr = plan(_split_prefer={name: (sp2['candidate'], sp2['signature'])})
     assert (pr['candidate'], pr['signature']) == (sp2['candidate'],
                                                   sp2['signature'])
     assert set(pr['candidates']) == {sp2['candidate']}
+    # one whose network changed (another signature) is not: the whole
+    # portfolio runs (the preferred one once) and the best key wins
+    _, pr = plan(_split_prefer={name: (sp2['candidate'], sp['signature'])})
+    assert (pr['candidate'], pr['signature']) == (sp['candidate'],
+                                                  sp['signature'])
+    assert set(pr['candidates']) == set(sp['candidates'])
     # an excluded preferred one: the rest of the portfolio, not it again
-    _, pr = plan(_split_prefer={name: sp['candidate']},
+    _, pr = plan(_split_prefer={name: (sp['candidate'], sp['signature'])},
                  _split_exclude={name: {sp['signature']}})
     assert pr['signature'] == sp2['signature']
     assert pr['candidates'][sp['candidate']] == 'excluded'
+    assert set(pr['candidates']) == set(sp['candidates'])
     # the core alone (Stage S off), its four strategies: LV and LVT build
     # one network here, so excluding the pick excludes both
     monkeypatch.setattr(SP, '_SPLIT_RULES', ())
@@ -2326,11 +2334,14 @@ def test_split_exclusion_by_signature(monkeypatch):
     both = {sig, ex['signature']}
     _, last = plan(_split_exclude={name: both})
     assert last['candidate'] == 'V' and last['signature'] == sig
-    # stickiness: a live preferred candidate is taken as is, first
-    _, pr = plan(_split_prefer={name: 'V0'})
+    # stickiness: a live preferred candidate is taken as is, first, while
+    # its network is unchanged
+    _, pr = plan(_split_prefer={name: ('V0', ex['signature'])})
     assert pr['candidate'] == 'V0' and set(pr['candidates']) == {'V0'}
-    _, pr = plan(_split_prefer={name: 'V0'},
+    _, pr = plan(_split_prefer={name: ('V0', ex['signature'])},
                  _split_exclude={name: {ex['signature']}})
+    assert pr['candidate'] == 'V' and set(pr['candidates']) == {'V', 'V0'}
+    _, pr = plan(_split_prefer={name: ('V0', sig)})
     assert pr['candidate'] == 'V' and set(pr['candidates']) == {'V', 'V0'}
     # the exclusion is by network, not by name: another side's is ignored
     _, other = plan(_split_exclude={'none': {sig}})

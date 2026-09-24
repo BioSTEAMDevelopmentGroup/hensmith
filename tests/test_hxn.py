@@ -1688,5 +1688,332 @@ def test_repair_shrinks_branches_with_fractions(monkeypatch):
     finally:
         hxn_synthesis._discard(units.values())
 
+# ---------------------------------------------------------------------------
+# Stream splitting: splitters, mixers and the refine loop (synthesize_network)
+# ---------------------------------------------------------------------------
+
+import math
+
+SPLIT_CASES = ['smith2005_ex18_2_split', 'rtB05_above_2h1c']
+
+def split_units(name, flowsheet=None):
+    """Heat utilities of corpus case `name` in the order the facility gives
+    them (by duty) and its T_min_app, in flowsheet `flowsheet` (if given)."""
+    case = next(c for c in MER_SPLIT if c['name'] == name)
+    units, dT = test_hxn_mer._build(case)
+    hus = sorted([hx.heat_utilities[0] for hx in units],
+                 key=lambda hu: hu.duty)
+    if flowsheet: bst.main_flowsheet.set_flowsheet(flowsheet)
+    return hus, dT
+
+def split_synthesis(name, flowsheet=None, **kwargs):
+    """`synthesize_network` with stream splitting on corpus case `name`:
+    its result, its info, the streams' curves and T_min_app."""
+    hus, dT = split_units(name, flowsheet)
+    curves = hxn_synthesis._pinch_analysis(hus, dT)[13]
+    info = {}
+    result = synthesize_network(hus, dT, info=info, stream_splitting=True,
+                                **kwargs)
+    return result, info, curves, dT
+
+def spy_plans(monkeypatch):
+    """Record every plan (and the keywords it was planned with) that
+    `synthesize_network` makes."""
+    plans, plan_network = [], hxn_synthesis.plan_network
+    def spy(*args, **kwargs):
+        plan = plan_network(*args, **kwargs)
+        plans.append((plan, kwargs))
+        return plan
+    monkeypatch.setattr(hxn_synthesis, 'plan_network', spy)
+    return plans
+
+def stream_port(hx, j):
+    """Port of stream `j` in synthesized process exchanger `hx`."""
+    return _stream_ports(hx).index(j)
+
+def test_synthesize_network_splitting_requires_info():
+    units = r002('r002_split_info')
+    hus = [hx.heat_utilities[0] for hx in units]
+    with pytest.raises(ValueError, match='info'):
+        synthesize_network(hus, 10., stream_splitting=True)
+
+@pytest.mark.parametrize('name', [*SPLIT_CASES, 'crude_fractionation_ph11c2',
+                                  'rtB03_above_hot_vapors'])
+def test_synthesize_network_with_splitting(name):
+    # smith2005_ex18_2 splits a cold stream at its inlet above the pinch,
+    # isothermally; rtB05 (real thermo) splits its cold stream as its last
+    # node, non-isothermally, into its heater; the crude unit splits into
+    # three branches or more (splitter chains of several elements); rtB03
+    # splits a vapor at its inlet, whose real inlet is not bit for bit its
+    # state at the inlet enthalpy: all reach MER through splitter chains,
+    # branch exchangers and rigorous mixers
+    result, info, curves, dT = split_synthesis(name, 'synth_' + name)
+    assert len(result) == 13
+    (hs, cs, utils, hxs, T_in, T_out, pinch_T, C_flow, hus_rearranged,
+     streams_inlet, stream_HXs, hot_indices, cold_indices) = result
+    assert info['status'] == 'mer' and info['stream_splitting'] is True
+    assert info['dropped'] == info['repaired'] == []
+    assert info['split_deviations'] == [] and info['deviations'] == []
+    scale = sum(abs(c.H_out - c.H_in) for c in curves)
+    assert_allclose([info['Q_hot'], info['Q_cold']],
+                    [info['Q_hot_target'], info['Q_cold_target']],
+                    rtol=0, atol=1e-6 * scale)
+    process = hs + cs
+    assert all(isinstance(hx, bst.HXprocess) for hx in process)
+    for i, stages in stream_HXs.items():
+        assert isinstance(stages[-1], bst.HXutility)
+        assert all(isinstance(u, bst.HXprocess) for u in stages[:-1])
+    # every process exchanger is on both its streams, once
+    assert sorted(hx.ID for stages in stream_HXs.values()
+                  for hx in stages[:-1]) == sorted(
+        [hx.ID for hx in process] * 2)
+    splits = info['splits']
+    assert splits and all(isinstance(sp, hxn_synthesis.StreamSplit)
+                          for sp in splits)
+    branch_HXs = {hx for sp in splits for b in sp.branches for hx in b}
+    ordinal = {}
+    for sp in splits:
+        j, n = sp.stream, len(sp.fractions)
+        hot = j in hot_indices
+        curve = curves[j]
+        duty = abs(curve.H_out - curve.H_in)
+        tag = 'hs' if sp.side == 'above' else 'cs'
+        ordinal[j, tag] = ordinal.get((j, tag), 0) + 1
+        assert sp.index == ordinal[j, tag]
+        base = f'Split_{j}_{tag}' + ('' if sp.index == 1 else f'_{sp.index}')
+        assert [u.ID for u in sp.splitters] == [base] + [
+            f'{base}_b{c}' for c in range(2, n)]
+        assert all(type(u) is bst.Splitter for u in sp.splitters)
+        assert type(sp.mixer) is bst.Mixer and sp.mixer.rigorous
+        assert sp.mixer.ID == 'Mix' + base[len('Split'):]
+        assert len(sp.branches) == n == len(sp.mixer.ins) >= 2
+        assert abs(math.fsum(sp.fractions) - 1.) <= 1e-12
+        # the chain: element c sends f_c / (f_c + ... + f_n) of its feed to
+        # its first outlet; its second outlet feeds element c + 1
+        F = streams_inlet[j].F_mol
+        feed = sp.splitters[0].ins[0]
+        assert_allclose(feed.F_mol, F, rtol=1e-14)
+        assert abs(feed.H - sp.H_split) <= 1e-9 * duty
+        for c, u in enumerate(sp.splitters):
+            assert_allclose(u.split, sp.fractions[c]
+                            / math.fsum(sp.fractions[c:]), rtol=1e-15)
+            if c: assert u.ins[0] is sp.splitters[c - 1].outs[1]
+        for b, f in enumerate(sp.fractions):
+            unit, port = sp.outlet(b)
+            assert unit in sp.splitters
+            assert_allclose(unit.outs[port].F_mol, f * F, rtol=1e-12)
+            for hx in sp.branches[b]:
+                assert hx in process
+                assert_allclose(hx.ins[stream_port(hx, j)].F_mol, f * F,
+                                rtol=1e-12)
+        # the stream re-joins at its split enthalpy -/+ the branch duties
+        Q = math.fsum(hx.Q for b in sp.branches for hx in b)
+        assert abs(sp.H_mix - (sp.H_split - Q if hot else sp.H_split + Q)
+                   ) <= 1e-9 * duty
+        assert abs(sp.mixer.outs[0].H - sp.H_mix) <= 1e-9 * duty
+        # the stream's stages: its trunk exchangers before the split, the
+        # branches (branch by branch, each in flow order), then the rest
+        stages = stream_HXs[j][:-1]
+        branches = [hx for b in sp.branches for hx in b]
+        k = stages.index(branches[0])
+        assert stages[k:k + len(branches)] == branches
+        assert len([hx for hx in stages[:k]
+                    if hx not in branch_HXs]) == sp.position
+        if k == 0:   # a split at the stream's inlet takes the real inlet
+            real = _copy(streams_inlet[j])
+            hxn_synthesis._first_inlet(real, not curve.monotone,
+                                       curve.T_out, hot)
+            assert feed.T == real.T
+    # smith2005_ex18_2 splits at the inlet and re-joins at the pinch (one
+    # temperature); rtB05 re-joins non-isothermally into its heater
+    if name.startswith('crude'):
+        assert max(len(sp.fractions) for sp in splits) >= 3
+    elif name.startswith('smith'):
+        assert [(sp.position, sp.isothermal) for sp in splits] == [(0, True)]
+    elif name.startswith('rtB05'):
+        assert [(sp.position, sp.isothermal) for sp in splits] == [(1, False)]
+        (sp,) = splits
+        util = stream_HXs[sp.stream][-1]
+        assert abs(util.ins[0].H - sp.H_mix) <= 1e-9 * abs(
+            curves[sp.stream].H_out - curves[sp.stream].H_in)
+
+@pytest.mark.parametrize('name', SPLIT_CASES)
+def test_split_mixer_outlet_is_the_planned_state(name, monkeypatch):
+    # a rigorous mixer seeded at the planned state lands on it: T within
+    # _MIX_T_TOL of the planned mix state and H equal to its inlets' (to
+    # round-off for constant CP; a real-thermo outlet's H is the H of the
+    # converged T); isothermal inlets share the mix state, others each
+    # carry the end state of their branch
+    result, info, curves, dT = split_synthesis(name, 'mix_' + name)
+    assert hxn_synthesis._MIX_T_TOL == 1e-7
+    smith = name.startswith('smith')
+    for sp in info['splits']:
+        j = sp.stream
+        curve = curves[j]
+        duty = abs(curve.H_out - curve.H_in)
+        out = sp.mixer.outs[0]
+        planned = curve.state_at_H(sp.H_mix)
+        assert abs(out.T - planned.T) <= hxn_synthesis._MIX_T_TOL
+        H_in = math.fsum(s.H for s in sp.mixer.ins)
+        assert abs(out.H - H_in) <= (1e-12 * abs(H_in) if smith
+                                     else 1e-9 * duty)
+        assert_allclose(out.F_mol, result[9][j].F_mol, rtol=1e-12)
+        assert [s.ID for s in sp.mixer.ins] == [
+            f's_{j}_{b}__{sp.mixer.ID}' for b in range(len(sp.fractions))]
+        assert out.ID == f'{sp.mixer.ID}__s_{j}'
+        for f, s, branch in zip(sp.fractions, sp.mixer.ins, sp.branches):
+            assert_allclose(s.F_mol, f * out.F_mol, rtol=1e-12)
+            if sp.isothermal:
+                assert abs(s.T - planned.T) <= 1e-9
+            else:
+                hx = branch[-1]
+                assert abs(s.H - hx.outs[stream_port(hx, j)].H
+                           ) <= 1e-9 * duty
+    # one rule for every mixer: outside the tolerance, it is reported
+    monkeypatch.setattr(hxn_synthesis, '_MIX_T_TOL', -1.)
+    _, info, _, _ = split_synthesis(name, 'mix_dev_' + name)
+    assert [d['ID'] for d in info['split_deviations']] == [
+        sp.mixer.ID for sp in info['splits']]
+    for d, sp in zip(info['split_deviations'], info['splits']):
+        assert set(d) == {'ID', 'T_plan', 'T', 'H_plan', 'H'}
+        assert d['T'] == sp.mixer.outs[0].T and d['H'] == sp.mixer.outs[0].H
+
+def test_unsplit_refine_loop_identical_with_splitting(monkeypatch):
+    # with chords 0.5 K off the exact curves and no refine round, round 0
+    # violates and is repaired; no side splits, so the flag changes nothing
+    # (the refine loop with splitting is the default loop, R3)
+    curves = hxn_synthesis.stream_curves
+    monkeypatch.setattr(hxn_synthesis, 'stream_curves',
+                        lambda *args, **kwargs: curves(*args, tol_T=0.5, **kwargs))
+    monkeypatch.setattr(hxn_synthesis, '_MAX_REFINE', 0)
+    units, T_min_app = test_hxn_targets.case_curvature()
+    hus = [hx.heat_utilities[0] for hx in units]
+    plans = spy_plans(monkeypatch)
+    runs = []
+    for flag in (False, True):
+        bst.main_flowsheet.set_flowsheet(f'curvature_split_{flag}')
+        info = {}
+        result = synthesize_network(hus, T_min_app, info=info,
+                                    stream_splitting=flag)
+        runs.append((info, [(hx.ID, hx.Q) for hx in result[0] + result[1]]))
+    (off, net_off), (on, net_on) = runs
+    assert len(plans) == 2   # one round each
+    assert on['refine_rounds'] == off['refine_rounds'] == 0
+    assert on['repaired'] and on['repaired'] == off['repaired']
+    assert net_on == net_off
+    assert 'splits' not in off and 'stream_splitting' not in off
+    assert on['splits'] == on['split_deviations'] == []
+    assert all(s['split'] is None for s in on['sides'].values())
+
+def test_split_retry_changes_the_candidate(monkeypatch):
+    # a violation on a split side after the last refine round (injected in
+    # round 0, with no refine rounds): the side's network is excluded by its
+    # signature, and the retry round plans a different one there
+    monkeypatch.setattr(hxn_synthesis, '_MAX_REFINE', 0)
+    plans = spy_plans(monkeypatch)
+    exact, injected = hxn_synthesis._exact_approach, []
+    def inject(plan, duties, ends, curves, knots, T_min_app):
+        worst, violations, bad = exact(plan, duties, ends, curves, knots,
+                                       T_min_app)
+        if len(plans) == 1 and not injected:
+            assert not bad
+            n = next(n for n, e in enumerate(plan.exchangers)
+                     if (e.hot_frac, e.cold_frac) != (1., 1.))
+            e = plan.exchangers[n]
+            curve, H = curves[e.hot], ends[n, e.hot][0]  # its hot end
+            violations = {e.hot: [(curve.T_exact(curve.H_lo + H), H)]}
+            bad = [n]
+            injected.append(e.side)
+        return worst, violations, bad
+    monkeypatch.setattr(hxn_synthesis, '_exact_approach', inject)
+    result, info, curves, dT = split_synthesis('smith2005_ex18_2_split',
+                                               'split_retry')
+    (s,) = injected
+    assert len(plans) == 2 and info['refine_rounds'] == 1
+    sp0 = plans[0][0].info['sides'][s]['split']
+    sp1 = plans[1][0].info['sides'][s]['split']
+    assert sp1['signature'] != sp0['signature']
+    assert plans[1][1]['_split_exclude'] == {s: {sp0['signature']}}
+    assert plans[1][1]['_split_prefer'] == {
+        s: (sp0['candidate'], sp0['signature'])}
+    assert sp1['candidates'][sp0['candidate']] == 'excluded'
+    # the retry's plan is the one realized (no restore)
+    assert info['sides'] is plans[1][0].info['sides']
+    assert info['status'] == 'mer' and info['split_deviations'] == []
+
+def test_split_retry_restores_the_best_plan(monkeypatch):
+    # a retry that does worse (injected: one violating exchanger on the
+    # split side in round 0, all of that side's in the retry): the round-0
+    # plan, with the fewest violating exchangers, is restored and realized
+    monkeypatch.setattr(hxn_synthesis, '_MAX_REFINE', 0)
+    monkeypatch.setattr(hxn_synthesis, '_MAX_SPLIT_RETRY', 1)
+    plans = spy_plans(monkeypatch)
+    exact, injected = hxn_synthesis._exact_approach, []
+    def inject(plan, duties, ends, curves, knots, T_min_app):
+        worst, violations, bad = exact(plan, duties, ends, curves, knots,
+                                       T_min_app)
+        if len(injected) < len(plans) <= 2:   # once in each round
+            assert not bad
+            s = next(e.side for e in plan.exchangers
+                     if (e.hot_frac, e.cold_frac) != (1., 1.))
+            bad = [n for n, e in enumerate(plan.exchangers) if e.side == s]
+            bad = bad[:1] if len(plans) == 1 else bad
+            violations = {}
+            for n in bad:
+                e = plan.exchangers[n]
+                curve, H = curves[e.hot], ends[n, e.hot][0]
+                violations.setdefault(e.hot, []).append(
+                    (curve.T_exact(curve.H_lo + H), H))
+            injected.append((s, bad))
+        return worst, violations, bad
+    monkeypatch.setattr(hxn_synthesis, '_exact_approach', inject)
+    result, info, curves, dT = split_synthesis('smith2005_ex18_2_split',
+                                               'split_restore')
+    (s, bad0), (s1, bad1) = injected
+    assert s1 == s and len(bad0) == 1 < len(bad1)
+    assert len(plans) == 2 and info['refine_rounds'] == 1
+    sp0 = plans[0][0].info['sides'][s]['split']
+    assert plans[1][0].info['sides'][s]['split']['signature'] != (
+        sp0['signature'])
+    assert info['sides'] is plans[0][0].info['sides']   # restored
+    assert info['status'] == 'mer' and info['repaired'] == []
+    (sp,) = info['splits']
+    assert sp.fractions == plans[0][0].splits[0].fractions
+
+def test_split_realization_failure_merges_the_split(monkeypatch):
+    # a mixer that cannot be simulated: its split's branch exchangers are
+    # dropped (their duty goes to the utilities), no splitter or mixer is
+    # left, the stream passes as a trunk and every balance still closes
+    plans = spy_plans(monkeypatch)
+    def fail(self): raise RuntimeError('mixer failed')
+    monkeypatch.setattr(bst.Mixer, '_run', fail)
+    result, info, curves, dT = split_synthesis('smith2005_ex18_2_split',
+                                               'split_failure')
+    hs, cs, utils = result[:3]
+    streams_inlet, stream_HXs = result[9], result[10]
+    (plan, _), = plans
+    (split,) = plan.splits
+    branch = [n for ns in split.branches for n in ns]
+    assert len(info['dropped']) == len(branch) >= 2
+    assert all('mixer failed' in d['error'] for d in info['dropped'])
+    assert_allclose(sorted(d['Q'] for d in info['dropped']),
+                    sorted(plan.exchangers[n].Q for n in branch), rtol=1e-15)
+    assert info['splits'] == [] and info['status'] == 'best_effort'
+    assert not [ID for ID in bst.main_flowsheet.unit.data
+                if ID.startswith(('Split_', 'Mix_'))]
+    scale = sum(abs(c.H_out - c.H_in) for c in curves)
+    assert_allclose([info['Q_hot'], info['Q_cold']],
+                    [info['Q_hot_plan'], info['Q_cold_plan']],
+                    rtol=0, atol=1e-6 * scale)
+    Q_lost = math.fsum(d['Q'] for d in info['dropped'])
+    assert_allclose(info['Q_hot_plan'], info['Q_hot_target'] + Q_lost,
+                    rtol=1e-9)
+    # every remaining exchanger runs whole streams
+    for hx in hs + cs:
+        for k, j in enumerate(_stream_ports(hx)):
+            assert_allclose(hx.ins[k].F_mol, streams_inlet[j].F_mol,
+                            rtol=1e-14)
+    assert len(hs + cs) == len(plan.exchangers) - len(branch)
+
 if __name__ == '__main__':
     pytest.main([__file__, '-q', '-p', 'no:cacheprovider'])
