@@ -16,6 +16,7 @@ direct evaluation.
 """
 import math
 import random
+from collections import Counter
 
 import numpy as np
 import pytest
@@ -1691,7 +1692,7 @@ def split_infos(plan):
             if s.get('split')}
 
 
-def check_split_network(streams, dT, net, tol=1e-6, exact=True):
+def check_split_network(streams, dT, net, tol=1e-6, exact=True, mer=True):
     """
     Walk every stream along ``plan.paths``: trunk exchangers in series and
     the branches of every split in parallel from the split state, each at
@@ -1707,7 +1708,9 @@ def check_split_network(streams, dT, net, tol=1e-6, exact=True):
     'mer'-close: temperatures offset by less than tolQ/CP let the unsplit
     planner's own tolerances reach the utilities (`_sides` omits a stream
     part of at most tolQ at the pinch; `_cascade` thresholds the target of
-    a side with no must). Returns the hot and cold utility.
+    a side with no must). With ``mer=False`` (a best-effort network, e.g.
+    avoid_recycle), the utilities are only at least the targets. Returns
+    the hot and cold utility.
     """
     plan = net['plan']
     matches = net['matches']
@@ -1772,8 +1775,11 @@ def check_split_network(streams, dT, net, tol=1e-6, exact=True):
     Qh = sum(net['hot_utility'].values())
     Qc = sum(net['cold_utility'].values())
     Qh_t, Qc_t, _ = cascade(streams, dT)
-    assert abs(Qh - Qh_t) <= qtol + preleak
-    assert abs(Qc - Qc_t) <= qtol + preleak
+    if mer:
+        assert abs(Qh - Qh_t) <= qtol + preleak
+        assert abs(Qc - Qc_t) <= qtol + preleak
+    else:   # never below the targets
+        assert Qh >= Qh_t - qtol and Qc >= Qc_t - qtol
     # MF4: the split machinery adds no heat error
     sides = sides_from_knots(
         [([min(s['T_in'], s['T_out']), max(s['T_in'], s['T_out'])],
@@ -1788,9 +1794,29 @@ def check_split_network(streams, dT, net, tol=1e-6, exact=True):
                                and m[role] == streams[c.stream]['name'])
             assert served + gaps.get(c.stream, 0.) == pytest.approx(
                 c.Q, abs=exact_tol)
-    if exact:
+    if exact and mer:
         assert plan.penalty <= preleak + exact_tol
     return Qh, Qc
+
+
+S_NAMES = tuple('S:' + rule for rule in SP._SPLIT_RULES)
+SPLIT_SIZE = {  # units + extra branches + split stages of the split side,
+    # at most (as recorded when Stage S was added)
+    'smith2005_exr18_4': 5, 'smith2005_ex16_5_five_stream': 5,
+    'rnd_uniform_n2-6_s327': 4}
+
+
+def split_size(side_info):
+    """Key element 4 of a split side: units + extra branches + split
+    stages (every splitter and mixer pair counts like a unit)."""
+    sp = side_info['split']
+    return side_info['units'] + (sp['branches'] - sp['stages']) + sp['stages']
+
+
+def repeated_pairs(net):
+    """(hot, cold) pairs of more than one exchanger, across the pinch."""
+    pairs = Counter((m['hot'], m['cold']) for m in net['matches'])
+    return [p for p, n in pairs.items() if n > 1]
 
 
 @pytest.mark.parametrize('name', sorted(SPLIT))
@@ -1808,11 +1834,19 @@ def test_split_cases_reach_mer(name):
         if sp is None:   # a side the unsplit search serves
             assert s['status'] in ('mer', 'trivial')
             continue
-        assert s['status'] == 'mer' and s['method'] == 'split-V'
+        assert s['status'] == 'mer' and s['method'] == 'split-' + sp[
+            'candidate']
         assert s['proof']['rule'] in ('outward', 'inward')
-        assert sp['candidate'] == 'V' and sp['preleak'] == sp['leak'] == 0.
+        assert sp['preleak'] == sp['leak'] == 0.
         assert sp['errors'] == [] and sp['small'] == []
-        assert isinstance(sp['candidates']['V'], tuple)
+        # the whole portfolio ran: Stage S (a rule reaches MER) and the
+        # core backstop, and the smallest key won
+        cands = sp['candidates']
+        assert set(cands) == set(S_NAMES) | set(SP._CORE_STRATEGIES)
+        keys = {n: k for n, k in cands.items() if isinstance(k, tuple)}
+        assert 'V' in keys and any(n in keys for n in S_NAMES)
+        assert sp['candidate'] == min(keys, key=keys.get)
+        assert split_size(s) <= SPLIT_SIZE[name]
         assert s['units'] == len([e for e in plan.exchangers
                                   if e.side == sname])
 
@@ -2031,8 +2065,36 @@ def test_split_exclusion_by_signature(monkeypatch):
         check_split_network(streams, dT, net)
         (name, sp), = split_infos(net['plan']).items()
         return name, sp
-    # one core candidate: excluding its signature still returns it (a
-    # side's last candidate is never excluded)
+    # the whole portfolio (Stage S and the core): excluding the chosen
+    # network gives a different one; excluding every network in turn
+    # still returns a candidate (never None)
+    name, sp = plan()
+    assert sp['candidate'] in S_NAMES
+    ex = {sp['signature']}
+    _, sp2 = plan(_split_exclude={name: set(ex)})
+    assert sp2['signature'] not in ex
+    assert sp2['candidates'][sp['candidate']] == 'excluded'
+    while True:
+        _, last = plan(_split_exclude={name: set(ex)})
+        if last['signature'] in ex:
+            break
+        ex.add(last['signature'])
+    assert len(ex) >= 3 and not any(
+        isinstance(k, tuple) for k in last['candidates'].values())
+    # stickiness: a live preferred Stage S candidate is taken first, alone
+    _, pr = plan(_split_prefer={name: sp2['candidate']})
+    assert (pr['candidate'], pr['signature']) == (sp2['candidate'],
+                                                  sp2['signature'])
+    assert set(pr['candidates']) == {sp2['candidate']}
+    # an excluded preferred one: the rest of the portfolio, not it again
+    _, pr = plan(_split_prefer={name: sp['candidate']},
+                 _split_exclude={name: {sp['signature']}})
+    assert pr['signature'] == sp2['signature']
+    assert pr['candidates'][sp['candidate']] == 'excluded'
+    # the core alone (Stage S off): one core candidate; excluding its
+    # signature still returns it (a side's last candidate is never
+    # excluded)
+    monkeypatch.setattr(SP, '_SPLIT_RULES', ())
     name, sp = plan()
     sig = sp['signature']
     name2, sp2 = plan(_split_exclude={name: {sig}})
@@ -2063,9 +2125,13 @@ def test_split_exclusion_by_signature(monkeypatch):
 
 def test_fuzz_splitting_always_reaches_mer(monkeypatch):
     monkeypatch.setattr(P, '_BE_WORK', 3000.)   # keep best effort short
+    monkeypatch.setattr(SP, '_SPLIT_S_WORK', 3000.)
+    rules = SP._SPLIT_RULES
     rng = random.Random(29)
-    n_split = n_same = 0
+    n_split = n_same = n_s = 0
     for seed in range(300):
+        # half the seeds with the core alone (Stage S off)
+        monkeypatch.setattr(SP, '_SPLIT_RULES', () if seed % 2 else rules)
         jitter = seed % 3 == 2   # temperatures closer than tolQ/CP
         if jitter:
             rows, dT = jittered_problem(seed)
@@ -2084,6 +2150,10 @@ def test_fuzz_splitting_always_reaches_mer(monkeypatch):
         infos = split_infos(plan)
         assert all(sp['leak'] == 0. and sp['errors'] == []
                    for sp in infos.values())
+        if seed % 2:
+            assert all(sp['candidate'] in SP._CORE_STRATEGIES
+                       for sp in infos.values())
+        n_s += sum(sp['candidate'] in S_NAMES for sp in infos.values())
         n_split += bool(infos)
         if not needs_split(streams, dT):
             off = P._plan_numeric(streams, dT)
@@ -2091,7 +2161,7 @@ def test_fuzz_splitting_always_reaches_mer(monkeypatch):
             assert [(e.H_hot_in, e.H_cold_in) for e in plan.exchangers] == [
                 (e.H_hot_in, e.H_cold_in) for e in off['plan'].exchangers]
             n_same += 1
-    assert n_split >= 110 and n_same >= 150
+    assert n_split >= 110 and n_same >= 150 and n_s >= 40
 
 
 # %% 18. Stage S cut transports (hensmith._splitting)
@@ -2379,3 +2449,206 @@ def test_pinch_split_on_the_corpus(monkeypatch):
     monkeypatch.setattr(SP, '_SPLIT_CUTS', 2)
     assert SP._pinch_split(side, a0, proof, 'nw-exact-asc') is None
     assert SP._pinch_split(side, a0, proof, 'nw-exact-desc')[1] == 2
+
+
+# %% 19. Stage S: pinch splits planned by the unchanged DFS
+
+def stage_s(side, a0, proof, cap1=False, forbid=frozenset(), Qmin=0., **kw):
+    """`_stage_s` with fresh errors and reasons."""
+    errors, reasons = [], {}
+    split = dict(Qmin=Qmin, exclude={}, prefer={})
+    cands = SP._stage_s(side, a0, proof, cap1, forbid, 1., split, errors,
+                        reasons, **kw)
+    return cands, errors, reasons
+
+
+def test_stage_s_cells_fold_and_sweep():
+    L = P._LevelCurve
+    # fold (Lemma F): a CP-3 flex in three branches serves two CP-1 musts
+    # from the pinch; the 0.1 branch is unused, so its fraction goes to
+    # the others in proportion and their parent positions shrink
+    musts = [L([0., 100.], [95., 195.], 0), L([0., 100.], [95., 195.], 1)]
+    flex = L([0., 300.], [95., 195.], 2, role='flex')
+    side = P._Side('above', musts, [flex], 1e-9, 1e-9)
+    items = [('must', 0, 1., None), ('must', 1, 1., None),
+             ('flex', 0, .5, ('S', 0, 0)), ('flex', 0, .4, ('S', 0, 1)),
+             ('flex', 0, .1, ('S', 0, 2))]
+    pieces = [(0, 0, 0., 0., 60.), (0, 0, 60., 60., 40.),
+              (1, 1, 0., 0., 100.)]
+    cells, why = SP._s_cells(side, items, [0., 0.], pieces)
+    assert why is None
+    assert [(c.i, c.j, c.x, c.a, c.b, c.f, c.km) for c in cells] == [
+        (0, 0, 100., 0., 0., 1., None), (1, 0, 100., 0., 0., 1., None)]
+    assert [(c.g, c.kf) for c in cells] == [(.5 / .9, ('S', 0, 0)),
+                                            (.4 / .9, ('S', 0, 1))]
+    _verify_side_cells(side, cells)
+    # one used branch: a trunk again
+    one = P._Side('above', musts[:1], [flex], 1e-9, 1e-9)
+    cells, why = SP._s_cells(one, items[:1] + items[2:], [0.], pieces[:2])
+    assert [(c.x, c.b, c.g, c.kf) for c in cells] == [(100., 0., 1., None)]
+    # the residual sweep: must A ends r short (r <= tolQ, the DFS's own
+    # tolerance); r goes to A's far-end cell, and the later cell of the
+    # same flex (B's) moves with it, so the flex stays a prefix
+    musts = [L([0., 50.], [95., 145.], 0), L([0., 100.], [95., 195.], 1)]
+    flexes = [L([0., 150.], [95., 195.], 2, role='flex'),
+              L([0., 150.], [95., 195.], 3, role='flex')]
+    side = P._Side('above', musts, flexes, 1e-9, 1e-9)
+    items = [('must', 0, 1., None), ('must', 1, 1., None),
+             ('flex', 0, 1., None), ('flex', 1, 1., None)]
+    for r in (.5e-9, -.5e-9):
+        pieces = [(0, 0, 0., 0., 50. - r), (1, 1, 0., 0., 60.),
+                  (1, 0, 60., 50. - r, 40.)]
+        cells, why = SP._s_cells(side, items, [0., 0.], pieces)
+        assert why is None
+        assert abs(cells[0].x - 50.) <= 1e-13
+        assert cells[2].b == cells[0].b_end and cells[2].x == 40.
+        _verify_side_cells(side, cells)
+    # beyond tolQ, or a must with no cell: rejected
+    pieces = [(0, 0, 0., 0., 50. - 2e-9), (1, 1, 0., 0., 60.),
+              (1, 0, 60., 50. - 2e-9, 40.)]
+    assert SP._s_cells(side, items, [0., 0.], pieces) == (None, 'sweep')
+    assert SP._s_cells(side, items, [0., 0.], pieces[:1]) == (None,
+                                                              'sweep')
+
+
+def test_stage_s_candidates_are_verified():
+    """Every Stage S candidate on the TP split sides, the number and CP
+    rule cases and the nptel_t5_3 double pinch: exact cells from the
+    pre-leaked root, isothermal must remixes, no bad remix, the rule's
+    order; the reasons name every rule."""
+    problems = [SPLIT[n] for n in sorted(SPLIT)] + [
+        TWO_HOT_ONE_COLD, ONE_HOT_TWO_COLD, NEAR_DOUBLE_PINCH,
+        corpus_problem('nptel_t5_3_four_stream_split')]
+    n = 0
+    for dT, rows in problems:
+        for name, side in sides_from(rows, dT).items():
+            z_m, z_f = [0.] * side.M, [0.] * side.F
+            proof = side.rules_violation(z_m, z_f, side.analyse(z_m, z_f))
+            if proof is None:
+                continue
+            a0 = SP._preleak_root(side)[1]
+            cands, errors, reasons = stage_s(side, a0, proof)
+            assert errors == [] and cands and set(reasons) == set(S_NAMES)
+            for c in cands:
+                assert c.order == (0, S_NAMES.index(c.name))
+                assert reasons[c.name] == c.key() and not c.excluded
+                assert c.leak_by_must == [0.] * side.M and c.mixbad == 0
+                _verify_side_cells(side, c.cells, a0)
+                merged = SP._merge_cells(c.cells, side.tolQ)
+                for (role, _, _), br in SP._stages(merged).items():
+                    assert role == 'f' or SP._remix(role, br, side.tolQ)[2]
+                n += 1
+    assert n >= 10
+
+
+def test_stage_s_budget(monkeypatch):
+    # the rules share one budget: a rule not reached is 'budget', and the
+    # core still serves the side
+    monkeypatch.setattr(SP, '_SPLIT_S_WORK', 1.)
+    dT, rows = SPLIT['smith2005_exr18_4']
+    streams = streams_from(rows)
+    net = P._plan_numeric(streams, dT, **SPLIT_ON)
+    assert net['status'] == 'mer'
+    check_split_network(streams, dT, net)
+    (_, sp), = split_infos(net['plan']).items()
+    assert sp['candidate'] == 'V'
+    reasons = [sp['candidates'][n] for n in S_NAMES]
+    assert 'budget' in reasons
+    assert set(reasons) <= {'budget', 'no split', 'same split'}
+
+
+def test_split_first_wins_is_deterministic(monkeypatch):
+    monkeypatch.setattr(SP, '_SPLIT_FIRST_WINS', True)
+    for dT, rows in [SPLIT[n] for n in sorted(SPLIT)] + [NEAR_DOUBLE_PINCH]:
+        streams = streams_from(rows)
+        one = P._plan_numeric(streams, dT, **SPLIT_ON)
+        two = P._plan_numeric(streams, dT, **SPLIT_ON)
+        assert one['status'] == 'mer'
+        check_split_network(streams, dT, one)
+        assert fingerprint(one) == fingerprint(two)
+        infos = split_infos(one['plan'])
+        assert infos and infos == split_infos(two['plan'])
+        for sp in infos.values():   # the first live candidate wins
+            live = [n for n, k in sp['candidates'].items()
+                    if isinstance(k, tuple)]
+            assert live == [sp['candidate']]
+
+
+def test_splitting_with_avoid_recycle_never_repeats_a_pair(monkeypatch):
+    monkeypatch.setattr(P, '_BE_WORK', 300.)   # keep best effort short
+    monkeypatch.setattr(SP, '_SPLIT_S_WORK', 3000.)
+    rng = random.Random(31)
+    cases = [SPLIT[n] for n in sorted(SPLIT)]
+    while len(cases) < 20:
+        rows, dT = pinch_problem(rng)
+        if needs_split(streams_from(rows), dT):
+            cases.append((dT, rows))
+    n_mer = n_split = n_rep = 0
+    for dT, rows in cases:
+        streams = streams_from(rows)
+        net = P._plan_numeric(streams, dT, avoid_recycle=True, **SPLIT_ON)
+        plan = net['plan']
+        assert repeated_pairs(net) == []   # not even across the pinch
+        assert net['status'] in ('mer', 'best_effort')
+        check_split_network(streams, dT, net, mer=net['status'] == 'mer')
+        n_mer += net['status'] == 'mer'
+        n_split += bool(plan.splits)
+        for sp in split_infos(plan).values():
+            assert sp['errors'] == []
+            n_rep += 'repeated pair' in sp['candidates'].values()
+    # candidates repeating a pair were generated and rejected
+    assert n_mer >= 6 and n_split >= 10 and n_rep >= 2
+
+
+def test_split_side_keeps_cells_below_Qmin():
+    # MF5: a split side's exchangers below Qmin count in the key but are
+    # kept and reported (Qmin never costs MER); an unsplit side drops them
+    # as today
+    dT, rows = SPLIT['smith2005_exr18_4']
+    streams = streams_from(rows)
+    Qmin = 3.5   # above two split cells (2.2, 2.4) and an unsplit one (3.3)
+    net = P._plan_numeric(streams, dT, Qmin=Qmin, **SPLIT_ON)
+    plan = net['plan']
+    above, below = plan.info['sides']['above'], plan.info['sides']['below']
+    sp = above['split']
+    assert above['status'] == below['status'] == 'mer'
+    assert sp['small'] and all(q < Qmin for *_, q in sp['small'])
+    # every exchanger of the split side is in the records, small ones too
+    recs = [e for e in plan.exchangers if e.side == 'above']
+    assert len(recs) == above['units']
+    assert sorted((h, c, q) for h, c, q in sp['small']) == sorted(
+        (e.hot, e.cold, e.Q) for e in recs if e.Q < Qmin)
+    # the unsplit side's small exchanger is dropped, as without splitting
+    (side, h, c, q), = plan.info['qmin_dropped']
+    off = P._plan_numeric(streams, dT, Qmin=Qmin)['plan'].info
+    assert side == 'below' and [d for d in off['qmin_dropped']
+                                if d[0] == side] == [(side, h, c, q)]
+    assert q == pytest.approx(3.304, abs=1e-3)
+    assert net['status'] == 'best_effort'   # the drop raises the utility
+    check_split_network(streams, dT, net, mer=False)
+
+
+def test_stage_s_unit_bound_and_improvement(monkeypatch):
+    def best(case, name):
+        side, a0, proof = root_of(*corpus_problem(case), name=name)
+        cands, errors, reasons = stage_s(side, a0, proof)
+        assert errors == []
+        return min(cands, key=SP._Candidate.key), reasons
+    # the unit bound prunes the rules that cannot beat the incumbent
+    # ('bound') and changes nothing else
+    b, reasons = best('nptel_t4_4_four_stream_dT20', 'below')
+    assert 'bound' in reasons.values()
+    search = SP._s_search
+    with monkeypatch.context() as m:
+        m.setattr(SP, '_s_search', lambda *a: search(*a[:5], math.inf, a[6]))
+        b0, r0 = best('nptel_t4_4_four_stream_dT20', 'below')
+    assert 'bound' not in r0.values()
+    assert (b0.name, b0.key(), b0.signature) == (b.name, b.key(), b.signature)
+    # the winner's unit improvement: 7sp3 above, 8 -> 7 (units + extra
+    # branches + split stages)
+    b, _ = best('7sp3_dt20F', 'above')
+    with monkeypatch.context() as m:
+        m.setattr(SP, '_improve_units', lambda side, pieces, *a, **k: (
+            pieces, 0.))
+        b0, _ = best('7sp3_dt20F', 'above')
+    assert (b0.key()[3], b.key()[3]) == (8, 7) and b.name == b0.name

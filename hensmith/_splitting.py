@@ -94,7 +94,19 @@ branches are whole-side branches, so by Lemma R the branched side keeps
 the cascade, and one `rules_violation` call at its pre-leaked root screens
 the split (`_pinch_split`); on a double pinch the same rule is applied at
 the cut that still fails. The branched side is an ordinary side for the
-planner's search.
+planner's search: `_stage_s` plans it from its pre-leaked root with the
+first passes of the planner's DFS, unchanged, under a unit bound from the
+best candidate so far and one work budget for all rules
+(`_SPLIT_S_WORK`). Its pieces become cells in parent coordinates
+(`_s_cells`); a flex branch the DFS left unused is folded into its used
+siblings (**Lemma F**: a larger fraction moves every flex position toward
+the pinch, where the flex levels are no higher, so every cell stays
+feasible), and each must's residual of at most ``tolQ`` (the DFS's own
+tolerance) is swept into its far-end cell, so every must is served
+exactly; Stage S books no leak. Must branches split at the must's inlet
+and remix isothermally at the pinch; flex branches split at the pinch and
+remix at the side's far end, before the stream's utility only. The best
+Stage S candidate gets the planner's unit improvements.
 
 The core (the provable backstop)
 --------------------------------
@@ -178,7 +190,9 @@ from itertools import accumulate, combinations
 import numpy as np
 
 from ._planner import (Exchanger, _APPROACH_TOL, _LevelCurve, _REL_Q,
-                       _Side, _SidePlan, _THRESHOLD_TOL, _WORK_EVENT, _merge)
+                       _SCHEDULE, _Search, _Side, _SidePlan, _THRESHOLD_TOL,
+                       _WORK_EVENT, _combine_cap, _improve_units, _merge,
+                       _units_guard)
 
 __all__ = ()
 
@@ -193,6 +207,9 @@ _CORE_STRATEGIES = ('V',)    # the core strategies `_drive` runs
 _SPLIT_RULES = ('partner', 'demand', 'mincell', 'nw-rho-desc', 'nw-rho-asc',
                 'nw-exact-desc', 'nw-exact-asc')   # Stage S, in order
 _SPLIT_CUTS = 3              # cuts per Stage S rule (double pinches)
+_SPLIT_PASSES = 3            # Stage S: the first `_SCHEDULE` passes
+_SPLIT_S_WORK = 30000.       # Stage S: work of all rules on a side
+_SPLIT_FIRST_WINS = False    # True: the first live candidate wins (runtime)
 _MINCELL_WORK = 20000        # search nodes of one 'mincell' transport
 _CP_TOL = 1e-12              # CP compatibility, as in `rules_violation`
 
@@ -1834,6 +1851,319 @@ def _pinch_split(side, a0, proof, rule):
     return None
 
 
+# %% Stage S: the plan
+
+def _repeats_a_pair(cells, tolQ):
+    """True if two exchangers of `cells` (`_merge_cells`) have the same
+    (must, flex) pair: avoid_recycle allows every pair once, and two
+    branches of a stream with one partner are two exchangers."""
+    pairs = Counter((c.i, c.j) for c in _merge_cells(cells, tolQ))
+    return any(n > 1 for n in pairs.values())
+
+
+def _fold(items, M, used):
+    """
+    Lemma F: the fraction and stage key of every used flex of a branched
+    side, after folding its unused siblings.
+
+    Parameters
+    ----------
+    items : list[tuple]
+        The branched side's items (`_pinch_split`).
+    M : int
+        Its number of musts.
+    used : collection[int]
+        Local indices of the flexes with cells.
+
+    Returns
+    -------
+    dict
+        ``{local flex index: (g, key)}``. A parent whose branches are all
+        used keeps them. Otherwise each used branch gets ``g / G``, with
+        ``G`` the sum over its used siblings (the unused fractions go to
+        them in proportion), and keys renumbered in item order; a parent
+        with one used branch is a trunk again, ``(1., None)``.
+    """
+    siblings = defaultdict(list)
+    for jj, (_, p, _, _) in enumerate(items[M:]):
+        siblings[p].append(jj)
+    out = {}
+    for p, br in siblings.items():
+        live = [jj for jj in br if jj in used]
+        if len(live) == len(br):
+            for jj in live:
+                out[jj] = items[M + jj][2:]
+        elif len(live) == 1:
+            out[live[0]] = (1., None)
+        elif live:
+            G = math.fsum(items[M + jj][2] for jj in live)
+            for n, jj in enumerate(live):
+                out[jj] = (items[M + jj][2] / G, ('S', p, n))
+    return out
+
+
+def _s_cells(side, items, a0, pieces):
+    """
+    Cells of a Stage S plan (design 2.3.4, steps 3-5): the DFS `pieces` of
+    the branched side, merged (`_merge`), in parent coordinates, with the
+    unused flex branches folded (`_fold`) and the residual swept.
+
+    Parameters
+    ----------
+    side : _Side
+        The parent side.
+    items : list[tuple]
+        The branched side's items (`_pinch_split`).
+    a0 : sequence[float]
+        The parent side's pre-leaked root.
+    pieces : list[tuple]
+        ``(i', j', a', b', x)`` on the branched side, from its pre-leaked
+        root (`_branched_side`).
+
+    Returns
+    -------
+    cells : list[_Cell] or None
+        The cells, or None if the sweep fails.
+    reason : None or 'sweep'
+
+    Notes
+    -----
+    A piece ``(i', j', a', b', x)`` becomes ``_Cell(parent(i'), parent(j'),
+    x, a'/f, b'/g, f, g, key(i'), key(j'))``: a branch is the scaled parent
+    (Lemma B). Folding raises a flex branch's fraction ``g``, so its
+    parent positions ``b'/g`` move toward the pinch, where the flex levels
+    are no higher, and every cell stays feasible (Lemma F); the must side
+    is unchanged.
+
+    The DFS completes a must within ``tolQ`` of heat. The residual of must
+    item ``i'``, ``r = f (Qm_i - a0_i)`` less its duties, is swept so that
+    every must is served exactly (MF4): if ``|r| <= tolQ``, `r` is added to
+    the item's far-end cell, the later cells of that cell's flex item move
+    with it (the flex stays a prefix), and the cells changed are verified
+    (`_cell_margin`); otherwise, or if that fails, the plan is rejected.
+    Stage S never books a leak.
+    """
+    M = sum(it[0] == 'must' for it in items)
+    tolQ, tolP = side.tolQ, side.tolP
+    ex = _merge(pieces)
+    fold = _fold(items, M, {e[1] for e in ex})
+    moved = set()
+    for i2, (_, p, f, _) in enumerate(items[:M]):
+        rows = [e for e in ex if e[0] == i2]
+        r = f * (side.Qm[p] - a0[p]) - math.fsum(e[4] for e in rows)
+        if r == 0.:
+            continue
+        if not rows or not abs(r) <= tolQ:
+            return None, 'sweep'
+        e = max(rows, key=lambda e: e[2] + e[4])
+        if not e[4] + r > 0.:
+            return None, 'sweep'
+        for e2 in ex:
+            if e2[1] == e[1] and e2[3] > e[3]:
+                e2[3] += r
+                moved.add(id(e2))
+        e[4] += r
+        moved.add(id(e))
+    cells = []
+    for e in ex:
+        i2, j2, a, b, x = e
+        _, p, f, km = items[i2]
+        g, kf = fold[j2]
+        c = _Cell(p, items[M + j2][1], x, a / f, b / g, f, g, km, kf)
+        if id(e) in moved and not _cell_margin(side, c)[0] >= -tolP:
+            return None, 'sweep'
+        cells.append(c)
+    return cells, None
+
+
+def _s_search(bside, a0, cap1, forbid, work_scale, bound, room):
+    """
+    The first `_SPLIT_PASSES` passes of `_SCHEDULE` on a branched side from
+    its pre-leaked root, as `_plan_side` runs them but for the unit bound
+    and the shared budget `room`.
+
+    Returns
+    -------
+    pieces : list[tuple] or None
+        The first success.
+    work : float
+        Work spent.
+    cut : bool
+        True if the shared budget stopped a pass.
+    """
+    work, seen = 0., set()
+    for mode, cap, extra, budget in _SCHEDULE[:_SPLIT_PASSES]:
+        cap = _combine_cap(cap, cap1)
+        if (mode, cap, extra) in seen:
+            continue
+        seen.add((mode, cap, extra))
+        left = room - work
+        if left <= 0.:
+            return None, work, True
+        budget *= work_scale
+        srch = _Search(bside, mode, cap, extra, min(budget, left),
+                       unit_bound=bound, forbid=forbid, a0=a0)
+        pieces = srch.run()
+        work += srch.work
+        if pieces is not None:
+            return pieces, work, False
+        if srch.exhausted and budget > left:
+            return None, work, True
+    return None, work, False
+
+
+def _s_candidate(name, n, side, items, a0, pieces, cap1, work, split,
+                 errors, reasons):
+    """The Stage S candidate of DFS `pieces` (design 2.3.4, steps 3-7), or
+    None; its key or the reason is recorded in `reasons`."""
+    cells, why = _s_cells(side, items, a0, pieces)
+    if cells is None:
+        reasons[name] = why
+        return None
+    if cap1 and _repeats_a_pair(cells, side.tolQ):
+        reasons[name] = 'repeated pair'
+        return None
+    try:
+        c = _Candidate(name, (0, n), side, a0, cells, None, work,
+                       split['Qmin'])
+    except _SplitInvariantError as e:
+        errors.append(f'{name}: {e}')
+        reasons[name] = 'error'
+        return None
+    c.excluded = _excluded(split, side.name, c)
+    reasons[name] = 'excluded' if c.excluded else c.key()
+    return c
+
+
+def _stage_s(side, a0, proof, cap1, forbid, work_scale, split, errors,
+             reasons, only=None, skip=None):
+    """
+    Stage S candidates of a side: pinch splits planned by the unchanged
+    DFS (design 2.3.4).
+
+    Parameters
+    ----------
+    side : _Side
+        The side.
+    a0 : sequence[float]
+        Its pre-leaked root (`_preleak_root`).
+    proof : dict
+        The root proof, an 'outward' or 'inward' violation.
+    cap1 : bool
+        avoid_recycle: every pair in at most one exchanger.
+    forbid : collection[tuple[int, int]]
+        Pairs never used (local indices).
+    work_scale : float
+        Scale of the search budgets.
+    split : dict
+        ``Qmin`` and ``exclude`` (`_split_side`).
+    errors : list[str]
+        `_SplitInvariantError` messages are appended.
+    reasons : dict
+        Set for every rule run, ``'S:<rule>'``: the candidate's key, or
+        'excluded', or why there is no candidate: 'no split'
+        (`_pinch_split` found none), 'same split' (an earlier rule's
+        branching), 'budget' (the shared budget ran out), 'bound' (no plan
+        within the unit bound), 'no plan', 'sweep' (`_s_cells`), 'repeated
+        pair' (avoid_recycle) or 'error'.
+    only : str, optional
+        Run this candidate name only (the preferred one).
+    skip : str, optional
+        Do not run this candidate name (the preferred one already ran).
+
+    Returns
+    -------
+    list[_Candidate]
+        The candidates, excluded ones included (`_excluded`).
+
+    Notes
+    -----
+    For each rule of `_SPLIT_RULES`, in order, `_pinch_split` gives the
+    branched side, and the first `_SPLIT_PASSES` passes of `_SCHEDULE`
+    plan it from its pre-leaked root (`_s_search`), with the pairs of
+    `forbid` forbidden on every branch pair of their parents. Once a live
+    candidate has no small exchanger, bad remix or touch, the DFS runs
+    with the unit bound ``score - extra - stages`` (``score`` the
+    incumbent's units + extra branches + split stages; this rule's extra
+    branches and split stages), which keeps ties. All rules share
+    ``_SPLIT_S_WORK work_scale`` of work (deterministic); rules not
+    reached are 'budget'. Each plan is converted (`_s_cells`: folding,
+    the residual sweep) and verified (`_Candidate`); with `cap1`, a plan
+    repeating a pair is rejected. With `_SPLIT_FIRST_WINS`, the first live
+    candidate ends the rules. The winner (the smallest key among the live
+    candidates) then gets the planner's `_improve_units` and
+    `_units_guard` on its branched side, and the result replaces it if
+    it is live and its key is not worse.
+    """
+    budget = _SPLIT_S_WORK * work_scale
+    used = 0.
+    out, seen, runs = [], [], {}
+    for n, rule in enumerate(_SPLIT_RULES):
+        name = 'S:' + rule
+        if name == skip or (only is not None and name != only):
+            continue
+        if _SPLIT_FIRST_WINS and any(not c.excluded for c in out):
+            break
+        if used >= budget:
+            reasons[name] = 'budget'
+            continue
+        try:
+            res = _pinch_split(side, a0, proof, rule)
+        except _SplitInvariantError as e:
+            errors.append(f'{name}: {e}')
+            reasons[name] = 'error'
+            continue
+        if res is None:
+            reasons[name] = 'no split'
+            continue
+        items, extra = res
+        if items in seen:
+            reasons[name] = 'same split'
+            continue
+        seen.append(items)
+        bside, a0b = _branched_side(side, items, a0)
+        M = bside.M
+        bforbid = frozenset(
+            (i2, j2) for i2, it in enumerate(items[:M])
+            for j2, jt in enumerate(items[M:]) if (it[1], jt[1]) in forbid)
+        stages = len({it[:2] for it in items if it[3] is not None})
+        live = [c for c in out if not c.excluded]
+        inc = min(live, key=_Candidate.key) if live else None
+        bound = math.inf
+        if inc is not None and inc.small == inc.mixbad == inc.touch == 0:
+            bound = inc.key()[3] - extra - stages
+        pieces, work, cut = _s_search(bside, a0b, cap1, bforbid, work_scale,
+                                      bound, budget - used)
+        used += work
+        if pieces is None:
+            reasons[name] = ('budget' if cut else 'no plan'
+                             if bound == math.inf else 'bound')
+            continue
+        c = _s_candidate(name, n, side, items, a0, pieces, cap1, work, split,
+                         errors, reasons)
+        if c is not None:
+            out.append(c)
+            runs[id(c)] = (bside, a0b, bforbid, items, pieces)
+    live = [c for c in out if not c.excluded]
+    if not live:
+        return out
+    # the winner's units, as `_plan_side` improves an unsplit plan
+    best = min(live, key=_Candidate.key)
+    bside, a0b, bforbid, items, pieces = runs[id(best)]
+    new, w1 = _improve_units(bside, pieces, best.work, cap1, bforbid,
+                             work_scale, a0=a0b)
+    new, w2 = _units_guard(bside, new, cap1, bforbid, work_scale, a0=a0b)
+    best.work += w1 + w2
+    if new is not pieces:
+        c = _s_candidate(best.name, best.order[1], side, items, a0, new,
+                         cap1, best.work, split, errors, reasons)
+        if c is not None and not c.excluded and c.key() <= best.key():
+            out[out.index(best)] = c
+        else:
+            reasons[best.name] = best.key()
+    return out
+
+
 # %% Portfolio and selection
 
 def _excluded(split, side_name, cand):
@@ -1886,21 +2216,28 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
         A side plan with status 'mer', method ``'split-<candidate>'``, the
         cells of the chosen candidate and the ``split`` info; None only if
         no candidate exists: the root deficit exceeds `_preleak_max`, or
-        avoid_recycle's pairs left no block.
+        avoid_recycle's pairs left no candidate.
 
     Notes
     -----
-    The core starts from the pre-leaked root ``a0 = P(delta)`` (Lemma P).
-    The preferred candidate (the previous refine round's pick) is generated
-    first and taken as is unless its signature is excluded. Otherwise every
-    generator runs (the preferred one is not run again) and the smallest
-    `_Candidate.key` wins among the candidates not excluded or, if all are
-    excluded, among all of them: a side's last candidate is never excluded.
-    A generator that raises `_SplitInvariantError` is recorded in
-    ``errors`` and the others remain.
+    Every generator starts from the pre-leaked root ``a0 = P(delta)``
+    (Lemma P): Stage S (`_stage_s`, one candidate 'S:<rule>' per rule of
+    `_SPLIT_RULES`) if the root proof is a pinch rule ('outward' or
+    'inward'), then the core (`_CORE_STRATEGIES`). The preferred candidate
+    (the previous refine round's pick) is generated first and taken as is
+    unless its signature is excluded. Otherwise every generator runs (the
+    preferred one is not run again) and the smallest `_Candidate.key` wins
+    among the candidates not excluded or, if all are excluded, among all
+    of them: a side's last candidate is never excluded. With
+    `_SPLIT_FIRST_WINS`, the first live candidate wins. A generator that
+    raises `_SplitInvariantError` is recorded in ``errors`` and the others
+    remain. With `cap1`, a candidate repeating a pair is rejected
+    (`_repeats_a_pair`).
     """
     delta, a0 = _preleak_root(side)
     core = delta <= _preleak_max(side)
+    s_ok = core and proof is not None and proof['rule'] in ('outward',
+                                                            'inward')
     prefer = split['prefer'].get(side.name)
     cands, errors, reasons = [], [], {}
 
@@ -1915,19 +2252,40 @@ def _split_side(side, d, proof, cap1, forbid, work_scale, work, split):
         if c is None:
             reasons[name] = 'forbidden pairs'
             return None
+        if cap1 and _repeats_a_pair(c.cells, side.tolQ):
+            reasons[name] = 'repeated pair'
+            return None
         c.excluded = _excluded(split, side.name, c)
         reasons[name] = 'excluded' if c.excluded else c.key()
         cands.append(c)
         return c
-    if core and prefer in _CORE_STRATEGIES:
-        c = generate(prefer)
+
+    def stage_s(**kw):
+        cs = _stage_s(side, a0, proof, cap1, forbid, work_scale, split,
+                      errors, reasons, **kw)
+        cands.extend(cs)
+        return cs
+    # the preferred candidate (stickiness), taken as is if it is live
+    first = []
+    if s_ok and prefer is not None and prefer[2:] in _SPLIT_RULES and (
+            prefer.startswith('S:')):
+        first = stage_s(only=prefer)
+    elif core and prefer in _CORE_STRATEGIES:
+        first = [generate(prefer)]
+    for c in first:
         if c is not None and not c.excluded:
             return _side_plan(side, c, cands, reasons, a0, delta, errors,
                               work, proof)
-    if core:
+    # the portfolio: Stage S, then the core
+    if s_ok:
+        stage_s(skip=prefer)
+    if core and not (_SPLIT_FIRST_WINS and any(not c.excluded
+                                               for c in cands)):
         for strategy in _CORE_STRATEGIES:
             if strategy != prefer:
-                generate(strategy)
+                c = generate(strategy)
+                if _SPLIT_FIRST_WINS and c is not None and not c.excluded:
+                    break
     if not cands:
         return None
     live = [c for c in cands if not c.excluded] or cands

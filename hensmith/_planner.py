@@ -1431,9 +1431,10 @@ def _plan_side(side, cap1=False, forbid=frozenset(), work_scale=1.,
     return _SidePlan(pieces, [0.] * M, 'mer', method, work)
 
 
-def _improve_units(side, pieces, first, cap1, forbid, work_scale):
+def _improve_units(side, pieces, first, cap1, forbid, work_scale, a0=None):
     """Branch and bound on the number of exchangers: the same search with a
-    unit bound one below the incumbent, restricted then full mode."""
+    unit bound one below the incumbent, restricted then full mode, from the
+    must frontiers `a0` (default: the pinch)."""
     U = _count_units(pieces)
     step = min(_UNITS_WORK_MAX, max(_UNITS_WORK_MIN, 3. * first)) * work_scale
     total = _UNITS_WORK_TOTAL * work_scale
@@ -1443,7 +1444,7 @@ def _improve_units(side, pieces, first, cap1, forbid, work_scale):
         found = None
         for mode in ('restricted', 'full'):
             srch = _Search(side, mode, cap, False, min(step, total - used),
-                           unit_bound=U - 1, forbid=forbid)
+                           unit_bound=U - 1, forbid=forbid, a0=a0)
             res = srch.run()
             used += srch.work
             if res is not None:
@@ -1457,10 +1458,11 @@ def _improve_units(side, pieces, first, cap1, forbid, work_scale):
     return pieces, used
 
 
-def _units_guard(side, pieces, cap1, forbid, work_scale):
+def _units_guard(side, pieces, cap1, forbid, work_scale, a0=None):
     """If a side's MER plan has more than ``3 (M + F)`` units, rerun the
     last two passes coarse to fine with a minimum piece size and keep the
-    MER plan with the fewest units (MER always wins over the unit count)."""
+    MER plan with the fewest units (MER always wins over the unit count).
+    The searches start from the must frontiers `a0` (default: the pinch)."""
     U = _count_units(pieces)
     if U <= _GUARD_FACTOR * (side.M + side.F):
         return pieces, 0.
@@ -1472,7 +1474,8 @@ def _units_guard(side, pieces, cap1, forbid, work_scale):
         for mode, cap, extra, _ in passes:
             srch = _Search(side, mode, _combine_cap(cap, cap1), extra,
                            _GUARD_WORK * work_scale,
-                           min_piece=lambda i, j, thr=thr: thr, forbid=forbid)
+                           min_piece=lambda i, j, thr=thr: thr, forbid=forbid,
+                           a0=a0)
             res = srch.run()
             used += srch.work
             if res is not None:
