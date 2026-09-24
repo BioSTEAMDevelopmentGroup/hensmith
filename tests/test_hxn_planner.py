@@ -22,6 +22,7 @@ import pytest
 from numpy.testing import assert_allclose
 
 from hensmith import _planner as P
+from hensmith import _splitting as SP
 
 
 # %% Independent helpers
@@ -947,3 +948,279 @@ def test_qmin_drops_small_exchangers(Qmin):
             sum(m['Q'] for m in full['matches']))
         if dropped:
             assert net['status'] == 'best_effort'
+
+
+# %% 15. Stream-splitting primitives (hensmith._splitting)
+
+MERGED_BREAKPOINT = [  # flex B starts 4e-7 K above the pinch: 1.2e-6 of A's
+    # heat (< tolQ = 2e-6) but far more than tolP = 2.9e-9 K of level
+    ('H1', 'h', 300, 50, 1.), ('H2', 'h', 300, 50, 1.),
+    ('A', 'c', 100, 250, 3.), ('B', 'c', 100 + 4e-7, 200, 1.),
+    ('H3', 'h', 70, 60, 1e4), ('C3', 'c', 0, 10, 1e4)]
+
+
+def sides_from(rows, dT):
+    """The planner's sides of a constant-CP problem, built as in
+    `plan_network`."""
+    streams = streams_from(rows)
+    curves = P._stream_curves(
+        [([min(s['T_in'], s['T_out']), max(s['T_in'], s['T_out'])],
+          [0., s['CP'] * abs(s['T_in'] - s['T_out'])]) for s in streams],
+        [s['kind'] == 'hot' for s in streams], dT)
+    act = [c for c in curves if c is not None]
+    scale = sum(c.duty for c in act)
+    span = max(c.T[-1] for c in act) - min(c.T[0] for c in act)
+    return P._sides(curves, P._cascade(curves, scale),
+                    P._REL_Q * max(scale, 1.), P._REL_T * max(span, 1.))
+
+
+def split_sides():
+    """The sides (with musts and flexes) of the SPLIT cases and of the
+    merged-breakpoint case."""
+    out = []
+    for dT, rows in [*SPLIT.values(), (10., MERGED_BREAKPOINT)]:
+        out += [s for s in sides_from(rows, dT).values() if s.M and s.F]
+    return out
+
+
+def random_side(rng, tol=1e-9):
+    M, F = rng.randint(1, 3), rng.randint(1, 3)
+    return P._Side('above', [random_level_curve(rng) for _ in range(M)],
+                   [random_level_curve(rng) for _ in range(F)], tol, tol)
+
+
+def random_fractions(rng):
+    """One to three branch fractions (each > 0.05) summing to 1."""
+    w = [rng.uniform(1., 5.) for _ in range(rng.randint(1, 3))]
+    f = [x / sum(w) for x in w[:-1]]
+    return f + [1. - sum(f)]
+
+
+def is_forest(cells):
+    """True if the bipartite graph of the (must, flex) cells has no
+    cycle."""
+    parent = {}
+
+    def find(u):
+        while parent.get(u, u) != u:
+            u = parent[u]
+        return u
+    for i, j in cells:
+        ru, rv = find(('m', i)), find(('f', j))
+        if ru == rv:
+            return False
+        parent[ru] = rv
+    return True
+
+
+def test_branch_curve_is_the_scaled_parent():
+    rng = random.Random(51)
+    curves = [random_level_curve(rng) for _ in range(30)]
+    curves += [random_level_curve(rng, grid=True) for _ in range(10)]
+    for side in split_sides():
+        curves += side.musts + side.flexes
+    for c in curves:
+        for f in (1., .5, 1e-3, rng.uniform(1e-3, 1.)):
+            for role in ('must', 'flex'):
+                bc = SP._branch_curve(c, f, role)
+                assert bc.y == c.y and bc.flats == c.flats    # levels
+                assert bc.q == [f * q for q in c.q] and bc.Q == f * c.Q
+                assert (bc.stream, bc.H0, bc.sgn) == (c.stream, c.H0, c.sgn)
+                for k in range(c.n - 1):                      # slopes / f
+                    s = (c.y[k + 1] - c.y[k]) / (c.q[k + 1] - c.q[k])
+                    assert bc.slope_right(bc.q[k]) == pytest.approx(
+                        s / f, rel=1e-12)
+                # at branch heat tau the branch is the parent at tau / f
+                xs = np.linspace(0., bc.Q, 41)
+                assert_allclose(bc.at_many(xs), c.at_many(xs / f), rtol=0.,
+                                atol=1e-12 * (1. + abs(c.y[-1])))
+
+
+def test_splitting_preserves_the_residual_cascade():
+    # Lemma R: branches with fractions summing to 1 leave every composite,
+    # and so the slack of (R), unchanged
+    rng = random.Random(52)
+    for side in split_sides() + [random_side(rng) for _ in range(40)]:
+        scale = max(side.duty, 1.)
+        for trial in range(4):
+            if trial:
+                a = [rng.uniform(0., .6 * q) for q in side.Qm]
+                b = [rng.uniform(0., .6 * q) for q in side.Qf]
+            else:
+                a, b = [0.] * side.M, [0.] * side.F
+            musts, am, flexes, bf = [], [], [], []
+            for c, x in zip(side.musts, a):
+                for f in random_fractions(rng):
+                    musts.append(SP._branch_curve(c, f, 'must'))
+                    am.append(f * x)
+            for c, x in zip(side.flexes, b):
+                for g in random_fractions(rng):
+                    flexes.append(SP._branch_curve(c, g, 'flex'))
+                    bf.append(g * x)
+            bside = P._Side(side.name, musts, flexes, side.tolQ, side.tolP)
+            d, bd = side.analyse(a, b), bside.analyse(am, bf)
+            assert bd.slack == pytest.approx(d.slack, abs=1e-12 * scale)
+            if not trial:   # the root: the same levels, the same composites
+                np.testing.assert_array_equal(bd.levels, d.levels)
+                for k in ('Si', 'Se', 'Di', 'De'):
+                    assert_allclose(getattr(bd, k), getattr(d, k), rtol=0.,
+                                    atol=1e-12 * scale)
+
+
+def test_cell_margin_matches_scaled_max_duty():
+    # Lemma 1: the margin at the knots of both branch curves decides (C)
+    # exactly as _max_duty does on the branch-scaled curves
+    rng = random.Random(53)
+    tol = 1e-9
+    count = [0, 0]
+    for _ in range(500):
+        cm, cf = random_level_curve(rng), random_level_curve(rng)
+        side = P._Side('above', [cm], [cf], tol, tol)
+        f = rng.choice((1., rng.uniform(.05, 1.)))
+        g = rng.choice((1., rng.uniform(.05, 1.)))
+        a = rng.choice((0., rng.choice(cm.q[:-1]), rng.uniform(0., cm.Q)))
+        b = rng.choice((0., rng.choice(cf.q[:-1]), rng.uniform(0., cf.Q)))
+        xmax = min(f * (cm.Q - a), g * (cf.Q - b))
+        x = rng.choice((xmax, rng.uniform(0., xmax)))
+        margin, touch = SP._cell_margin(side, SP._Cell(0, 0, x, a, b, f, g))
+        bm, bf = SP._branch_curve(cm, f, 'must'), SP._branch_curve(cf, g,
+                                                                   'flex')
+        xd = P._max_duty(bm, f * a, bf, g * b, x, tol)
+        assert (margin >= -tol) == (xd >= x - tol)
+        ts = np.concatenate(([0., x], bm.qa - f * a, bf.qa - g * b))
+        ts = ts[(ts >= 0.) & (ts <= x)]
+        direct = (bm.at_many(f * a + ts) - bf.at_many(g * b + ts)).min()
+        assert margin == pytest.approx(direct, abs=1e-9)
+        count[margin >= -tol] += 1
+    assert min(count) >= 100
+
+
+def test_cell_margin_touch():
+    cm = P._LevelCurve([0., 20.], [0., 10.])
+    side = P._Side('above', [cm], [P._LevelCurve([0., 20.], [0., 10.])],
+                   1e-9, 1e-9)
+    # equal branch fractions: parallel at zero approach along the cell
+    assert SP._cell_margin(side, SP._Cell(0, 0, 10., 0., 0., .5, .5)) == (
+        0., True)
+    # the flex trunk rises half as fast: zero approach at the pinch only
+    assert SP._cell_margin(side, SP._Cell(0, 0, 10., 0., 0., .5, 1.)) == (
+        0., False)
+    # the flex branch overtakes the must trunk
+    assert SP._cell_margin(side, SP._Cell(0, 0, 10., 0., 0., 1., .5))[0] == (
+        pytest.approx(-5.))
+    # beyond the end of the flex: infeasible whatever the levels
+    assert SP._cell_margin(side, SP._Cell(0, 0, 11., 0., 0., 1., .5)) == (
+        -math.inf, False)
+    # a must flat on a flex flat at the same level
+    side = P._Side('above', [P._LevelCurve([0., 10., 20.], [4., 4., 8.])],
+                   [P._LevelCurve([0., 10., 20.], [0., 4., 4.])], 1e-9, 1e-9)
+    assert SP._cell_margin(side, SP._Cell(0, 0, 10., 0., 10.)) == (0., True)
+    assert SP._cell_margin(side, SP._Cell(0, 0, 10., 0., 0.)) == (0., False)
+
+
+def test_vertical_coupling_positions():
+    rng = random.Random(54)
+    nodes = [(s, [0.] * s.M, [0.] * s.F) for s in split_sides()]
+    for _ in range(400):
+        side = random_side(rng)
+        a = [rng.choice((0., rng.uniform(0., .6 * q))) for q in side.Qm]
+        b = [rng.choice((0., rng.uniform(0., .6 * q))) for q in side.Qf]
+        if residual_slack(side, a, b) >= 0.:
+            nodes.append((side, a, b))
+    assert len(nodes) >= 60
+    for side, a, b in nodes:
+        d = side.analyse(a, b)
+        cp = SP._Coupling(side, a, b, d)
+        X = math.fsum(q - x for q, x in zip(side.Qm, a))
+        scale = max(side.duty, 1.)
+        t = cp.t
+        assert cp.X == X and cp.ulp == SP._SPLIT_ULP * max(X, 1.)
+        assert t[0] == 0. and t[-1] == X and cp.K == t.size - 1 >= 1
+        assert (np.diff(t) > cp.ulp).all()
+        # no breakpoint is merged beyond round-off (and none folded here)
+        raw = np.clip(np.concatenate((d.De, d.Di, d.Se, d.Si)), 0., X)
+        assert cp.folded == 0
+        assert np.abs(raw[:, None] - t[None, :]).min(1).max() <= cp.ulp
+        # positions: monotone, from the node, exact at X, heat-consistent
+        Pm, Pf = cp.Pm, cp.Pf
+        assert Pm.shape == (t.size, side.M) and Pf.shape == (t.size, side.F)
+        assert (np.diff(Pm, axis=0) >= 0.).all()
+        assert (np.diff(Pf, axis=0) >= 0.).all()
+        assert Pm[0].tolist() == a and Pf[0].tolist() == b
+        assert Pm[-1].tolist() == side.Qm
+        assert (Pf <= np.array(side.Qf)).all()
+        assert_allclose((Pm - a).sum(1), t, rtol=0., atol=1e-12 * scale)
+        assert_allclose((Pf - b).sum(1), t, rtol=0., atol=1e-12 * scale)
+        # must_at and flex_at: the same closed form anywhere in [0, X]
+        for k in range(t.size):
+            assert_allclose(cp.must_at(t[k]), Pm[k], rtol=0., atol=cp.ulp)
+            assert_allclose(cp.flex_at(t[k]), Pf[k], rtol=0., atol=cp.ulp)
+        assert cp.must_at(X) == side.Qm and cp.must_at(0.) == a
+        for tm in [rng.uniform(0., X) for _ in range(5)]:
+            assert math.fsum(cp.must_at(tm)) - math.fsum(a) == pytest.approx(
+                tm, abs=1e-12 * scale)
+    # merged breakpoint: B's supply is 1.2e-6 of A's heat (< tolQ) above
+    # the pinch; that breakpoint must stay (tolQ merging hides B's knot)
+    side = sides_from(MERGED_BREAKPOINT, 10.)['above']
+    streams = [c.stream for c in side.flexes]
+    jA, jB = streams.index(2), streams.index(3)
+    cp = SP._Coupling(side, [0.] * side.M, [0.] * side.F)
+    tB = 3. * ((100 + 4e-7) - 100)
+    assert cp.ulp < tB < side.tolQ
+    k = int(np.abs(cp.t - tB).argmin())
+    assert cp.t[k] == pytest.approx(tB, rel=1e-6)
+    assert cp.Pf[k, jB] == 0. and cp.Pf[k, jA] == pytest.approx(tB, rel=1e-6)
+
+
+def test_transport_forest():
+    h, g = {0: 1., 1: 1.}, {0: 1., 1: 1.}
+    full = {(i, j) for i in h for j in g}
+    # north-west, with continuations first; forbidden pairs never used
+    assert SP._transport(h, g, full) == {(0, 0): 1., (1, 1): 1.}
+    assert SP._transport(h, g, full, [(0, 1)]) == {(0, 1): 1., (1, 0): 1.}
+    assert SP._transport(h, g, full, [(0, 0)], {(0, 0)}) == {
+        (0, 1): 1., (1, 0): 1.}
+    # the greedy is stuck, Edmonds-Karp is not
+    assert SP._transport(h, g, {(0, 0), (0, 1), (1, 0)}) == {
+        (0, 1): 1., (1, 0): 1.}
+    # no transport exists
+    assert SP._transport({0: 2., 1: 1.}, {0: 1., 1: 2.},
+                         {(0, 0), (1, 1)}) is None
+    assert SP._transport(h, g, {(0, 0), (1, 0)}) is None
+    # a row of round-off heat on an exhausted column still gets its cell
+    assert SP._transport({0: 1., 1: 1e-12}, {0: 1.}, {(0, 0), (1, 0)},
+                         tol=1e-9) == {(0, 0): 1., (1, 0): 1e-12}
+    rng = random.Random(55)
+    eps = np.finfo(float).eps
+    for _ in range(300):
+        m, n = rng.randint(1, 5), rng.randint(1, 5)
+        comp = {(i, j) for i in range(m) for j in range(n)
+                if rng.random() < .6}
+        q0 = {c: rng.uniform(.1, 10.) for c in sorted(comp)
+              if rng.random() < .7}
+        h = {i: math.fsum(x for (k, _), x in q0.items() if k == i)
+             for i in range(m)}
+        g = {j: (math.fsum(x for (_, k), x in q0.items() if k == j)
+                 + rng.choice((0., rng.uniform(0., 5.)))) * (1. - 1e-15)
+             for j in range(n)}   # flex surplus, and round-off imbalance
+        forbid = {c for c in comp if c not in q0 and rng.random() < .5}
+        prefer = rng.sample(sorted(comp), min(len(comp), 2))
+        q = SP._transport(h, g, comp, prefer, forbid, tol=1e-9)
+        assert q is not None and is_forest(q)
+        assert all(x > 0. and c in comp and c not in forbid
+                   for c, x in q.items())
+        for i, v in h.items():   # exact row sums
+            assert abs(sum(x for (k, _), x in q.items() if k == i)
+                       - v) <= 4 * eps * v
+        for j, v in g.items():
+            assert math.fsum(x for (_, k), x in q.items() if k == j) <= (
+                v + 1e-9)
+        lines = {('m', i) for i, _ in q} | {('f', j) for _, j in q}
+        assert len(q) <= max(len(lines) - 1, 0)
+    for _ in range(100):   # a live continuation is always kept
+        h = {i: rng.uniform(1., 5.) for i in range(rng.randint(1, 4))}
+        g = {j: rng.uniform(1., 5.) for j in range(rng.randint(1, 4))}
+        g[0] += sum(h.values())
+        c = (rng.choice(list(h)), rng.choice(list(g)))
+        q = SP._transport(h, g, {(i, j) for i in h for j in g}, [c])
+        assert q[c] == pytest.approx(min(h[c[0]], g[c[1]]), rel=4 * eps)
