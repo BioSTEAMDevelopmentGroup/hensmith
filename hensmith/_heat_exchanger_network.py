@@ -66,26 +66,28 @@ def _network_path(units, stream_life_cycles):
     Return the simulation path of a synthesized network and its recycle
     (tear) streams.
 
-    Every stream passes its stages in series, so the network is a directed
-    graph with an edge from each stage to the next one of the same stream.
-    The path is a topological order of that graph (Kahn's algorithm, ties
-    broken by the order of `units`); where the graph has a cycle (e.g. a
-    pair of streams matched both above and below the pinch, or repeated
-    matches in alternating order), the unit with the fewest unplaced
-    predecessors comes next and its inlets from later units become recycle
-    streams. Every unit then runs after all its feeders except across a
-    declared recycle, and the fixed-point iteration of the resulting
-    `System` converges the loops. (Deterministic, unlike a general network
-    sort, which need not settle on intertwined loops.)
+    A stream's stages form a series-parallel chain (in series, except that
+    the branches of a split run in parallel between its splitter chain and
+    its mixer), so the network is a directed graph with an edge along every
+    connection of every life cycle (`StreamLifeCycle.connections`; for an
+    unsplit stream, from each stage to the next one). The path is a
+    topological order of that graph (Kahn's algorithm, ties broken by the
+    order of `units`); where the graph has a cycle (e.g. a pair of streams
+    matched both above and below the pinch, or repeated matches in
+    alternating order), the unit with the fewest unplaced predecessors
+    comes next and its inlets from later units become recycle streams
+    (possibly a splitter outlet). Every unit then runs after all its
+    feeders except across a declared recycle, and the fixed-point iteration
+    of the resulting `System` converges the loops. (Deterministic, unlike a
+    general network sort, which need not settle on intertwined loops.)
     """
     position = {u: i for i, u in enumerate(units)}
     successors = {u: [] for u in units}
     N_waiting = {u: 0 for u in units}
     for life_cycle in stream_life_cycles:
-        stages = life_cycle.life_cycle
-        for a, b in zip(stages, stages[1:]):
-            successors[a.unit].append((b.unit, a.unit.outs[a.index]))
-            N_waiting[b.unit] += 1
+        for up, up_port, down, _ in life_cycle.connections():
+            successors[up].append((down, up.outs[up_port]))
+            N_waiting[down] += 1
     ready = [position[u] for u in units if not N_waiting[u]]
     heapq.heapify(ready)
     placed = {}
@@ -123,10 +125,19 @@ class HeatExchangerNetwork(bst.Facility):
     units : Iterable[Unit], optional
         All unit operations available to the heat exchanger network. Defaults
         to all unit operations in the system.
-    
+    stream_splitting : bool, optional
+        Allow a process stream to be split into parallel branches that
+        re-join, where the minimum energy requirement needs it (see
+        `synthesize_network`). The branches are realized with
+        `biosteam.Splitter` chains (`new_splitters`) and rigorous
+        `biosteam.Mixer` units (`new_mixers`), which are adiabatic and
+        cost nothing. Defaults to False: the network has no split, and
+        both lists are empty.
+
     Notes
     -----
-    The network is synthesized without stream splits by
+    The network is synthesized without stream splits (unless
+    `stream_splitting`) by
     :func:`~hensmith.hxn_synthesis.synthesize_network`: a problem table on
     the streams' temperature-enthalpy curves gives the minimum energy
     requirement (MER) targets, and a planner builds each side of the pinch
@@ -136,7 +147,8 @@ class HeatExchangerNetwork(bst.Facility):
     of streams may then be matched more than once (IDs with a suffix
     ``_<n>``, e.g. ``HX_3_2_cs_2``), since series alternation can replace a
     split. Where the pinch design rules prove that MER needs stream
-    splitting, the network is a best-effort one close to the targets. The
+    splitting, the network is a best-effort one close to the targets, or,
+    with `stream_splitting`, one that splits streams to reach them. The
     outcome is recorded in `synthesis_info` (a dict; see the `info` keyword
     of `synthesize_network`): 'status' is 'mer' when the network's utilities
     equal the targets and 'best_effort' otherwise, with the targets, the
@@ -147,8 +159,10 @@ class HeatExchangerNetwork(bst.Facility):
     stream copies and new HX objects can be found in a newly created
     flowsheet '<sys>_HXN' where <sys> is the name of the system associated
     to the HeatExchangerNetwork object. Each stream passes its exchangers in
-    series; the network is simulated as a `System` (`HXN_sys`) whose path
-    follows the streams, with the loops that repeated matches can form torn
+    series (where it splits, its branches run in parallel from a splitter
+    chain to a mixer); the network is simulated as a `System` (`HXN_sys`)
+    whose path follows the streams, with the loops that repeated matches
+    can form torn
     and converged to a tight tolerance (every exchanger starts at its
     planned state, so the loops are at their fixed point after one pass).
 
@@ -251,7 +265,7 @@ class HeatExchangerNetwork(bst.Facility):
     def __init__(self, ID='', T_min_app=5., units=None, ignored=None, Qmin=1e-3,
                  force_ideal_thermo=False, cache_network=False, avoid_recycle=False,
                  acceptable_energy_balance_error=None, replace_unit_heat_utilities=False,
-                 sort_hus_by_T=False):
+                 sort_hus_by_T=False, stream_splitting=False):
         bst.Facility.__init__(self, ID, None, None)
         self.T_min_app = T_min_app
         self.units = units
@@ -262,6 +276,7 @@ class HeatExchangerNetwork(bst.Facility):
         self.avoid_recycle = avoid_recycle
         self.replace_unit_heat_utilities = replace_unit_heat_utilities
         self.sort_hus_by_T = sort_hus_by_T
+        self.stream_splitting = stream_splitting
         if acceptable_energy_balance_error is not None:
             self.acceptable_energy_balance_error = acceptable_energy_balance_error
         
@@ -285,10 +300,13 @@ class HeatExchangerNetwork(bst.Facility):
 
     def _enter_network(self, index, stage, stream):
         """Bring `stream` (the network copy of stream `index`'s real inlet,
-        which enters the network at `stage`) to the state in which its first
-        process exchanger takes it: at equilibrium at its inlet enthalpy for
-        a point-load stream (see `hensmith.hxn_synthesis._first_inlet`)."""
-        if not isinstance(stage.unit, bst.HXprocess): return
+        which enters the network at `stage.unit`: its life cycle's entry
+        port, or its first stage) to the state in which its first process
+        exchanger takes it, directly or, where the stream splits at its
+        inlet, through the splitter chain (which keeps the intensive state):
+        at equilibrium at its inlet enthalpy for a point-load stream (see
+        `hensmith.hxn_synthesis._first_inlet`)."""
+        if not isinstance(stage.unit, (bst.HXprocess, bst.Splitter)): return
         point_load = index in self.synthesis_info.get('point_loads', ())
         _first_inlet(stream, point_load, self.outlet_Ts[index],
                      index not in self.cold_indices)
@@ -418,8 +436,16 @@ class HeatExchangerNetwork(bst.Facility):
                 hot_indices, cold_indices = \
                 synthesize_network(hx_utils, self.T_min_app, self.Qmin,
                                    self.force_ideal_thermo, self.avoid_recycle,
-                                   self.sort_hus_by_T, info=synthesis_info)
+                                   self.sort_hus_by_T, info=synthesis_info,
+                                   stream_splitting=self.stream_splitting)
+                self._synthesis_options = (self.stream_splitting,)
                 new_HXs = HXs_hot_side + HXs_cold_side
+                # the realized splits (none without stream splitting)
+                splits = synthesis_info.get('splits', ())
+                self.new_splitters = new_splitters = [
+                    u for split in splits for u in split.splitters
+                ]
+                self.new_mixers = new_mixers = [split.mixer for split in splits]
                 self.new_HXs_hot_side = HXs_hot_side
                 self.new_HXs_cold_side = HXs_cold_side
                 self.cold_indices = cold_indices
@@ -432,26 +458,32 @@ class HeatExchangerNetwork(bst.Facility):
                 self.pinch_Ts = pinch_T_arr
                 self.inlet_Ts = T_in_arr
                 self.outlet_Ts = T_out_arr
-                all_units = new_HXs + new_HX_utils
+                all_units = new_HXs + new_HX_utils + new_splitters + new_mixers
                 IDs = set([i.ID for i in all_units])
                 assert len(all_units) == len(IDs)
+                # Each stream enters at its entry port (its first stage, or
+                # the splitter chain of a split at its inlet) as a copy of
+                # its real inlet, and every connection of its life cycle
+                # (for an unsplit stream, from each stage to the next) is
+                # wired.
                 for i, life_cycle in enumerate(stream_life_cycles):
-                    stage = life_cycle.life_cycle[0]
+                    entry = life_cycle.entry
                     s_util = hx_heat_utils_rearranged[i].unit.ins[0]
-                    s_lc = stage.unit.ins[stage.index]
+                    s_lc = entry.unit.ins[entry.index]
                     s_lc.copy_like(s_util)
-                    self._enter_network(i, stage, s_lc)
+                    self._enter_network(i, entry, s_lc)
                 for life_cycle in stream_life_cycles:
-                    s_out = None
-                    for i in life_cycle.life_cycle:
-                        unit = i.unit
-                        if s_out: unit.ins[i.index] = s_out
-                        s_out = unit.outs[i.index]
+                    for up, up_port, down, down_port in life_cycle.connections():
+                        down.ins[down_port] = up.outs[up_port]
                 # For the cached network: the share of its stream's duty at
                 # which each process stage's enthalpy limit sits, so that a
                 # changed feed rescales every stage instead of letting the
-                # first one take the whole duty.
+                # first one take the whole duty. A branch stage (fraction f
+                # of the flow) has f times the whole stream's limit: its
+                # share is that of the whole stream's limit (on the parent
+                # basis), and f is kept in `_stage_scales`.
                 self._stage_fractions = stage_fractions = {}
+                self._stage_scales = stage_scales = {}
                 for i, life_cycle in enumerate(stream_life_cycles):
                     hx = hx_heat_utils_rearranged[i].unit
                     H_in = hx.ins[0].H
@@ -461,6 +493,10 @@ class HeatExchangerNetwork(bst.Facility):
                         if isinstance(unit, bst.HXutility): continue
                         H_lim = getattr(unit, f'H_lim{lc.index}')
                         if H_lim is None: continue
+                        f = lc.fraction
+                        if f != 1.:
+                            H_lim /= f
+                            stage_scales[unit.ID, lc.index] = f
                         stage_fractions[unit.ID, lc.index] = (
                             (H_lim - H_in) / span if span else 0.
                         )
@@ -616,9 +652,18 @@ class HeatExchangerNetwork(bst.Facility):
         new_HX_utils = self.new_HX_utils
         streams = self.streams_inlet
         indices = [i for i in range(len(streams))]
+        # each stream's own splits (``synthesis_info['splits']``); a stream
+        # without any gets its life cycle exactly as without splitting
+        splits = {}
+        for split in self.synthesis_info.get('splits', ()):
+            splits.setdefault(split.stream, []).append(split)
         SLCs = [StreamLifeCycle(index, index in cold_indices) for index in indices]
         for SLC in SLCs:
-            SLC.get_life_cycle(new_HXs, new_HX_utils)
+            if SLC.index in splits:
+                SLC.get_life_cycle(new_HXs, new_HX_utils,
+                                   splits=splits[SLC.index])
+            else:
+                SLC.get_life_cycle(new_HXs, new_HX_utils)
         stream_life_cycles = SLCs
         self.stream_life_cycles = stream_life_cycles
         return stream_life_cycles

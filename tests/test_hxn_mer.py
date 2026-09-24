@@ -825,38 +825,50 @@ def _variant(variant):
         patch.setattr(_splitting, '_CORE_STRATEGIES', ('V',))
         yield
 
-def _network(case, stream_splitting=False, variant=None):
+def _network_record(units, HXN, T_min_app, stream_splitting, variant=None,
+                    time_s=None):
+    """What the checks read of a simulated facility `HXN` on the process
+    exchangers `units` (as `_network` returns it)."""
+    hus = [hu for hx in HXN.new_HX_utils for hu in hx.heat_utilities]
+    total, net = _duties(units)
+    return dict(
+        units=units, HXN=HXN, T_min_app=T_min_app, time=time_s,
+        table=_hensmith_table(units, T_min_app), total=total, net=net,
+        heat=sum(hu.unit_duty for hu in hus if hu.unit_duty > 0),
+        cool=-sum(hu.unit_duty for hu in hus if hu.unit_duty < 0),
+        stream_splitting=stream_splitting, variant=variant,
+    )
+
+def _synthesize(case, stream_splitting, variant):
+    """Simulate the case's units with the facility (`_network`)."""
+    units, T_min_app = _build(case)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app,
+                               stream_splitting=stream_splitting)
+    sys = bst.System.from_units('sys', units=[*units, HXN])
+    t0 = time.perf_counter()
+    with warnings.catch_warnings(), _variant(variant):
+        warnings.simplefilter('error', RuntimeWarning)
+        # biosteam's HeatUtility.load_agent names a new 'oxygen_rich_inlet'
+        # stream for every fuel (furnace) utility; the network itself replaces
+        # nothing in the registry (test_synthesis_registers_no_intermediate_streams)
+        warnings.filterwarnings('ignore', category=RuntimeWarning,
+                                message='.*<Stream: oxygen_rich_inlet> has been replaced in registry')
+        sys.simulate()
+    return _network_record(units, HXN, T_min_app, stream_splitting, variant,
+                           time.perf_counter() - t0)
+
+def _network(case, stream_splitting=False, variant=None, cached=True):
     """Synthesize the case with the public facility, like a user would,
     with or without `stream_splitting` (the planner patched by `_variant`
     during the synthesis only); cached per (name, stream_splitting,
-    variant)."""
+    variant), or a fresh network (never cached) unless `cached`."""
     name = case['name']
+    if not cached:
+        return _synthesize(case, stream_splitting, variant)
     key = (name, stream_splitting, variant)
     if key not in _NETWORKS:
         try:
-            units, T_min_app = _build(case)
-            options = dict(stream_splitting=True) if stream_splitting else {}
-            HXN = HeatExchangerNetwork('HXN', T_min_app=T_min_app, **options)
-            sys = bst.System.from_units('sys', units=[*units, HXN])
-            t0 = time.perf_counter()
-            with warnings.catch_warnings(), _variant(variant):
-                warnings.simplefilter('error', RuntimeWarning)
-                # biosteam's HeatUtility.load_agent names a new 'oxygen_rich_inlet'
-                # stream for every fuel (furnace) utility; the network itself replaces
-                # nothing in the registry (test_synthesis_registers_no_intermediate_streams)
-                warnings.filterwarnings('ignore', category=RuntimeWarning,
-                                        message='.*<Stream: oxygen_rich_inlet> has been replaced in registry')
-                sys.simulate()
-            time_s = time.perf_counter() - t0
-            hus = [hu for hx in HXN.new_HX_utils for hu in hx.heat_utilities]
-            total, net = _duties(units)
-            _NETWORKS[key] = dict(
-                units=units, HXN=HXN, T_min_app=T_min_app, time=time_s,
-                table=_hensmith_table(units, T_min_app), total=total, net=net,
-                heat=sum(hu.unit_duty for hu in hus if hu.unit_duty > 0),
-                cool=-sum(hu.unit_duty for hu in hus if hu.unit_duty < 0),
-                stream_splitting=stream_splitting, variant=variant,
-            )
+            _NETWORKS[key] = _synthesize(case, stream_splitting, variant)
         except Exception as error:
             _NETWORKS[key] = error
     result = _NETWORKS[key]
@@ -1161,7 +1173,7 @@ def _split_network_problems(net):
     for u in units:
         if type(u) not in kinds: problem('G0', f'{u.ID}: a {type(u).__name__}')
     for kind, pattern, attr in _NETWORK_UNITS:
-        listed = list(getattr(HXN, attr, []))
+        listed = list(getattr(HXN, attr))
         present = [u for u in units if type(u) is kind]
         if not (len(set(listed)) == len(listed) and set(listed) == set(present)):
             problem('G0', f'{attr} {IDs(listed)} != the {kind.__name__} units '
@@ -1781,15 +1793,24 @@ def test_split_checker_agrees_on_linear_networks(case):
     problems = _linear_network_problems(net)
     assert not problems, '\n'.join(problems)
 
+@pytest.mark.parametrize('source', ['wired', 'facility'])
 @pytest.mark.parametrize('mutation', list(SPLIT_MUTATIONS))
-def test_split_checker_detects_mutations(mutation):
-    # a split network wired by hand (as the facility wires it) passes the
-    # strict checks; each defect, applied to a fresh copy, is caught by the
-    # check made for it (and possibly others)
+def test_split_checker_detects_mutations(mutation, source):
+    # a split network, wired by hand (as the facility wires it) or by the
+    # facility itself, passes the strict checks; each defect, applied to a
+    # fresh copy, is caught by the check made for it (and possibly others)
     case = _case(MUTATION_CASE)
-    problems = _network_problems(_wired_split_network(case, cached=True))
+    if source == 'wired':
+        net = _wired_split_network(case, cached=True)
+    else:
+        net = _network(case, True)
+    problems = _network_problems(net)
     assert not problems, '\n'.join(problems)
-    net = _wired_split_network(case)
+    assert net['HXN'].synthesis_info['splits']
+    if source == 'wired':
+        net = _wired_split_network(case)
+    else:
+        net = _network(case, True, cached=False)
     tag = SPLIT_MUTATIONS[mutation](net)
     problems = _network_problems(net)
     assert any(p.startswith(tag + ' ') for p in problems), (tag, problems)
