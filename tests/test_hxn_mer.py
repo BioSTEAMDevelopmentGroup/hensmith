@@ -26,10 +26,13 @@ NO_SPLIT
     that proves the claim.
 SPLIT
     Problems for which the pinch design rules PROVE that MER needs stream
-    splitting. hensmith does not split streams, so the network must stay
-    feasible and balanced, never beat the targets, and report
+    splitting. Without stream splitting (the default) the network must
+    stay feasible and balanced, never beat the targets, and report
     ``'best_effort'``. A strict miss is not asserted: alternating repeated
-    matches can approach MER arbitrarily closely.
+    matches can approach MER arbitrarily closely. With
+    ``stream_splitting=True`` it must reach the targets, with every
+    material and energy balance closed and every exchanger feasible (see
+    "Networks that split streams").
 Each set holds at least five problems with more than ten streams.
 
 Provenance
@@ -179,6 +182,33 @@ and also to those if it has no splitter.
     At the planner (on the facility's round-0 inputs, ``_corpus_knots``),
     splitting leaves an unsplit problem's plan, and a SPLIT problem's sides
     that need no split, bit for bit as they are without it.
+``test_split_network_balanced_and_feasible`` / ``test_split_network_reaches_mer``
+    Every constant-CP SPLIT problem (``SPLIT_CP``), synthesized with
+    ``stream_splitting=True``, passes
+    G0-G10 and reaches both hensmith's targets and the independent
+    reference within the NO_SPLIT tolerances (``_split_mer_problems``):
+    status 'mer', no side left to best effort, every exchanger at its
+    planned duty (``deviations``), nothing repaired, dropped or dropped by
+    ``Qmin``, every mixer outlet at its planned state, the minimum
+    approach kept, and every split side free of leaks, pre-leaks, cells
+    below ``Qmin`` and failed strategies.
+``test_split_network_structure``
+    Every realized split has two or more branches, each with a process
+    exchanger and one fraction, the fractions summing to 1; each life cycle
+    holds exactly its stream's splits in flow order, with every branch's
+    stages; a must re-joins isothermally.
+``test_split_exact_dTmin_is_enthalpy_limited``
+    A branch exchanger at exactly ``T_min_app`` stops at its enthalpy limit
+    (its guard ``dT`` sits 1e-6 K lower), at its planned duty.
+``test_no_split_network_with_splitting``
+    A NO_SPLIT problem synthesized with ``stream_splitting=True`` is the
+    network synthesized without it, bit for bit.
+``test_backstop_alone_reaches_mer`` / ``..._in_the_facility``
+    With the vertical core alone (no Stage S rule, strategy V only), every
+    split side of ``SPLIT_CP``, and of the two constructed problems whose
+    roots pre-leak, is planned at MER, with cells that pass
+    test_hxn_planner's independent ``_verify_side_cells``; the facility's
+    backstop network (smith2005_ex18_4_split) passes the checks above.
 
 Tolerances
 ----------
@@ -260,6 +290,8 @@ from hensmith._heat_exchanger_network import _network_path
 from hensmith._planner import plan_network
 from hensmith.hxn_synthesis import problem_table
 from hxn_mer_cases import NO_SPLIT, SPLIT, Q_UNITS, T_UNITS
+from test_hxn_planner import (NEAR_DOUBLE_PINCH, NEAR_THRESHOLD, _verify_side_cells,
+                              sides_from_knots)
 
 # ---------------------------------------------------------------------------
 # Tolerances (justified in the module docstring)
@@ -1841,3 +1873,241 @@ def test_network_variant_is_patched_for_the_synthesis_only():
         assert _splitting._SPLIT_RULES is rules
     with pytest.raises(ValueError):
         with _variant('LV'): pass
+
+# ---------------------------------------------------------------------------
+# Stream splitting: the facility at the corpus
+# ---------------------------------------------------------------------------
+
+#: the constant-CP SPLIT problems
+SPLIT_CP = [case for case in SPLIT if _is_cp(case)]
+
+#: NO_SPLIT problems synthesized end to end with stream splitting (at the
+#: planner, test_no_split_plan_unchanged_by_splitting covers them all)
+NO_SPLIT_WITH_SPLITTING = ['4sp1_lee1970_dt10F', 'linnhoff_4stream']
+
+#: problems (dT, rows) of test_hxn_planner whose roots the planner's own
+#: cascade tolerances leave slightly negative, so that splitting starts
+#: from the pre-leaked root: a threshold deficit of 23.7 tolQ, and
+#: nptel_t5_3 with CP2 = 6 - 1.58e-11 (near-equal minima, 0.05 tolQ)
+PRELEAK_PROBLEMS = {'near_threshold': NEAR_THRESHOLD,
+                    'near_double_pinch': NEAR_DOUBLE_PINCH}
+
+def _numeric_knots(dT, rows):
+    """Planner inputs (knots, is_hot, T_min_app) of a constant-CP problem
+    given as test_hxn_planner rows, as `_planner._plan_numeric` builds
+    them."""
+    knots, is_hot = [], []
+    for _, kind, T_in, T_out, CP in rows:
+        a, b = float(min(T_in, T_out)), float(max(T_in, T_out))
+        T = np.array([a, b])
+        knots.append((T, float(CP) * (T - a)))
+        is_hot.append(kind == 'h')
+    return knots, is_hot, float(dT)
+
+def _curved(case):
+    """{(stream, side): whether the planner's curve of the stream on that
+    side of the pinch has a kink (more than two knots), on the facility's
+    round-0 knots}."""
+    knots = _corpus_knots(case)
+    sides = sides_from_knots(knots['knots'], knots['is_hot'], knots['T_min_app'])
+    return {(c.stream, name): c.n > 2 for name, side in sides.items()
+            for c in side.musts + side.flexes}
+
+def _split_mer_problems(case, net, candidate=None):
+    """Everything that keeps the split network `net` of `case` from being
+    the MER network the synthesizer promises (test_split_network_reaches_mer);
+    `candidate`, if given, is the name every split side must have picked."""
+    HXN, T_min_app = net['HXN'], net['T_min_app']
+    info = HXN.synthesis_info
+    problems = []
+    if info['status'] != 'mer': problems.append(f"status {info['status']!r}")
+    atol = MER_TOL[case['kind']] * net['total']
+    for label, got, target, ref, ref_tol in _utilities(case, net):
+        if not abs(got - target) <= atol:
+            problems.append(f'{label} {got!r} != target {target!r}')
+        if not abs(got - ref) <= atol + ref_tol:
+            problems.append(f'{label} {got!r} != reference {ref!r}')
+    if not (HXN.new_splitters and HXN.new_mixers and info['splits']):
+        problems.append('no split')
+    for key in ('repaired', 'dropped', 'qmin_dropped', 'split_deviations', 'deviations'):
+        if info[key] != []: problems.append(f'{key}: {info[key]}')
+    if not info['min_approach'] >= T_min_app - APPROACH_TOL:
+        problems.append(f"min_approach {info['min_approach']!r} K")
+    split_sides = 0
+    for name, side in info['sides'].items():
+        if side['status'] == 'best_effort': problems.append(f'{name}: best effort')
+        split = side['split']
+        if split is None: continue
+        split_sides += 1
+        if split['candidate'] is None or side['method'] != f"split-{split['candidate']}":
+            problems.append(f"{name}: method {side['method']!r}, candidate "
+                            f"{split['candidate']!r}")
+        if candidate is not None and split['candidate'] != candidate:
+            problems.append(f"{name}: picked {split['candidate']!r}")
+        for key, empty in (('leak', 0.), ('preleak', 0.), ('small', []), ('errors', [])):
+            if split[key] != empty: problems.append(f'{name}: {key} {split[key]!r}')
+    if not split_sides: problems.append('no side split')
+    curved = _curved(case)
+    mixers = {}
+    for split in info['splits']:
+        key = split.stream, split.side
+        mixers[key] = mixers.get(key, 0) + 1
+    for key, n in mixers.items():
+        if curved[key] and n > _splitting._SPLIT_MIX_CAP:
+            problems.append(f'stream {key[0]} {key[1]}: {n} mixers on a curved stream')
+    return problems
+
+@pytest.mark.parametrize('case', SPLIT_CP, ids=_name)
+def test_split_network_balanced_and_feasible(case):
+    # the strict split-aware checks (G0-G10) on the network synthesized
+    # with stream splitting
+    problems = _network_problems(_network(case, True))
+    assert not problems, '\n'.join(problems)
+
+@pytest.mark.parametrize('case', SPLIT_CP, ids=_name)
+def test_split_network_reaches_mer(case):
+    # with stream splitting, a problem whose MER needs splits reaches both
+    # hensmith's targets and the independent reference, with every
+    # exchanger at its planned duty (no deviation), nothing repaired or
+    # dropped, and splits free of leaks and small cells
+    problems = _split_mer_problems(case, _network(case, True))
+    assert not problems, '\n'.join(problems)
+
+@pytest.mark.parametrize('case', SPLIT_CP, ids=_name)
+def test_split_network_structure(case):
+    # every realized split: at least two branches with one fraction each,
+    # summing to 1, each with a process exchanger; the life cycles hold
+    # exactly the stream's splits, in flow order, with the branches' stages;
+    # a must (a hot stream above the pinch, a cold one below) re-joins at
+    # one temperature
+    HXN = _network(case, True)['HXN']
+    splits = HXN.synthesis_info['splits']
+    assert splits
+    cycles = {lc.index: lc for lc in HXN.stream_life_cycles}
+    new_HXs = {id(hx) for hx in HXN.new_HXs}
+    for split in splits:
+        assert len(split.fractions) == len(split.branches) >= 2
+        assert abs(math.fsum(split.fractions) - 1.) <= 1e-12
+        assert all(split.branches), split
+        assert all(type(hx) is bst.HXprocess and id(hx) in new_HXs
+                   for branch in split.branches for hx in branch), split
+        assert (any(split.mixer is u for u in HXN.new_mixers)
+                and all(any(s is u for u in HXN.new_splitters) for s in split.splitters))
+        must = (split.side == 'above') != cycles[split.stream].cold
+        if must: assert split.isothermal, split
+    for lc in HXN.stream_life_cycles:
+        own = [split for split in splits if split.stream == lc.index]
+        first = 'below' if lc.cold else 'above'
+        own.sort(key=lambda split: (split.side != first, split.index))
+        assert [id(split) for split in lc.splits] == [id(split) for split in own]
+        for k, split in enumerate(lc.splits):
+            for b, branch in enumerate(split.branches):
+                stages = [stage for stage in lc.life_cycle if stage.branch == (k, b)]
+                assert [id(stage.unit) for stage in stages] == [id(hx) for hx in branch]
+                assert all(stage.fraction == split.fractions[b] for stage in stages)
+        assert ([id(u) for u in HXN.stream_HXs_dict[lc.index]]
+                == [id(stage.unit) for stage in lc.life_cycle])
+
+def _planned_duties(case):
+    """{exchanger ID: planned duty [kJ/hr]} of the facility's round-0 plan
+    of `case` with stream splitting (its IDs as `hxn_synthesis._realize`
+    names the exchangers)."""
+    knots = _corpus_knots(case)
+    plan = plan_network(knots['knots'], knots['is_hot'], knots['T_min_app'],
+                        Qmin=1e-3, stream_splitting=True)
+    duties = {}
+    for e in plan.exchangers:
+        suffix = '' if e.pair_index == 1 else f'_{e.pair_index}'
+        ID = (f'HX_{e.cold}_{e.hot}_hs{suffix}' if e.side == 'above'
+              else f'HX_{e.hot}_{e.cold}_cs{suffix}')
+        duties[ID] = e.Q
+    return duties
+
+@pytest.mark.parametrize('case', [_case('smith2005_ex18_4_split')], ids=_name)
+def test_split_exact_dTmin_is_enthalpy_limited(case):
+    # a branch exchanger at exactly the minimum approach (at the pinch) runs
+    # with its guard dT = T_min_app - 1e-6 K, so its duty ends where an
+    # enthalpy limit (f times the parent's) binds: the planned duty
+    net = _network(case, True)
+    HXN, T_min_app = net['HXN'], net['T_min_app']
+    info = HXN.synthesis_info
+    assert info['refine_rounds'] == 0  # round 0 is the realized plan
+    planned = _planned_duties(case)
+    duty = {lc.index: abs(hx.outs[0].H - hx.ins[0].H)
+            for hx, lc in zip(HXN.original_heat_exchangers, HXN.stream_life_cycles)}
+    at_pinch = 0
+    for split in info['splits']:
+        for hx in (hx for branch in split.branches for hx in branch):
+            assert hx.dT == T_min_app - 1e-6
+            streams = [int(n) for n in hx.ID.split('_')[1:3]]  # at ports 0, 1
+            limited = [k for k, H_lim in enumerate((hx.H_lim0, hx.H_lim1))
+                       if H_lim is not None
+                       and abs(hx.outs[k].H - H_lim) <= DUTY_RTOL * duty[streams[k]]]
+            assert limited, hx.ID
+            scale = duty[streams[0]] + duty[streams[1]]
+            assert abs(hx.Q - planned[hx.ID]) <= hxn_synthesis._DUTY_TOL * scale, hx.ID
+            h = 0 if hx.ins[0].T > hx.ins[1].T else 1
+            c = 1 - h
+            terminal = min(hx.ins[h].T - hx.outs[c].T, hx.outs[h].T - hx.ins[c].T)
+            at_pinch += abs(terminal - T_min_app) <= 1e-9
+    assert at_pinch
+
+@pytest.mark.parametrize('name', NO_SPLIT_WITH_SPLITTING)
+def test_no_split_network_with_splitting(name):
+    # a problem that needs no split gives, end to end with stream splitting,
+    # exactly the network it gives without (bit for bit)
+    case = _case(name)
+    on, off = _network(case, True), _network(case)
+    info_on, info_off = on['HXN'].synthesis_info, off['HXN'].synthesis_info
+    assert info_on['status'] == info_off['status'] == 'mer'
+    assert info_on['splits'] == on['HXN'].new_splitters == on['HXN'].new_mixers == []
+    assert not any(type(u) in (bst.Splitter, bst.Mixer) for u in on['HXN'].HXN_sys.units)
+    assert ([(hx.ID, float(hx.Q).hex()) for hx in on['HXN'].new_HXs]
+            == [(hx.ID, float(hx.Q).hex()) for hx in off['HXN'].new_HXs])
+    for key in ('refine_rounds', 'repaired'):
+        assert info_on[key] == info_off[key], key
+    problems = _network_problems(on)
+    assert not problems, '\n'.join(problems)
+
+@pytest.mark.parametrize('name', [case['name'] for case in SPLIT_CP]
+                                 + list(PRELEAK_PROBLEMS))
+def test_backstop_alone_reaches_mer(name, monkeypatch):
+    # the vertical core alone (no Stage S rule, strategy V only) plans every
+    # split side at MER from the pre-leaked root, with cells that pass the
+    # independent check (test_hxn_planner); only the constructed problems
+    # pre-leak
+    if name in PRELEAK_PROBLEMS:
+        knots, is_hot, T_min_app = _numeric_knots(*PRELEAK_PROBLEMS[name])
+    else:
+        k = _corpus_knots(_case(name))
+        knots, is_hot, T_min_app = k['knots'], k['is_hot'], k['T_min_app']
+    monkeypatch.setattr(_splitting, '_SPLIT_RULES', ())
+    monkeypatch.setattr(_splitting, '_CORE_STRATEGIES', ('V',))
+    planned = {}
+    plan_side = _planner._plan_side
+    def spy(side, *args, **kwargs):
+        result = plan_side(side, *args, **kwargs)
+        planned[side.name] = side, result
+        return result
+    monkeypatch.setattr(_planner, '_plan_side', spy)
+    plan = plan_network(knots, is_hot, T_min_app, stream_splitting=True)
+    assert plan.status == 'mer'
+    splits = {n: side['split'] for n, side in plan.info['sides'].items()
+              if side['split'] is not None}
+    assert splits and all(split['candidate'] == 'V' for split in splits.values())
+    assert all(split['leak'] == 0. for split in splits.values())
+    preleak = math.fsum(split['preleak'] for split in splits.values())
+    assert (preleak > 0.) == (name in PRELEAK_PROBLEMS)
+    assert plan.penalty <= preleak + 1e-12 * plan.info['scale']
+    for n in splits:
+        side, result = planned[n]
+        assert result.status == 'mer'
+        _verify_side_cells(side, result.cells, _splitting._preleak_root(side)[1])
+
+@pytest.mark.parametrize('case', [_case('smith2005_ex18_4_split')], ids=_name)
+def test_backstop_alone_reaches_mer_in_the_facility(case):
+    # the facility with the vertical core alone: MER, and a strictly
+    # balanced and feasible network
+    net = _network(case, True, variant='V')
+    problems = _network_problems(net) + _split_mer_problems(case, net, candidate='V')
+    assert not problems, '\n'.join(problems)
