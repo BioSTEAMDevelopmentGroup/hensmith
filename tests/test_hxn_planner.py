@@ -2599,6 +2599,12 @@ TINY_HOT_BRANCH = (10., [  # below: the hot branch for C2 would carry 1e-6
 TIGHT_TINY_BRANCH = (10., [  # below: as tiny, and no CP slack to raise it
     ('H0', 'h', 170, 100, 1.0001), ('C1', 'c', 90, 175, 1.),
     ('C2', 'c', 90, 180, 1e-4)])
+TINY_DEMAND_BRANCH = (10., [  # above (the facility fuzz): H1 (CP 1) needs a
+    # branch of 1e-6 to 1e-3 of it for C3 (CP 1e-3) or C1 (CP 1e-4)
+    ('H0', 'h', 205, 170, 7.), ('H1', 'h', 225, 170, 1.),
+    ('H2', 'h', 185, 150, .999999), ('C0', 'c', 150, 245, .999999),
+    ('C1', 'c', 120, 240, 1e-4), ('C2', 'c', 160, 245, 7.),
+    ('C3', 'c', 160, 240, 1e-3)])
 
 
 def corpus_problem(name):
@@ -2837,6 +2843,68 @@ def test_cut_fractions_spread_the_capacity_slack():
                        ([(0, 0, 1.), (1, 0, 1e-4)], {0: (1.0001, 1.)}),
                        ([(0, 0, 1.), (1, 0, 1e-4)], {0: (3., 1.5e-3)})):
         assert SP._cut_fractions(cells, cap) == SP._cut_fractions(cells)
+
+
+def test_cut_fractions_raise_a_demand_branch_into_capacity_room():
+    # a demand's branches are its loads' shares, bit for bit, unless one
+    # would be below _SPLIT_MIN_FRACTION of its parent and the room left in
+    # the capacities takes the raise: then g_k = max(g_min, lam x_k / m),
+    # adding up to 1, with every raised load g_k m within its capacity's CP
+    cells = [(0, 0, .999999), (0, 1, 1e-6)]
+    shares = SP._cut_fractions(cells)
+    cap = {0: (.999999, 1.), 1: (1e-3, 1.)}
+    assert SP._cut_fractions(cells, cap) == shares   # no demand given
+    fr = SP._cut_fractions(cells, cap, {0: 1.})
+    assert_allclose([f for f, _ in fr], [.999, 1e-3], rtol=1e-12)
+    assert [g for _, g in fr] == [1., 1.]
+    assert abs(math.fsum(f for f, _ in fr) - 1.) <= 1e-15
+    assert all(f >= SP._SPLIT_MIN_FRACTION for f, _ in fr)
+    # a demand of fraction .5 of its parent needs g_min = 2e-3
+    fr = SP._cut_fractions(cells, {0: (.999999, 1.), 1: (3e-3, 1.)}, {0: .5})
+    assert_allclose([f for f, _ in fr], [.998, 2e-3], rtol=1e-12)
+    assert all(.5 * f >= SP._SPLIT_MIN_FRACTION for f, _ in fr)
+    # no room for the raise: the loads' shares
+    for cap, dem in (({0: (.999999, 1.), 1: (1e-4, 1.)}, {0: 1.}),
+                     ({0: (.999999, 1.), 1: (1e-3, 1.)}, {0: .5})):
+        assert SP._cut_fractions(cells, cap, dem) == shares
+    # two demands' slivers on one capacity whose room takes one raise: the
+    # first demand is raised, the second keeps its shares (its sliver then
+    # merges, `_split_items`), and the capacity's own branch for it is
+    # raised from its CP slack
+    cells = [(0, 0, .999999), (0, 2, 1e-6), (1, 1, .999999), (1, 2, 1e-6)]
+    cap = {0: (.999999, 1.), 1: (.999999, 1.), 2: (1.5e-3, 1.)}
+    fr = SP._cut_fractions(cells, cap, {0: 1., 1: 1.})
+    assert_allclose([f for f, _ in fr], [.999, 1e-3, .999999, 1e-6],
+                    rtol=1e-12)
+    assert_allclose([g for _, g in fr], [1., .999, 1., 1e-3], rtol=1e-12)
+
+
+def test_stage_s_raises_demand_branches_to_the_minimum():
+    # TINY_DEMAND_BRANCH: H1 (CP 1) fits no cold stream at the pinch, and
+    # every cut transport gives it a branch below _SPLIT_MIN_FRACTION (for
+    # C3 or C1), which merged away and undid the split: every Stage S rule
+    # failed and a core candidate split H1 0.9999 / 1e-4. C3's CP room
+    # takes a branch of the minimum: 'demand' and 'nw-exact-desc' split H1
+    # 0.999 / 0.001, and the plan reaches MER with a Stage S candidate and
+    # every fraction at least the minimum
+    dT, rows = TINY_DEMAND_BRANCH
+    side, a0, proof = root_of(dT, rows)
+    for rule in ('demand', 'nw-exact-desc'):
+        items, extra = SP._pinch_split(side, a0, proof, rule)
+        check_items(side, a0, items, extra)
+        assert extra == 1
+        assert_allclose(sorted(it[2] for it in items if it[3] is not None),
+                        [1e-3, .999], rtol=1e-12)
+    streams = streams_from(rows)
+    net = P._plan_numeric(streams, dT, **SPLIT_ON)
+    plan = net['plan']
+    assert net['status'] == 'mer'
+    check_split_network(streams, dT, net)
+    assert split_infos(plan)['above']['candidate'] in S_NAMES
+    assert plan.splits and all(min(s.fractions) >= SP._SPLIT_MIN_FRACTION
+                               for s in plan.splits)
+    assert all(min(e.hot_frac, e.cold_frac) >= SP._SPLIT_MIN_FRACTION
+               for e in plan.exchangers)
 
 
 @pytest.mark.parametrize('problem', ['TINY_BRANCH', 'TINY_HOT_BRANCH'])

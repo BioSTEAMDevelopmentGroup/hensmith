@@ -96,18 +96,19 @@ own capacity branch with ``CP_cap >= CP_dem``. `_cut_transport` splits the
 demands and capacities there by one of `_SPLIT_RULES`: demands whole,
 capacities whole, Linnhoff and Hindmarsh's minimum-cell structure, or the
 north-west corner with the CP slack spread uniformly or not at all. A
-capacity branch below `_SPLIT_MIN_FRACTION` takes its parent's CP slack
-from its siblings where that covers it (a branch needs only ``CP_cap >=
-CP_dem``, `_cut_fractions`), and merges into its largest sibling where it
-does not. The branches are whole-side branches, so by Lemma R the
-branched side keeps the cascade, and one `rules_violation` call at its
-pre-leaked root screens the split (`_pinch_split`); on a double pinch the
-same rule is applied at the cut that still fails. The branched side is an
-ordinary side for the planner's search: `_stage_s` plans it from its
-pre-leaked root with the first passes of the planner's DFS, unchanged but
-for the strict max duty of Lemma 1 (a `_StrictSide`), under a unit bound
-from the best candidate so far and one work budget for all rules
-(`_SPLIT_S_WORK`). Its pieces become cells in parent coordinates
+branch below `_SPLIT_MIN_FRACTION` is raised to it from its siblings
+where the CP slack covers that (`_cut_fractions`): a demand branch where
+the capacity it faces has room for the larger load, a capacity branch
+where its parent's slack keeps ``CP_cap >= CP_dem``; it merges into its
+largest sibling where not. The branches are whole-side branches, so by
+Lemma R the branched side keeps the cascade, and one `rules_violation`
+call at its pre-leaked root screens the split (`_pinch_split`); on a
+double pinch the same rule is applied at the cut that still fails. The
+branched side is an ordinary side for the planner's search: `_stage_s`
+plans it from its pre-leaked root with the first passes of the planner's
+DFS, unchanged but for the strict max duty of Lemma 1 (a `_StrictSide`),
+under a unit bound from the best candidate so far and one work budget for
+all rules (`_SPLIT_S_WORK`). Its pieces become cells in parent coordinates
 (`_s_cells`); a flex branch the DFS left unused is folded into its used
 siblings (**Lemma F**: a larger fraction moves every flex position toward
 the pinch, where the flex levels are no higher, so every cell stays
@@ -2108,7 +2109,7 @@ def _mincell(dem, cap):
     return cells
 
 
-def _cut_fractions(cells, cap=None):
+def _cut_fractions(cells, cap=None, dem=None):
     """
     Branch fractions ``(f, g)`` of every cell of a cut transport: the
     cell's load over the sum of the loads of its demand (capacity). A
@@ -2116,12 +2117,20 @@ def _cut_fractions(cells, cap=None):
     split whole, with no bypass, so its branch has CP ``g c >= load``. An
     item with one cell has fraction 1 (no split).
 
-    A capacity branch only needs ``g c >= load``, so with `cap`
-    (``{capacity: (c, f)}``: its CP and its own fraction of its parent), a
-    capacity with a branch below `_SPLIT_MIN_FRACTION` of its parent
-    (``f g``), which `_split_items` would merge away, spreads its CP slack
-    instead (`_raised_fractions`); if the slack cannot raise the branch,
-    its fractions stay the loads' shares.
+    A branch below `_SPLIT_MIN_FRACTION` of its parent would merge into a
+    sibling (`_split_items`); the CP slack raises it where it can. With
+    `cap` (``{capacity: (c, f)}``: its CP and its own fraction of its
+    parent) and `dem` (``{demand: f}``: its own fraction):
+
+    * a demand with such a branch moves load to it from its other branches
+      (`_water_fill`) if every capacity it raises a load on keeps ``sum
+      load <= c``; the demands go in the order of `dem`, each within the
+      room the ones before left;
+    * then a capacity with such a branch spreads its CP slack over the
+      loads so settled (`_raised_fractions`), as a capacity branch only
+      needs ``g c >= load``.
+
+    An item the slack cannot raise keeps the loads' shares, bit for bit.
     """
     by_d, by_c = defaultdict(list), defaultdict(list)
     for d, c, x in cells:
@@ -2130,34 +2139,86 @@ def _cut_fractions(cells, cap=None):
     sd = {d: math.fsum(v) for d, v in by_d.items()}
     sc = {c: math.fsum(v) for c, v in by_c.items()}
     fractions = [(x / sd[d], x / sc[c]) for d, c, x in cells]
+    loads, raised = [x for *_, x in cells], {}
+    for d, f in (dem.items() if cap and dem else ()):
+        at = [n for n, cell in enumerate(cells) if cell[0] == d]
+        if len(at) < 2 or all(f * fractions[n][0] >= _SPLIT_MIN_FRACTION
+                              for n in at):
+            continue
+        g = _water_fill([loads[n] for n in at], _min_share(f))
+        if g is None:
+            continue
+        new = list(loads)
+        for n, gn in zip(at, g):
+            new[n] = gn * sd[d]
+        up = {cells[n][1] for n in at if new[n] > loads[n]}
+        if all(c in cap and _fits(cap[c][0], math.fsum(
+                x for (_, k, _), x in zip(cells, new) if k == c))
+               for c in up):
+            loads = new
+            raised.update(zip(at, g))
+    if raised:
+        by_c = defaultdict(list)
+        for (_, c, _), x in zip(cells, loads):
+            by_c[c].append(x)
+        sc = {c: math.fsum(v) for c, v in by_c.items()}
+        fractions = [(raised.get(n, fractions[n][0]), x / sc[c])
+                     for n, ((_, c, _), x) in enumerate(zip(cells, loads))]
     for c, (cp, f) in (cap or {}).items():
         at = [n for n, cell in enumerate(cells) if cell[1] == c]
         if len(at) < 2 or all(f * fractions[n][1] >= _SPLIT_MIN_FRACTION
                               for n in at):
             continue
-        g_min = _SPLIT_MIN_FRACTION / f
-        while f * g_min < _SPLIT_MIN_FRACTION:   # as `_split_items` tests
-            g_min = math.nextafter(g_min, 2.)
-        g = _raised_fractions(by_c[c], cp, g_min)
+        g = _raised_fractions(by_c[c], cp, _min_share(f))
         if g is not None:
             for n, gn in zip(at, g):
                 fractions[n] = (fractions[n][0], gn)
     return fractions
 
 
-def _raised_fractions(loads, c, g_min):
+def _min_share(f):
+    """The smallest branch fraction ``g`` of an item of fraction `f` of its
+    parent with ``f g >= _SPLIT_MIN_FRACTION`` in floating point, the test
+    `_split_items` applies."""
+    g = _SPLIT_MIN_FRACTION / f
+    while f * g < _SPLIT_MIN_FRACTION:
+        g = math.nextafter(g, 2.)
+    return g
+
+
+def _water_fill(loads, g_min):
     """
-    Branch fractions of a capacity of CP `c` over its `loads`, each at
-    least `g_min`: ``g_k = max(g_min, lam x_k)``, ``sum g_k = 1``.
+    Branch fractions over `loads`, each at least `g_min`: ``g_k = max(g_min,
+    lam x_k)``, ``sum g_k = 1``.
 
     The branches below `g_min` at the loads' shares (``lam = 1 / sum x``)
     are raised to it, and the others share the rest in proportion to their
-    loads, so they keep one CP ratio ``lam c`` (uniform, as the loads'
-    shares do). With the loads ascending, the raised branches are the
-    first `t`, ``lam = (1 - t g_min) / sum_{k >= t} x_k``, and the first
-    `t` for which ``lam x_t >= g_min`` is the one: raising branch t lowers
-    `lam` exactly when ``lam x_t < g_min``, so the branches raised before
-    stay below `g_min` and `lam` only falls. Every branch then needs ``g_k
+    loads. With the loads ascending, the raised branches are the first
+    `t`, ``lam = (1 - t g_min) / sum_{k >= t} x_k``, and the first `t` for
+    which ``lam x_t >= g_min`` is the one: raising branch t lowers `lam`
+    exactly when ``lam x_t < g_min``, so the branches raised before stay
+    below `g_min` and `lam` only falls.
+
+    Returns
+    -------
+    list[float] or None
+        The fractions, in the order of `loads`; None if ``n g_min > 1``.
+    """
+    order = sorted(range(len(loads)), key=loads.__getitem__)
+    for t, k in enumerate(order):
+        lam = (1. - t * g_min) / math.fsum(loads[j] for j in order[t:])
+        if lam * loads[k] >= g_min:
+            break
+    else:
+        return None
+    return [max(g_min, lam * x) for x in loads]
+
+
+def _raised_fractions(loads, c, g_min):
+    """
+    Branch fractions of a capacity of CP `c` over its `loads`, each at
+    least `g_min` (`_water_fill`): the unraised branches keep one CP ratio
+    ``lam c`` (uniform, as the loads' shares do). Every branch needs ``g_k
     c >= x_k``: a raised one has it when ``lam c >= 1``, and the others
     have it iff ``lam c >= 1``.
 
@@ -2168,15 +2229,8 @@ def _raised_fractions(loads, c, g_min):
         (``n g_min > 1``, or the CP slack ``c - sum x`` cannot cover the
         raise: ``lam c < 1``).
     """
-    order = sorted(range(len(loads)), key=loads.__getitem__)
-    for t, k in enumerate(order):
-        lam = (1. - t * g_min) / math.fsum(loads[j] for j in order[t:])
-        if lam * loads[k] >= g_min:
-            break
-    else:
-        return None
-    g = [max(g_min, lam * x) for x in loads]
-    if all(_fits(gk * c, x) for gk, x in zip(g, loads)):
+    g = _water_fill(loads, g_min)
+    if g is not None and all(_fits(gk * c, x) for gk, x in zip(g, loads)):
         return g
     return None
 
@@ -2186,10 +2240,10 @@ def _split_items(items, M, split):
     The items (`_pinch_split`) after one cut: every item in `split`
     (``(role, local index) -> branch fractions``) becomes branches of its
     fraction times those. A branch below `_SPLIT_MIN_FRACTION` of its
-    parent (a demand branch, or a capacity branch its CP slack could not
-    raise, `_cut_fractions`) merges into its largest sibling (a realizable
-    split), and a parent left with one branch is a trunk again. Keys are
-    ``('S', parent, n)``, numbered per parent in item order.
+    parent (one the CP slack could not raise, `_cut_fractions`) merges
+    into its largest sibling (a realizable split), and a parent left with
+    one branch is a trunk again. Keys are ``('S', parent, n)``, numbered
+    per parent in item order.
     """
     parent, frac = [], []
     for n, (role, p, f, _) in enumerate(items):
@@ -2245,8 +2299,8 @@ def _pinch_split(side, a0, proof, rule):
     The branched side of one Stage S rule (module docstring, 'Stage S').
 
     The rule's transport (`_cut_transport`) at the proof's cut splits the
-    demands and capacities there into whole-side branches, a capacity's CP
-    slack raising its branches to `_SPLIT_MIN_FRACTION` where it can
+    demands and capacities there into whole-side branches, the CP slack
+    raising branches to `_SPLIT_MIN_FRACTION` where it can
     (`_cut_fractions`). By Lemma R the branched side keeps the parent's
     cascade, so one exact screen at its pre-leaked root decides the split:
     its slack of (R) must be the parent's, and `rules_violation` there
@@ -2298,11 +2352,13 @@ def _pinch_split(side, a0, proof, rule):
             return None
         dem, cap = ('must', 'flex') if v['rule'] == 'outward' else (
             'flex', 'must')
-        # each capacity's CP and its item's fraction of its parent
+        # each capacity's CP and each item's fraction of its parent
         first = 0 if cap == 'must' else bside.M
         room = {c: (cp, items[first + c][2]) for c, cp in sets[1]}
+        first = 0 if dem == 'must' else bside.M
+        own = {d: items[first + d][2] for d, _ in sets[0]}
         split = defaultdict(list)
-        for (d, c, _), (f, g) in zip(cells, _cut_fractions(cells, room)):
+        for (d, c, _), (f, g) in zip(cells, _cut_fractions(cells, room, own)):
             split[dem, d].append(f)
             split[cap, c].append(g)
         new = _split_items(items, bside.M, split)

@@ -2750,6 +2750,40 @@ def test_synthetic_network_splits_to_mer():
                     atol=1e-6 * total_duty(units))
     assert_path_follows_streams(HXN)
 
+#: two problems of the facility fuzz of stream splitting (random pinch
+#: problems with odd CPs), ``(ID, T_in, T_out, CP)`` rows at dT 10 K
+SPLIT_AT_THE_MINIMUM = {
+    # every Stage S rule gave H1 a branch below the minimum fraction, which
+    # merged away, and a core candidate split it 0.9999 / 1e-4; C6's CP
+    # room takes a branch of the minimum (`_splitting._cut_fractions`)
+    'tiny_demand_branch': [
+        ('H0', 205., 170., 7.), ('H1', 225., 170., 1.),
+        ('H2', 185., 150., .999999), ('C3', 150., 245., .999999),
+        ('C4', 120., 240., 1e-4), ('C5', 160., 245., 7.),
+        ('C6', 160., 240., 1e-3)],
+    # Stage S splits H0 0.999 / 0.001 below the pinch; the splitter makes
+    # its second branch as the complement of its first, a hair below 0.001
+    # (G4 holds the planned fraction to the minimum, the flows to the plan)
+    'complement_at_the_minimum': [
+        ('H0', 190., 180., 7.), ('C1', 130., 195., 1e-3),
+        ('C2', 160., 260., .999999)],
+}
+
+@pytest.mark.parametrize('problem', sorted(SPLIT_AT_THE_MINIMUM))
+def test_split_branches_keep_the_minimum_fraction(problem):
+    # both reach MER with every planned branch at least the minimum
+    # fraction, and pass the strict checks and the synthesis report
+    units = cp_units(f'min_fraction_{problem}', SPLIT_AT_THE_MINIMUM[problem],
+                     200.)
+    sys, HXN, problems = split_facility(units, 10.,
+                                        f'sys_min_fraction_{problem}')
+    problems += test_hxn_mer._split_report_problems(HXN, 10.)
+    assert not problems, '\n'.join(problems)
+    splits = HXN.synthesis_info['splits']
+    assert splits and all(min(s.fractions) >= _splitting._SPLIT_MIN_FRACTION
+                          for s in splits)
+    assert_feasible(HXN, 10.)
+
 def test_split_network_registers_no_intermediate_streams():
     # as test_synthesis_registers_no_intermediate_streams, with splitting:
     # no synthesis (the first, or a new one) replaces anything in a

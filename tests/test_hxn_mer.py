@@ -141,9 +141,9 @@ G3
     the flow.
 G4
     Splitters balance mass; each branch is one fraction f of the split's
-    feed (phase by phase), at least 1e-3, the product of the splitters'
-    ratios down to it equals the split's fraction, at the feed's T and P,
-    with f times its enthalpy.
+    feed (phase by phase), at the feed's T and P, with f times its
+    enthalpy; f and the product of the splitters' ratios down to it equal
+    the split's planned fraction, which is at least 1e-3.
 G5
     Mixers balance mass, energy and pressure, and their outlet is at
     equilibrium at its enthalpy (the flash-free ``_Temperature``); an
@@ -1310,8 +1310,15 @@ def _split_network_problems(net):
                 s = u.outs[port]
                 f = s.F_mol / feed.F_mol if feed.F_mol else math.nan
                 label = f'{u.ID} outlet {port} (branch {b} of {name})'
-                if not MIN_FRACTION <= f < 1.:
-                    problem('G4', f'{label}: fraction {f:.15g}')
+                # the minimum holds for the planned fraction, exactly; the
+                # flows give it to FLOW_RTOL (a splitter's last branch is
+                # its feed minus its first: round-off of the feed's flow)
+                planned = (split.fractions[b] if split is not None
+                           and b < len(split.fractions) else f)
+                if not (MIN_FRACTION <= planned < 1.
+                        and abs(f - planned) <= FLOW_RTOL):
+                    problem('G4', f'{label}: fraction {f:.15g}, planned '
+                                  f'{planned:.15g}')
                 if not _is_fraction_of(s, f, feed, atol):
                     problem('G4', f'{label}: its flows are not {f:.15g} x those of the feed')
                 if split is not None and not (
