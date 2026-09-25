@@ -358,6 +358,9 @@ class HeatExchangerNetwork(bst.Facility):
     ticket_name = 'HXN'
     acceptable_energy_balance_error = 0.02
     raise_energy_balance_error = False
+    # Default of an instance without it (e.g. one from before stream
+    # splitting); `__init__` sets it on every new facility.
+    stream_splitting = False
     network_priority = -2
     _N_ins = 0
     _N_outs = 0
@@ -859,10 +862,10 @@ class HeatExchangerNetwork(bst.Facility):
                 # stage is then a branch: a fraction of the flow).
                 rows = [(stage.unit.ID, stage.H_in, stage.H_out)
                         for stage in life_cycle.life_cycle]
-                entry = life_cycle.entry.unit
-                if isinstance(entry, bst.Splitter):
+                entry = life_cycle.entry # None if assigned by hand
+                if entry is not None and isinstance(entry.unit, bst.Splitter):
                     H_in = life_cycle.H_in
-                    rows.insert(0, (entry.ID, H_in, H_in))
+                    rows.insert(0, (entry.unit.ID, H_in, H_in))
                 last = len(rows) - 1
                 for n, (ID, H_in, H_out) in enumerate(rows):
                     T_in = inlet_Ts[stream] - 273.15 if n == 0 else None

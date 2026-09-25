@@ -15,7 +15,8 @@ everywhere inside every exchanger; by default, where MER provably needs a
 split, the network is a best-effort one close to the targets. With
 `HeatExchangerNetwork(..., stream_splitting=True)`, streams are instead
 split into parallel branches there (BioSTEAM splitters and rigorous mixers),
-and the network reaches the MER targets.
+and the network reaches the MER targets (not guaranteed with `avoid_recycle`;
+see the documentation for the limits with real thermodynamics).
 
 ```python
 import biosteam as bst  # hensmith units plug into BioSTEAM systems

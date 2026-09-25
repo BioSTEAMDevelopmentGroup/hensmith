@@ -93,13 +93,15 @@ def test_cache_network_from_before_stream_splitting_synthesizes_again():
     HXN.cache_network = True
     sys.simulate()
     network = HXN.HXN_sys
-    del HXN._synthesis_options, HXN._stage_scales
+    # nor a stream_splitting attribute: the class default (off) applies
+    del HXN._synthesis_options, HXN._stage_scales, HXN.stream_splitting
     for life_cycle in HXN.stream_life_cycles:
         del life_cycle.entry, life_cycle.splits
     feed.F_mol *= 1.05
     with warnings.catch_warnings():
         warnings.simplefilter('error', RuntimeWarning)
         sys.simulate()
+    assert HXN.stream_splitting is False and not HXN.new_splitters
     assert HXN.HXN_sys is not network
     assert HXN._synthesis_options == (False,)
     assert all(lc.entry is not None for lc in HXN.stream_life_cycles)
@@ -107,6 +109,49 @@ def test_cache_network_from_before_stream_splitting_synthesizes_again():
     HXN.cache_network = False
     sys.simulate()
     assert_same_results(again, network_results(HXN))
+
+def test_life_cycles_without_entry_plot_and_write_csv(tmp_path, monkeypatch):
+    # the pinch diagram and the CSV read a stream's inlet at its entry
+    # port, which only get_life_cycle sets: a life cycle whose life_cycle
+    # is assigned directly, and one from before stream splitting (no entry
+    # or splits; e.g. unpickled, or hensmith reloaded in a live session),
+    # read it at their first stage, and draw and write exactly as before
+    import csv
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from hensmith.hxn_synthesis import StreamLifeCycle
+    sys, HXN, feed = build_system()
+    sys.simulate()
+
+    def outputs(name):
+        fig, ax = HXN.plot_pinch_diagram()
+        try:
+            texts = [(t.get_text(), t.get_position(), t.get_gid())
+                     for t in ax.texts]
+        finally:
+            plt.close(fig)
+        folder = tmp_path / name
+        folder.mkdir()
+        monkeypatch.chdir(folder)
+        HXN.save_stream_life_cycles_as_csv()
+        path, = folder.glob('HXN-*.csv')
+        with open(path, newline='') as file:
+            return texts, list(csv.reader(file))
+    expected = outputs('entry')
+    assigned = []
+    for life_cycle in HXN.stream_life_cycles:
+        assert life_cycle.entry is not None and not life_cycle.splits
+        new = StreamLifeCycle(life_cycle.index, life_cycle.cold)
+        new.life_cycle = life_cycle.life_cycle
+        assigned.append(new)
+    HXN.stream_life_cycles = assigned
+    assert all(lc.H_in == lc.life_cycle[0].H_in for lc in assigned)
+    assert outputs('assigned') == expected
+    for life_cycle in assigned:
+        del life_cycle.entry, life_cycle.splits
+    assert all(lc.entry is None and not lc.splits for lc in assigned)
+    assert outputs('before') == expected
 
 def assert_no_phantom_utility_exchangers(HXN):
     """Every utility exchanger either has exactly no duty, and so no design
@@ -1646,8 +1691,8 @@ def test_realize_split_branch_ports(name):
         assert_allclose([H_split, H_mix], [s.H_split, s.H_mix], rtol=0,
                         atol=1e-12 * span[s.stream])
         assert len(H_ends) == len(s.branches)
-    # smith2005_ex18_2 splits a cold stream at its inlet; rtB05 splits its
-    # cold stream after its trunk exchanger below the pinch
+    # smith2005_ex18_2 splits its hot stream (stream 2) at its inlet; rtB05
+    # splits its cold stream after its trunk exchanger below the pinch
     assert any(first_nodes.values()) == name.startswith('smith')
     min_approach, violations, bad = hxn_synthesis._exact_approach(
         plan, duties, ends, curves, knots, dT)
@@ -1867,13 +1912,13 @@ def test_synthesize_network_splitting_requires_info():
 @pytest.mark.parametrize('name', [*SPLIT_CASES, 'crude_fractionation_ph11c2',
                                   'rtB03_above_hot_vapors'])
 def test_synthesize_network_with_splitting(name):
-    # smith2005_ex18_2 splits a cold stream at its inlet above the pinch,
-    # isothermally; rtB05 (real thermo) splits its cold stream as its last
-    # node, non-isothermally, into its heater; the crude unit splits into
-    # three branches or more (splitter chains of several elements); rtB03
-    # splits a vapor at its inlet, whose real inlet is not bit for bit its
-    # state at the inlet enthalpy: all reach MER through splitter chains,
-    # branch exchangers and rigorous mixers
+    # smith2005_ex18_2 splits its hot stream (stream 2) at its inlet above
+    # the pinch, isothermally; rtB05 (real thermo) splits its cold stream
+    # as its last node, non-isothermally, into its heater; the crude unit
+    # splits into three branches or more (splitter chains of several
+    # elements); rtB03 splits a vapor at its inlet, whose real inlet is not
+    # bit for bit its state at the inlet enthalpy: all reach MER through
+    # splitter chains, branch exchangers and rigorous mixers
     result, info, curves, dT = split_synthesis(name, 'synth_' + name)
     assert len(result) == 13
     (hs, cs, utils, hxs, T_in, T_out, pinch_T, C_flow, hus_rearranged,

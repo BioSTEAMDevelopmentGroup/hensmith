@@ -219,7 +219,8 @@ class StreamLifeCycle:
         ``(unit, index)``, a named tuple: the inlet port `unit.ins[index]`
         where the whole stream enters the network, i.e. the first
         splitter of its first split if it splits at its inlet, else its
-        first stage's. None until `get_life_cycle` runs.
+        first stage's. None until `get_life_cycle` runs, and for a life
+        cycle whose `life_cycle` is assigned directly.
 
     Notes
     -----
@@ -229,6 +230,10 @@ class StreamLifeCycle:
     `plot_pinch_diagram` draws them.
 
     """
+    # Defaults for an instance without them, e.g. one unpickled from before
+    # stream splitting: an unsplit stream with no entry port recorded.
+    splits = ()
+    entry = None
 
     def __init__(self, index, cold):
         self.index = index
@@ -242,8 +247,11 @@ class StreamLifeCycle:
     def H_in(self):
         """Enthalpy of the stream at `entry` [kJ/hr], read from the stream
         when accessed: the whole flow's inlet, equal to the first stage's
-        `H_in` unless the stream splits at its inlet."""
-        unit, index = self.entry
+        `H_in` unless the stream splits at its inlet. Without an `entry`
+        (a `life_cycle` assigned directly), the first stage's `H_in`."""
+        entry = self.entry
+        if entry is None: return self.life_cycle[0].H_in
+        unit, index = entry
         return unit.ins[index].H
 
     def get_relevant_units(self, index, new_HXs, new_HX_utils):

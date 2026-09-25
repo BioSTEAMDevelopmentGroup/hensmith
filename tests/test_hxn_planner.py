@@ -2593,6 +2593,12 @@ ONE_HOT_TWO_COLD = (10., [  # the CP rule: no cold stream is large enough
 TINY_BRANCH = (10., [  # the cold branch for H2 would carry 1e-4 of it
     ('H1', 'h', 200, 100, 1.), ('H2', 'h', 200, 100, 1e-4),
     ('C1', 'c', 90, 190, 3.)])
+TINY_HOT_BRANCH = (10., [  # below: the hot branch for C2 would carry 1e-6
+    ('H0', 'h', 170, 150, 7.), ('C1', 'c', 120, 175, 1.000001),
+    ('C2', 'c', 140, 180, 1e-6)])
+TIGHT_TINY_BRANCH = (10., [  # below: as tiny, and no CP slack to raise it
+    ('H0', 'h', 170, 100, 1.0001), ('C1', 'c', 90, 175, 1.),
+    ('C2', 'c', 90, 180, 1e-4)])
 
 
 def corpus_problem(name):
@@ -2802,11 +2808,82 @@ def test_mincell_prefers_fewer_cells():
         dem, cap, 'nw-rho-desc')
 
 
+def test_cut_fractions_spread_the_capacity_slack():
+    # the loads' shares, bit for bit, unless a capacity branch would be
+    # below _SPLIT_MIN_FRACTION of its parent: then g_k = max(g_min, lam
+    # x_k), adding up to 1, which keeps g_k c >= x_k while lam c >= 1
+    cells = [(0, 0, 1.), (1, 0, 1e-4), (2, 0, 5e-4), (3, 0, 2e-3)]
+    shares = SP._cut_fractions(cells)
+    X = math.fsum(x for *_, x in cells)
+    assert shares == [(1., x / X) for *_, x in cells]
+    assert SP._cut_fractions(cells, {0: (10., 1.), 7: (1., 1.)}) != shares
+    for c, f in ((10., 1.), (10., .25), (10., .3), (1.01, 1.)):
+        fr = SP._cut_fractions(cells, {0: (c, f)})
+        assert [d for d, _ in fr] == [d for d, _ in shares]
+        g = [g for _, g in fr]
+        g_min = SP._SPLIT_MIN_FRACTION / f
+        lam = g[0] / cells[0][2]   # the largest load: never raised
+        assert_allclose(g, [max(g_min, lam * x) for *_, x in cells],
+                        rtol=1e-12)
+        assert abs(math.fsum(g) - 1.) <= 1e-15
+        assert all(f * gk >= SP._SPLIT_MIN_FRACTION for gk in g)
+        assert all(gk * c >= x for gk, (*_, x) in zip(g, cells))
+    assert_allclose([g for _, g in SP._cut_fractions(cells, {0: (10., 1.)})],
+                    [.998 / 1.002, 1e-3, 1e-3, 2e-3 * .998 / 1.002],
+                    rtol=1e-12)
+    # all branches reach the minimum, or the slack cannot raise them (the
+    # branch then merges, `_split_items`): the loads' shares
+    for cells, cap in (([(0, 0, 1.), (1, 0, 2.)], {0: (5., 1.)}),
+                       ([(0, 0, 1.), (1, 0, 1e-4)], {0: (1.0001, 1.)}),
+                       ([(0, 0, 1.), (1, 0, 1e-4)], {0: (3., 1.5e-3)})):
+        assert SP._cut_fractions(cells, cap) == SP._cut_fractions(cells)
+
+
+@pytest.mark.parametrize('problem', ['TINY_BRANCH', 'TINY_HOT_BRANCH'])
+def test_stage_s_keeps_capacity_branches_above_the_minimum(problem):
+    # a capacity whose branch for a tiny demand would be below
+    # _SPLIT_MIN_FRACTION of it has CP slack to raise it: Stage S splits
+    # (it used to merge the branch and fail, leaving the side to a core
+    # candidate with a branch of 1e-4 or 1e-6 of its stream)
+    dT, rows = globals()[problem]
+    side, a0, proof = root_of(dT, rows, 'above' if problem == 'TINY_BRANCH'
+                              else 'below')
+    for rule in CUT_RULES:
+        out = SP._pinch_split(side, a0, proof, rule)
+        if rule != 'demand':   # no capacity to take a whole demand
+            check_items(side, a0, *out)
+            assert out[1] == 1
+    streams = streams_from(rows)
+    net = P._plan_numeric(streams, dT, **SPLIT_ON)
+    plan = net['plan']
+    assert net['status'] == 'mer'
+    check_split_network(streams, dT, net)
+    infos = split_infos(plan)
+    assert infos and all(sp['candidate'] in S_NAMES for sp in infos.values())
+    assert plan.splits and all(min(s.fractions) >= SP._SPLIT_MIN_FRACTION
+                               for s in plan.splits)
+    assert all(min(e.hot_frac, e.cold_frac) >= SP._SPLIT_MIN_FRACTION
+               for e in plan.exchangers)
+
+
 def test_pinch_split_screens_the_branched_root(monkeypatch):
-    # a branch below _SPLIT_MIN_FRACTION merges into its sibling, which
-    # undoes the split: the rule fails
+    # a capacity branch below _SPLIT_MIN_FRACTION takes CP slack from its
+    # sibling: the cold stream (CP 3) splits 0.999 / 0.001, branch CPs
+    # 2.997 >= 1 and 0.003 >= 1e-4
     side, a0, proof = root_of(*TINY_BRANCH)
-    assert SP._pinch_split(side, a0, proof, 'partner') is None
+    items, extra = SP._pinch_split(side, a0, proof, 'partner')
+    check_items(side, a0, items, extra)
+    assert extra == 1
+    assert_allclose([it[2] for it in items[2:]], [.999, .001], rtol=1e-12)
+    # with no CP slack to raise it (CP 1.0001 on 1 and 1e-4), the branch
+    # merges into its sibling, which undoes the split: the rule fails
+    side, a0, proof = root_of(*TIGHT_TINY_BRANCH, name='below')
+    dem, cap = cut_sets(side, a0, proof)
+    assert proof['rule'] == 'outward'
+    assert_allclose([m for _, m in dem] + [c for _, c in cap],
+                    [1., 1e-4, 1.0001], rtol=1e-12)
+    assert all(SP._pinch_split(side, a0, proof, rule) is None
+               for rule in CUT_RULES)
     with monkeypatch.context() as mp:
         mp.setattr(SP, '_SPLIT_MIN_FRACTION', 0.)
         items, extra = SP._pinch_split(side, a0, proof, 'partner')

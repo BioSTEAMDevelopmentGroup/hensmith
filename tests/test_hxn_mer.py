@@ -171,13 +171,16 @@ and also to those if it has no splitter.
     Both checks pass on every unsplit corpus network.
 ``test_split_checker_detects_mutations``
     On a split network wired by hand as the facility wires one
-    (``_wired_split_network``), each of fourteen defects (a misnamed or
-    unlisted unit, a moved entry, a mixer inlet taken from another stream's
-    trunk, swapped mixer inlets, a bypassed branch exchanger, a wrong split
-    ratio, a mis-scaled branch, a mixer outlet off its inlets, a branch past
-    the stream's outlet, a branch exchanger past its approach, a utility
-    short of flow, a shifted outlet, misreported heat) is caught by the
-    check made for it.
+    (``_wired_split_network``), and on a fresh facility network
+    (``_network(case, True, cached=False)``), each of fifteen defects (a
+    misnamed or unlisted unit, a moved entry, a mixer inlet taken from
+    another stream's trunk, swapped mixer inlets, a bypassed branch
+    exchanger, a wrong split ratio, a mis-scaled branch, a mixer outlet off
+    its inlets, a mixer outlet off equilibrium at its enthalpy (on rtB05,
+    real thermo), a branch past the stream's outlet, a branch exchanger
+    past its approach, a utility short of flow, a shifted outlet,
+    misreported heat) is caught by the check made for it, identified by
+    its message.
 ``test_no_split_plan_unchanged_by_splitting`` / ``test_split_cases_keep_unsplit_sides``
     At the planner (on the facility's round-0 inputs, ``_corpus_knots``),
     splitting leaves an unsplit problem's plan, and a SPLIT problem's sides
@@ -1510,10 +1513,15 @@ def _wired_split_network(case, cached=False):
     return result
 
 # ---------------------------------------------------------------------------
-# Defects of a split network, one per check (each returns the check's tag)
+# Defects of a split network, one per check (each returns the check's tag
+# and a fragment of the message only that check gives)
 # ---------------------------------------------------------------------------
 
 MUTATION_CASE = 'smith2005_ex18_2_split'
+#: The case of a defect that `MUTATION_CASE` cannot show: its constant-CP
+#: fluid is locked to liquid, so a mixer outlet off equilibrium needs real
+#: thermodynamics (rtB05 splits a water stream).
+MUTATION_CASES = {'mixer_outlet_off_equilibrium': 'rtB05_above_2h1c'}
 
 def _split_stage(net, b=0):
     """The network's first split, the index of its stream's life cycle, and
@@ -1531,17 +1539,17 @@ def _rewire(unit, port, stream):
 def _misnamed_mixer(net):
     split, *_ = _split_stage(net)
     split.mixer.ID = 'Mixer_' + split.mixer.ID
-    return 'G0'
+    return 'G0', 'not a Mixer ID'
 
 def _unlisted_splitter(net):
     net['HXN'].new_splitters.remove(_split_stage(net)[0].splitters[0])
-    return 'G0'
+    return 'G0', '!= the Splitter units'
 
 def _entry_moved(net):
     # the stream's entry moved into its first branch
     split, n, stage = _split_stage(net)
     net['HXN'].stream_life_cycles[n].entry = hxn_synthesis._Port(stage.unit, stage.index)
-    return 'G1'
+    return 'G1', 'is not a feed of the network'
 
 def _mixer_inlet_from_a_trunk(net):
     # a mixer inlet re-pointed to another stream's trunk
@@ -1549,43 +1557,56 @@ def _mixer_inlet_from_a_trunk(net):
     other = next(lc for lc in net['HXN'].stream_life_cycles
                  if lc.index != split.stream and not lc.splits and len(lc.life_cycle) > 1)
     _rewire(split.mixer, 1, other.life_cycle[0].s_out)
-    return 'G2'
+    return 'G2', '(outside a split)'
 
 def _mixer_inlets_swapped(net):
     # the branches re-join at each other's mixer inlets
     mixer = _split_stage(net)[0].mixer
     with bst.IgnoreDockingWarnings(): mixer.ins[:] = [mixer.ins[1], mixer.ins[0], *mixer.ins[2:]]
-    return 'G3'
+    return 'G3', 'beyond its life-cycle connections'
 
 def _branch_exchanger_bypassed(net):
     # the exchanger's inlet stream wired to its outlet's sink
     stage = _split_stage(net)[2]
     s_out = stage.s_out
     _rewire(s_out.sink, _inlet_port(s_out.sink, s_out), stage.s_in)
-    return 'G3'
+    return 'G3', '!= its life cycle'
 
 def _wrong_split_ratio(net):
     split, *_ = _split_stage(net)
     split.splitters[0].split = 0.9 * split.fractions[0]
     _converge(net['HXN'].HXN_sys)
-    return 'G4'
+    return 'G4', 'the split ratios give'
 
 def _branch_inlet_scaled(net):
     # a branch inlet carries the wrong fraction
     _split_stage(net)[2].s_in.scale(1.1)
-    return 'G4'
+    return 'G4', 'its outlets carry'
 
 def _mixer_outlet_shifted(net):
     mixer = _split_stage(net)[0].mixer
     mixer.outs[0].T += 0.01
-    return 'G5'
+    return 'G5', '!= that of its inlets'
+
+def _mixer_outlet_off_equilibrium(net):
+    # the outlet keeps its flows, pressure and enthalpy, so every balance
+    # holds, with 2 % of its main chemical vaporized: colder than its
+    # equilibrium state at that enthalpy, which the equilibrium check sees
+    out = _split_stage(net)[0].mixer.outs[0]
+    H, main = out.H, out.chemicals.IDs[int(np.argmax(out.mol))]
+    x = 0.02 * out.F_mol
+    out.phases = ('g', 'l')
+    out.imol['g', main] = x
+    out.imol['l', main] -= x
+    out.H = H
+    return 'G5', 'not at equilibrium'
 
 def _branch_passes_the_outlet(net):
     split, n, stage = _split_stage(net)
     outlet = net['HXN'].original_heat_exchangers[n].outs[0]
     sign = 1. if net['HXN'].stream_life_cycles[n].cold else -1.
     stage.s_out.T = outlet.T + sign
-    return 'G6'
+    return 'G6', 'passes its outlet'
 
 def _branch_H_lim_shifted(net):
     # a branch exchanger's enthalpy limits moved on by 5 % of its duty,
@@ -1602,26 +1623,27 @@ def _branch_H_lim_shifted(net):
         if H_lim is not None:
             setattr(hx, f'H_lim{k}', H_lim + 0.05 * (H_lim - hx.ins[k].H))
     _converge(net['HXN'].HXN_sys)
-    return 'G7'
+    return 'G7', 'internal approach'
 
 def _utility_inlet_short(net):
     split, n, stage = _split_stage(net)
     net['HXN'].stream_life_cycles[n].life_cycle[-1].s_in.scale(1. - 1e-9)
-    return 'G8'
+    return 'G8', ' kmol/hr of '
 
 def _utility_outlet_shifted(net):
     split, n, stage = _split_stage(net)
     net['HXN'].stream_life_cycles[n].life_cycle[-1].s_out.T += 0.01
-    return 'G9'
+    return 'G9', 'network outlet != original'
 
 def _heat_misreported(net):
     net['heat'] += 1e-6 * net['total']
-    return 'G10'
+    return 'G10', 'heat - cool = '
 
 SPLIT_MUTATIONS = {f.__name__.strip('_'): f for f in (
     _misnamed_mixer, _unlisted_splitter, _entry_moved, _mixer_inlet_from_a_trunk,
     _mixer_inlets_swapped, _branch_exchanger_bypassed, _wrong_split_ratio,
-    _branch_inlet_scaled, _mixer_outlet_shifted, _branch_passes_the_outlet,
+    _branch_inlet_scaled, _mixer_outlet_shifted, _mixer_outlet_off_equilibrium,
+    _branch_passes_the_outlet,
     _branch_H_lim_shifted, _utility_inlet_short, _utility_outlet_shifted,
     _heat_misreported,
 )}
@@ -1813,8 +1835,9 @@ def test_split_checker_agrees_on_linear_networks(case):
 def test_split_checker_detects_mutations(mutation, source):
     # a split network, wired by hand (as the facility wires it) or by the
     # facility itself, passes the strict checks; each defect, applied to a
-    # fresh copy, is caught by the check made for it (and possibly others)
-    case = _case(MUTATION_CASE)
+    # fresh copy, is caught by the check made for it, known by its message
+    # (and possibly by others)
+    case = _case(MUTATION_CASES.get(mutation, MUTATION_CASE))
     if source == 'wired':
         net = _wired_split_network(case, cached=True)
     else:
@@ -1826,9 +1849,10 @@ def test_split_checker_detects_mutations(mutation, source):
         net = _wired_split_network(case)
     else:
         net = _network(case, True, cached=False)
-    tag = SPLIT_MUTATIONS[mutation](net)
+    tag, message = SPLIT_MUTATIONS[mutation](net)
     problems = _network_problems(net)
-    assert any(p.startswith(tag + ' ') for p in problems), (tag, problems)
+    assert any(p.startswith(tag + ' ') and message in p for p in problems), (
+        tag, message, problems)
 
 @pytest.mark.parametrize('case', NO_SPLIT, ids=_name)
 def test_no_split_plan_unchanged_by_splitting(case):

@@ -2176,11 +2176,11 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
         instead, and then reaches the MER targets exactly on the planner's
         knots (see Notes, "Stream splitting"). Sides that an unsplit
         network serves are never split, so a problem that needs no split
-        gets the same network as with the default. The branches are
-        realized with `biosteam.Splitter` chains and rigorous
-        `biosteam.Mixer` units, which are adiabatic and cost nothing; their
-        structure is reported in ``info['splits']`` (`synthesize_network`)
-        and ``synthesis_info['splits']`` (`HeatExchangerNetwork`). With
+        gets the same network as with the default. The splits are
+        returned in ``plan.splits`` (each stream's flow order in
+        ``plan.paths``), every exchanger carries the fractions and branches
+        of its streams, and ``plan.info['sides'][side]['split']`` records
+        each side's chosen candidate; `synthesize_network` realizes them. With
         `avoid_recycle`, a split that would repeat a stream pair is not
         used, and MER is then not guaranteed. Defaults to False.
     _split_exclude : dict[str, set[tuple]], optional
