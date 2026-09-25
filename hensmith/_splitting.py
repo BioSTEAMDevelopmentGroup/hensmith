@@ -9,9 +9,10 @@
 """
 Stream splitting for the MER planner (`hensmith._planner`).
 
-When the pinch design rules prove that a side of the pinch has no minimum
-energy requirement (MER) network without stream splits, the planner can
-split streams into parallel branches. This module holds the numeric
+When a side of the pinch has no minimum energy requirement (MER) network
+without stream splits (the pinch design rules prove it, or the unsplit
+search leaves a utility penalty), the planner, with `stream_splitting`,
+splits streams into parallel branches. This module holds the numeric
 machinery. Like the planner, it works on numbers only (numpy; no BioSTEAM
 objects). The planner imports it only inside the functions that run when
 splitting is on, so nothing here runs, and nothing changes, when it is off.
@@ -174,9 +175,31 @@ block is scaled back by the largest lambda (bisected) whose end node
 satisfies (R), by the same exact check as every node. 'T' completes the
 side with a DFS tail (`_tail`) from a node where the rules hold: the
 planner's own search from ``(a, b)`` at a fraction of its budgets (on a
-`_StrictSide`, Lemma 1), its must residuals swept as in Stage S. A tail never yields a node, so every
-node of a core candidate is the pre-leaked root, a vertical block's
-closed-form end or a pinch block's accepted end.
+`_StrictSide`, Lemma 1), its must residuals swept as in Stage S. A tail
+never yields a node, so every node of a core candidate is the pre-leaked
+root, a vertical block's closed-form end or a pinch block's accepted end.
+
+**Theorem M (the portfolio always contains MER).** Without `avoid_recycle`
+(no forbidden pairs, no pair cap) and with a root deficit ``delta <=
+_preleak_max(side)`` (every deficit `_cascade`'s own tolerances can leave,
+Lemma P), `_split_side` returns an MER side plan whose every cell is
+feasible at every knot, up to a recorded leak of position round-off size.
+*Proof.* 'V' runs from the pre-leaked root ``P(delta)``, which satisfies
+(R) (Lemma P); every node it visits is the root or a vertical block's
+closed-form end, and at each one an elementary block exists over the first
+float-nonempty interval (Theorem V', no knot hiding inside it since
+breakpoints merge only at round-off), up to the recovery above. Every
+block advances some must by a float-nonempty amount or books a leak, so
+the loop ends, with every must served exactly from its root position to
+its end and every flex used as a prefix: the side's leftover is its
+target plus the pre-leak, which the targets already absorbed. So 'V'
+yields a candidate, the side's last candidate is never excluded, and the
+winner is MER, since every candidate is (Stage S serves every must
+exactly and books no leak; LV, VT and LVT by the same argument as 'V').
+The realization closes the rest (see
+`hensmith.hxn_synthesis.synthesize_network`, Notes): exact on constant
+heat capacity knots; on real-thermodynamics chords, by the refine rounds
+and the split retry.
 
 Candidates
 ----------

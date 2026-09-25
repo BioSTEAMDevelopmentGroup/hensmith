@@ -11,8 +11,11 @@ systems. Targets come from a problem table on each stream's temperature-enthalpy
 curve (phase changes included), and a pinch-outward planner synthesizes a
 network without stream splits that reaches those minimum energy requirement
 (MER) targets whenever it finds one, keeping the minimum approach temperature
-everywhere inside every exchanger; where MER provably needs a split, the
-network is a best-effort one close to the targets.
+everywhere inside every exchanger; by default, where MER provably needs a
+split, the network is a best-effort one close to the targets. With
+`HeatExchangerNetwork(..., stream_splitting=True)`, streams are instead
+split into parallel branches there (BioSTEAM splitters and rigorous mixers),
+and the network reaches the MER targets.
 
 ```python
 import biosteam as bst  # hensmith units plug into BioSTEAM systems

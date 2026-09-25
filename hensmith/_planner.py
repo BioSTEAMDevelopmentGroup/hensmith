@@ -7,8 +7,10 @@
 # github.com/BioSTEAMDevelopmentGroup/hensmith/blob/master/LICENSE.txt
 # for license details.
 """
-Planner for heat exchanger networks at minimum energy requirement (MER)
-without stream splits.
+Planner for heat exchanger networks at minimum energy requirement (MER):
+without stream splits by default, and with them, where a side of the pinch
+needs them, if `stream_splitting` (see "Stream splitting (optional)"
+below).
 
 The planner works on numbers only (numpy; no BioSTEAM objects). The caller,
 `hensmith.hxn_synthesis.synthesize_network`, describes each process stream
@@ -129,7 +131,9 @@ a stream is ticked off, a dT limit is reached, a level becomes R-tight, or
 a later match along one link, one block of tied musts, or one return must
 be able to start. Chains of partial services ("coupled vertices") are not
 enumerated. Repeated (must, flex) pairs are allowed: series alternation
-emulates a split. Early passes cap the number of new exchangers per pair.
+emulates a split (the unsplit search's only way to approach one; with
+`stream_splitting`, a side that needs a split gets real ones instead).
+Early passes cap the number of new exchangers per pair.
 
 Budgets are counted in deterministic *work units*: one per node plus a
 share proportional to the residual arrays. No wall clock is used, so the
@@ -145,7 +149,9 @@ side still has more than ``3 (M + F)`` units, a coarse-to-fine rerun with a
 minimum piece size keeps the MER plan with the fewest units.
 
 **Best effort.** This runs on a side that has a root proof or whose search
-ran out of budget:
+ran out of budget (with `stream_splitting`, only if the side's split
+attempt finds no candidate, which Theorem M of `hensmith._splitting` rules
+out without `avoid_recycle`):
 
 1. Twelve greedy dives give an incumbent. Each dive leaks must heat when no
    partner fits.
@@ -179,9 +185,37 @@ Guarantees and limits
   proven. It was validated on a certified benchmark and on fresh problems.
 - Networks whose match order is cyclic cannot be represented.
 - Some unsplit MER networks need arbitrarily many exchangers. Series
-  alternation approaches a split only in the limit.
+  alternation approaches a split only in the limit (unless
+  `stream_splitting`: see below).
 - A side that needs splits but has no rules proof spends its whole MER
-  budget before best effort starts.
+  budget before best effort (or, with `stream_splitting`, the split
+  attempt) starts.
+- With `stream_splitting` and without `avoid_recycle`, every side that no
+  unsplit plan serves gets a split plan at MER on the knots (Theorem M of
+  `hensmith._splitting`), so the plan's status is 'mer'.
+
+Stream splitting (optional)
+---------------------------
+With ``stream_splitting=True``, :func:`plan_network` hands every side that
+has a root proof, or whose best effort leaves a penalty, to
+`hensmith._splitting._split_side`. Sides the unsplit search serves are
+planned exactly as without the option, so a problem that needs no split
+gets the same plan. A split side is planned as verified *cells* in parent
+coordinates (a branch of flow fraction ``f`` is the parent's curve with
+every heat times ``f``), by a portfolio of generators: Stage S (splits at
+the pinch, one candidate per transport rule, completed by the unsplit
+search) and the core strategies V, LV, VT and LVT (vertical blocks, pinch
+blocks and tails), of which V always yields an MER candidate (without
+`avoid_recycle`). The candidate with the smallest key (feasibility
+markers, then units plus extra branches plus split stages) wins, and
+`_split_records` turns its cells into the plan's records: every split
+stage becomes a `hensmith._splitting.Split` in ``Plan.splits``, a branch
+exchanger carries its fractions (``Exchanger.hot_frac``/``cold_frac``)
+and parent-equivalent enthalpies, and ``Plan.paths`` lists each stream's
+flow order with a split as one item (``Plan.stages`` flattened). The side's
+``info['sides'][side]['split']`` reports the candidates and the pick. The
+module docstring of `hensmith._splitting` holds the theory: the lemmas,
+Theorems V' and M, the generators, the key and the signature.
 
 References
 ----------
@@ -2142,9 +2176,13 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
         instead, and then reaches the MER targets exactly on the planner's
         knots (see Notes, "Stream splitting"). Sides that an unsplit
         network serves are never split, so a problem that needs no split
-        gets the same network as with the default. With `avoid_recycle`, a
-        split that would repeat a stream pair is not used, and MER is then
-        not guaranteed. Defaults to False.
+        gets the same network as with the default. The branches are
+        realized with `biosteam.Splitter` chains and rigorous
+        `biosteam.Mixer` units, which are adiabatic and cost nothing; their
+        structure is reported in ``info['splits']`` (`synthesize_network`)
+        and ``synthesis_info['splits']`` (`HeatExchangerNetwork`). With
+        `avoid_recycle`, a split that would repeat a stream pair is not
+        used, and MER is then not guaranteed. Defaults to False.
     _split_exclude : dict[str, set[tuple]], optional
         Private (the refine loop): per side, network signatures a split
         candidate may not have unless it is the side's last candidate.
@@ -2191,6 +2229,30 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
     ('mer', 20.0, 60.0)
     >>> len(plan.exchangers)
     4
+
+    Two hot streams that reach the pinch against one cold stream break the
+    number rule above it (stream 0 is cold, 1 and 2 are hot), so no unsplit
+    network reaches the targets:
+
+    >>> knots = [linear(90., 190., 2.5), linear(60., 200., 1.),
+    ...          linear(100., 200., 1.)]
+    >>> is_hot = [False, True, True]
+    >>> plan_network(knots, is_hot, 10.).status
+    'best_effort'
+
+    With `stream_splitting`, the cold stream is split into two branches
+    above the pinch, one per hot stream (a branch of flow fraction f has f
+    times the stream's heat capacity flow rate), and the plan reaches the
+    targets:
+
+    >>> plan = plan_network(knots, is_hot, 10., stream_splitting=True)
+    >>> plan.status, plan.Q_hot, plan.Q_cold
+    ('mer', 50.0, 40.0)
+    >>> split = plan.splits[0]
+    >>> split.stream, split.side, [round(f, 4) for f in split.fractions]
+    (0, 'above', [0.5, 0.5])
+    >>> [(e.hot, e.cold, e.Q, e.cold_frac) for e in plan.exchangers]
+    [(1, 0, 100.0, 0.5), (2, 0, 100.0, 0.5)]
 
     """
     is_hot = [bool(h) for h in is_hot]

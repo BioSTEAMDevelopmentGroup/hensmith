@@ -8,10 +8,11 @@
 # for license details.
 """
 Pinch analysis and heat exchanger network synthesis: the problem table
-(`problem_table`), the synthesis of an unsplit network at minimum energy
-requirement (`synthesize_network`, on the planner of `hensmith._planner`),
-stream life cycles (`StreamLifeCycle`) and pinch diagrams
-(`plot_pinch_diagram`).
+(`problem_table`), the synthesis of a network at minimum energy requirement
+(`synthesize_network`, on the planner of `hensmith._planner`), unsplit by
+default and with stream splits where needed if `stream_splitting` (on
+`hensmith._splitting`; realized splits are `StreamSplit`), stream life
+cycles (`StreamLifeCycle`) and pinch diagrams (`plot_pinch_diagram`).
 """
 from collections import namedtuple
 import heapq
@@ -219,10 +220,6 @@ class StreamLifeCycle:
         where the whole stream enters the network, i.e. the first
         splitter of its first split if it splits at its inlet, else its
         first stage's. None until `get_life_cycle` runs.
-    H_in : float
-        Enthalpy of the stream at `entry` [kJ/hr], read from the stream
-        when accessed: the whole flow's inlet, equal to the first stage's
-        `H_in` unless the stream splits at its inlet.
 
     Notes
     -----
@@ -243,6 +240,9 @@ class StreamLifeCycle:
 
     @property
     def H_in(self):
+        """Enthalpy of the stream at `entry` [kJ/hr], read from the stream
+        when accessed: the whole flow's inlet, equal to the first stage's
+        `H_in` unless the stream splits at its inlet."""
         unit, index = self.entry
         return unit.ins[index].H
 
@@ -707,9 +707,10 @@ def _pinch_cut(table):
     every stream with ``side = 'right' if cut == 'below' else 'left'``
     (see `pinch_state`) to agree with the table: the heat above the split
     is then exactly the hot utility target and the heat below it the cold
-    one. (`synthesize_network` does not split streams: the planner finds
-    the same cut in its own cascade, ``plan.cut``, which reproduces the
-    table's.)
+    one. (`synthesize_network` does not cut streams at the pinch, even
+    with `stream_splitting`, whose splits are parallel branches: the
+    planner finds the same cut in its own cascade, ``plan.cut``, which
+    reproduces the table's.)
     """
     if table.hot_util_load == 0.: return 'below'
     k = int(np.flatnonzero(table.Ts == table.pinch_T)[0])
@@ -880,7 +881,8 @@ def pinch_state(stream_in, stream_out, T_pinch, side=None, curve=None):
     have.
 
     A standalone analysis helper (see also `load_duties`): the network
-    synthesis does not split streams at a pinch temperature, it plans on
+    synthesis does not cut streams at a pinch temperature (its only
+    splits, with `stream_splitting`, are parallel branches), it plans on
     the curves themselves (see `synthesize_network`).
     """
     if side is None:
@@ -1681,12 +1683,14 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                        avoid_recycle=False, sort_hus_by_T=False, info=None,
                        stream_splitting=False):
     """
-    Synthesize a heat exchanger network without stream splits for the
-    process streams behind a set of utility heat exchangers: pinch analysis
-    (`problem_table`), then a pinch-outward plan that reaches the minimum
-    energy requirement (MER) targets whenever the search finds an unsplit
-    network that does, realized with one `HXprocess` per match and one
-    rigorous `HXutility` per stream.
+    Synthesize a heat exchanger network for the process streams behind a
+    set of utility heat exchangers: pinch analysis (`problem_table`), then a
+    pinch-outward plan that reaches the minimum energy requirement (MER)
+    targets whenever the search finds an unsplit network that does,
+    realized with one `HXprocess` per match and one rigorous `HXutility`
+    per stream. By default no stream is split; with `stream_splitting`, a
+    side of the pinch that no unsplit network serves at MER is planned with
+    stream splits and reaches the targets.
 
     Parameters
     ----------
@@ -1750,7 +1754,11 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         (mixers whose outlet is off the planned state; normally empty);
         each side in 'sides' then also has 'split' (None for a side that
         did not try to split, else the chosen candidate and its network
-        signature) and its method is 'split-<candidate>' when it splits.
+        signature, both None if no candidate was found, see
+        `hensmith._planner.Plan`) and its method is 'split-<candidate>'
+        when it splits. Required with `stream_splitting`, which raises a
+        ValueError without it (the splitters and mixers are returned only
+        there).
     stream_splitting : bool, optional
         Allow a process stream to be split into parallel branches that
         re-join. A side of the pinch that no unsplit network serves at the
@@ -1762,9 +1770,10 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         gets the same network as with the default. The branches are
         realized with `biosteam.Splitter` chains and rigorous
         `biosteam.Mixer` units, which are adiabatic and cost nothing; their
-        structure is reported in ``info['splits']``. With `avoid_recycle`,
-        a split that would repeat a stream pair is not used, and MER is
-        then not guaranteed. Needs `info`. Defaults to False.
+        structure is reported in ``info['splits']`` (`synthesize_network`)
+        and ``synthesis_info['splits']`` (`HeatExchangerNetwork`). With
+        `avoid_recycle`, a split that would repeat a stream pair is not
+        used, and MER is then not guaranteed. Defaults to False.
 
     Returns
     -------
@@ -1845,7 +1854,8 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     deterministic work units, so results do not depend on machine speed.
     A branch and bound then reduces the number of exchangers. A side that
     is proven to need splits, or whose search runs out of budget, gets a
-    best-effort plan: heat a must cannot place is moved to its pinch end,
+    best-effort plan (unless `stream_splitting`, see "Stream splitting"
+    below): heat a must cannot place is moved to its pinch end,
     where it crosses the pinch at the cost of an equal amount of extra hot
     and cold utility (the penalty), minimized by greedy dives and a
     bisection of these gaps. See `hensmith._planner` for the details.
@@ -1931,16 +1941,43 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     whose match order is cyclic cannot be represented. An unsplit MER
     network can need many exchangers (series alternation approaches a
     split only in the limit); MER always takes precedence over the number
-    of units. Problems that need stream splits get a best-effort network
-    whose penalty is small but not minimal in general. A side that needs
-    splits without a pinch-rule proof spends its whole MER budget before
-    the best-effort step. Thermosteam's TP flashes fail silently inside
-    the glides of some mixtures (e.g. water-ethanol with 20-50 % ethanol);
-    an exchanger simulated there can deviate from its plan (reported in
-    `info['deviations']`).
+    of units. By default, problems that need stream splits get a
+    best-effort network whose penalty is small but not minimal in general,
+    and a side that needs splits without a pinch-rule proof spends its
+    whole MER budget before the best-effort step.
+
+    With `stream_splitting` (and without `avoid_recycle`), every side that
+    no unsplit network serves has a split plan at MER on the planner's
+    knots: the vertical core of `hensmith._splitting` always yields one
+    (Theorem M there), up to the part of the root deficit that the
+    cascade's own tolerances already absorbed into the targets (at most
+    about 1e-9 of the total duty). The remaining gap is the realization.
+    With constant heat capacities the knots are exact, and the realized
+    network reaches the targets to round-off. With real thermodynamics
+    the knots are chords, so a split plan can fall short of `T_min_app` on
+    the exact states by up to the chords' tolerance; the refine rounds
+    close that as they do for unsplit plans, with up to two more rounds
+    that exclude the violating network (see "Stream splitting" above), and
+    only an exchanger still short after them is shrunk (reported in
+    'repaired', with status 'best_effort'). A rigorous mixer's outlet
+    enthalpy differs from the sum of its inlets by at most its flash
+    residual, which the stream's utility takes. The test suite reaches
+    'mer' with splits on all 38 problems of its corpus that provably need
+    them (25 with constant heat capacities, 13 with real thermodynamics)
+    and on the three such regression systems. The number of exchangers is
+    minimized only among the candidate split plans a side generates, and
+    splitters and mixers are not costed.
+
+    Thermosteam's TP flashes fail silently inside the glides of some
+    mixtures (e.g. water-ethanol with 20-50 % ethanol); an exchanger
+    simulated there can deviate from its plan (reported in
+    `info['deviations']`), and a mixer's outlet can land off its planned
+    state (reported in ``info['split_deviations']``).
 
     `HeatExchangerNetwork` calls this function, rewires each stream's
-    stages in series, converges the network as a `System` and costs it.
+    stages in series (the branches of a split in parallel, from its
+    splitter chain to its mixer), converges the network as a `System` and
+    costs it.
 
     Examples
     --------

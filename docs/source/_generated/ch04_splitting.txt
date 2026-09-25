@@ -1,0 +1,14 @@
+stream_splitting=False: best_effort, 8 process exchangers, 6.684e+05 USD added installed cost
+stream_splitting=True: mer, 5 process exchangers, 5.893e+05 USD added installed cost
+splitters: ['Split_3_cs']
+mixers:    ['Mix_3_cs']
+process exchangers: ['HX_0_2_hs', 'HX_3_0_cs', 'HX_3_1_cs', 'HX_2_1_cs', 'HX_3_0_cs_2']
+[<StreamSplit Split_3_cs: stream 3 below, 2 branches (0.5624, 0.4376)>]
+<StreamLifeCycle: Stream_3, hot
+	life_cycle = [
+		<LifeStage: <HXprocess: HX_3_0_cs>, branch (0, 0), fraction 0.5624, H_in = 1.15e+07 kJ/hr, H_out = 1.39e+06 kJ/hr>
+		<LifeStage: <HXprocess: HX_3_1_cs>, branch (0, 1), fraction 0.4376, H_in = 8.93e+06 kJ/hr, H_out = 2.23e+06 kJ/hr>
+		<LifeStage: <HXprocess: HX_3_0_cs_2>, branch (0, 1), fraction 0.4376, H_in = 2.23e+06 kJ/hr, H_out = 1.08e+06 kJ/hr>
+		<LifeStage: <HXutility: Util_3_cs>, H_in = 2.47e+06 kJ/hr, H_out = 2.47e+06 kJ/hr>
+	]
+	split 0: 2 branches (0.5624, 0.4376)>

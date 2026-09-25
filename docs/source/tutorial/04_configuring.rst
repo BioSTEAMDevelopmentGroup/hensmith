@@ -5,8 +5,9 @@ The three chapters before this one held everything fixed: a minimum approach
 temperature of 5 K, every unit of the system in scope, and one small
 five-stream flowsheet. This chapter varies all three. It sweeps ``T_min_app``
 over the quickstart system to expose the trade-off between recovered heat and
-added area, narrows the analysis with ``ignored=``, goes through the remaining
-constructor options of :class:`~hensmith.HeatExchangerNetwork` one by one, and
+added area, lets hensmith split streams where the targets need it
+(``stream_splitting=True``), narrows the analysis with ``ignored=``, goes
+through the remaining constructor options of :class:`~hensmith.HeatExchangerNetwork` one by one, and
 finishes by synthesizing a ten-stream network with ten process exchangers.
 
 Every number and figure below is output of the code shown on this page. The
@@ -90,14 +91,16 @@ vapor inlet, 65.4 °C on the real scale (323.53, 318.53 and 308.53 K shifted:
 the same real temperature less 15, 20 and 30 K). Below that pinch the pinch
 design rules fail: the cold streams that reach it cannot each be paired with
 a hot stream whose heat capacity flow rate is at least as large, which proves
-that the targets need a stream split. hensmith does not split streams, so the
-network is a best-effort one, and the status column shows how close it comes:
+that the targets need a stream split. By default hensmith does not split
+streams, so the network is a best-effort one, and the status column shows how
+close it comes:
 6.63e+03, 4.7e+03 and 837 kJ/hr of process-side heating above the target, at
 most a few thousandths of a percent of the heating load. At 15 K it takes eight
 exchangers to get that close, among them repeated matches between the same
 two streams, which emulate the missing split -- and which cost more than the
 four exchangers at 10 K. ``HXN.synthesis_info`` records each outcome,
-including the pinch-rule proof, under ``'sides'``.
+including the pinch-rule proof, under ``'sides'``. `Splitting streams`_ below
+makes the split instead.
 
 .. literalinclude:: /../_demo_src/examples/ch04_configuring.py
    :language: python
@@ -123,6 +126,46 @@ including the pinch-rule proof, under ``'sides'``.
    choosing a point on these two curves; the economically sensible one depends
    on utility prices and on the cost of exchanger area, neither of which the
    network optimizes for you.
+
+Splitting streams
+-----------------
+
+``stream_splitting=True`` lets the planner split a process stream into
+parallel branches that re-join, on any side of the pinch that no network
+without splits serves at MER. Like ``T_min_app`` it is a plain attribute of the
+facility, so the block below synthesizes the 15 K network of the sweep twice,
+without and with it.
+
+.. literalinclude:: /../_demo_src/examples/ch04_configuring.py
+   :language: python
+   :start-after: # [start:splitting]
+   :end-before: # [end:splitting]
+   :dedent:
+
+.. literalinclude:: /_generated/ch04_splitting.txt
+   :language: text
+
+With the option, the network reaches the targets -- status ``mer`` -- with five
+process exchangers instead of eight, and its added installed cost falls from
+6.684e+05 to 5.893e+05 USD. One stream is split: stream 3, the column's
+condenser, which enters at the pinch and condenses over about half a kelvin,
+so that its heat capacity flow rate is far larger than that of either cold
+stream. Below the pinch, the splitter ``Split_3_cs`` sends a fraction 0.5624
+of it to ``HX_3_0_cs``, against cold stream 0, and the other 0.4376 to
+``HX_3_1_cs``, against cold stream 1, and then on to ``HX_3_0_cs_2``: each of
+the two cold streams reaching the pinch meets a branch there. The mixer
+``Mix_3_cs`` re-joins the two branches before the stream's cooler. The life
+cycle marks each branch stage with its branch, ``(0, b)`` for branch *b* of
+the stream's first split, and its fraction of the flow; a branch stage's
+enthalpies are its
+branch's, so the cooler's inlet, 2.47e+06 kJ/hr, is the sum of the two branch
+outlets, 1.39e+06 and 1.08e+06 kJ/hr. The splitters and mixers are adiabatic
+and add no cost; they are listed in ``HXN.new_splitters`` and
+``HXN.new_mixers``, simulated in ``HXN.HXN_sys`` with the exchangers, and
+described in ``HXN.synthesis_info['splits']``. A side that a network without
+splits serves is planned exactly as without the option, so the MER networks of
+the sweep at 2, 5 and 10 K would come out the same. :doc:`../concepts`
+describes the method and its guarantee.
 
 Scoping the analysis
 --------------------
@@ -174,8 +217,9 @@ Other options
 
 The remaining keyword arguments of :class:`~hensmith.HeatExchangerNetwork` are
 listed in the :doc:`../API/api` reference; what each of them does to the
-synthesis is described below. Four of them -- ``Qmin``, ``force_ideal_thermo``,
-``avoid_recycle`` and ``sort_hus_by_T`` -- are passed straight through to
+synthesis is described below (``stream_splitting`` in `Splitting streams`_
+above). Five of them -- ``Qmin``, ``force_ideal_thermo``, ``avoid_recycle``,
+``sort_hus_by_T`` and ``stream_splitting`` -- are passed straight through to
 :func:`~hensmith.synthesize_network`, which can also be called directly on a
 list of heat utilities.
 
@@ -238,7 +282,9 @@ one, say). Two exchangers between the same two streams can close a loop in the
 network, which its ``System`` tears at a recycle stream and converges by
 fixed-point iteration. Turning the option on trades those networks -- and
 possibly MER with them -- for a network in which no two exchangers connect the
-same pair of streams.
+same pair of streams. With ``stream_splitting`` as well, a split whose
+branches would match the same pair twice is not used either, so MER is then
+not guaranteed.
 
 ``force_ideal_thermo`` (default ``False``) runs the analysis on copies of the
 streams made with ideal thermodynamics (``i.thermo.ideal()``), and the

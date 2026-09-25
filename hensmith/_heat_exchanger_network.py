@@ -7,6 +7,12 @@
 # github.com/BioSTEAMDevelopmentGroup/hensmith/blob/master/LICENSE.txt
 # for license details.
 """
+The `HeatExchangerNetwork` facility: a pinch analysis on the heat utilities
+of a whole BioSTEAM system, the synthesis of a heat exchanger network at the
+minimum energy requirement (`hensmith.hxn_synthesis.synthesize_network`;
+unsplit by default, with stream splits where a side of the pinch needs them
+if `stream_splitting`), and its convergence and costing as a `System`.
+
 Created on Sat Aug 22 21:58:19 2020
 @author: sarangbhagwat and yoelcp
 """
@@ -169,12 +175,19 @@ class HeatExchangerNetwork(bst.Facility):
         to all unit operations in the system.
     stream_splitting : bool, optional
         Allow a process stream to be split into parallel branches that
-        re-join, where the minimum energy requirement needs it (see
-        `synthesize_network`). The branches are realized with
-        `biosteam.Splitter` chains (`new_splitters`) and rigorous
-        `biosteam.Mixer` units (`new_mixers`), which are adiabatic and
-        cost nothing. Defaults to False: the network has no split, and
-        both lists are empty.
+        re-join. A side of the pinch that no unsplit network serves at the
+        minimum energy requirement (a pinch-rule proof, or an unsplit
+        search that leaves a utility penalty) is planned with splits
+        instead, and then reaches the MER targets exactly on the planner's
+        knots (see Notes, "Stream splitting"). Sides that an unsplit
+        network serves are never split, so a problem that needs no split
+        gets the same network as with the default. The branches are
+        realized with `biosteam.Splitter` chains and rigorous
+        `biosteam.Mixer` units, which are adiabatic and cost nothing; their
+        structure is reported in ``info['splits']`` (`synthesize_network`)
+        and ``synthesis_info['splits']`` (`HeatExchangerNetwork`). With
+        `avoid_recycle`, a split that would repeat a stream pair is not
+        used, and MER is then not guaranteed. Defaults to False.
 
     Notes
     -----
@@ -195,6 +208,22 @@ class HeatExchangerNetwork(bst.Facility):
     equal the targets and 'best_effort' otherwise, with the targets, the
     planned utilities and, per side of the pinch, any proof that a split is
     needed.
+
+    *Stream splitting.* With `stream_splitting`, a side of the pinch that
+    no unsplit network serves at MER is planned with stream splits and
+    reaches the targets exactly on the planner's knots (see
+    `synthesize_network`, Notes, for the guarantee and its limits). Each
+    split is realized as a chain of `biosteam.Splitter` units, IDs
+    ``Split_<stream>_<hs|cs>`` (with ``_<n>`` for the n-th split of the
+    stream on that side, n >= 2, and ``_b<c>`` for the chain's element
+    c >= 2), and a rigorous `biosteam.Mixer`, ID
+    ``Mix_<stream>_<hs|cs>[_<n>]``, listed in `new_splitters` and
+    `new_mixers` (both empty without a split) and simulated in `HXN_sys`
+    with the exchangers. They are adiabatic and add no cost.
+    ``synthesis_info['splits']`` holds the splits
+    (:class:`~hensmith.hxn_synthesis.StreamSplit`: the branch fractions and
+    the exchangers of every branch), and a split stream's life cycle lists
+    its branch stages with their branch and fraction.
 
     Original system stream and heat exchanger objects are preserved. All
     stream copies and new HX objects can be found in a newly created
@@ -293,7 +322,38 @@ class HeatExchangerNetwork(bst.Facility):
     		<LifeStage: <HXprocess: HX_1_4_hs>, H_in = 7.51e+05 kJ/hr, H_out = 7.18e+05 kJ/hr>
     		<LifeStage: <HXutility: Util_4_cs>, H_in = 7.18e+05 kJ/hr, H_out = 7.18e+05 kJ/hr>
     	]>]
-    
+
+    Two hot liquids that reach the pinch against one cold liquid break the
+    number rule above it (case rtB05 of the test suite), so no unsplit
+    network reaches the MER targets; with `stream_splitting`, the cold
+    stream is split into two branches, one per hot stream:
+
+    >>> bst.main_flowsheet.set_flowsheet('two_hot_one_cold')
+    >>> bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    >>> def process_stream(ID, T_in, T_out, P, **kmol_hr):
+    ...     inlet = bst.Stream(ID + '_in', T=T_in, P=P, phase='l',
+    ...                        units='kmol/hr', **kmol_hr)
+    ...     return bst.HXutility(ID, ins=inlet, T=T_out, rigorous=False)
+    >>> units = [process_stream('H1', 400., 320., 5e5, Water=60.),
+    ...          process_stream('H2', 390., 330., 5e5, Ethanol=30.),
+    ...          process_stream('C1', 310., 410., 5e5, Water=150.),
+    ...          process_stream('H3', 360., 300., 101325., Water=200.)]
+    >>> HXN = bst.HeatExchangerNetwork('HXN', T_min_app=10.)
+    >>> sys = bst.System.from_units('sys', units=[*units, HXN])
+    >>> sys.simulate()
+    >>> HXN.synthesis_info['status']
+    'best_effort'
+    >>> HXN.stream_splitting = True
+    >>> sys.simulate()
+    >>> HXN.synthesis_info['status']
+    'mer'
+    >>> [u.ID for u in HXN.new_splitters], [u.ID for u in HXN.new_mixers]
+    (['Split_0_hs'], ['Mix_0_hs'])
+    >>> [hx.ID for hx in HXN.new_HXs]
+    ['HX_0_2_hs', 'HX_0_3_hs', 'HX_1_0_cs']
+    >>> HXN.synthesis_info['splits']
+    [<StreamSplit Split_0_hs: stream 0 above, 2 branches (0.5201, 0.4799)>]
+
     """
     ticket_name = 'HXN'
     acceptable_energy_balance_error = 0.02

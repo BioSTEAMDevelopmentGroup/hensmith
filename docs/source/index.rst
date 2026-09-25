@@ -39,8 +39,9 @@ is the automated heat exchanger network synthesis facility for BioSTEAM
 systems: :class:`HeatExchangerNetwork` is a BioSTEAM ``Facility`` that
 performs a pinch analysis on every heating and cooling utility in a system,
 synthesizes a network of process exchangers that reaches the minimum energy
-requirement (MER) whenever it finds one without stream splits, and reports the
-utility savings and added capital cost as part of the system's
+requirement (MER) whenever it finds one without stream splits -- or, with
+``stream_splitting=True``, splits streams where MER needs it -- and reports
+the utility savings and added capital cost as part of the system's
 techno-economic analysis.
 Watch it run in the `Quickstart`_ demo below.
 

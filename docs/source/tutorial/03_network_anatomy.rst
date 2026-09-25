@@ -56,7 +56,8 @@ the exchangers resolve through ``HXN.HXN_flowsheet.unit``. It is an ordinary
 ``System`` holding the nine units listed on the third line. They are listed in
 the order the system simulates them, which follows the streams: after
 synthesis every stream's stages are rewired in series, each stage feeding the
-next, and the path is a topological order of those connections, ties broken
+next (where a stream splits, its branches run in parallel from the splitter
+chain to the mixer), and the path is a topological order of those connections, ties broken
 by the order in which the synthesis returned the exchangers -- the process
 exchangers in plan order, then the utility exchangers, hot streams first.
 ``HX_0_2_hs`` therefore runs first: it is the first stage of both of its
@@ -81,7 +82,13 @@ it. The indices are stream indices: positions in the rearranged utility list of
 :func:`~hensmith.synthesize_network`, cold streams first and then hot ones, as
 described in :doc:`02_pinch_analysis`. The stream copies are named after the
 exchanger they touch, ``s_<index>__<exchanger>`` on the way in and
-``<exchanger>__s_<index>`` on the way out.
+``<exchanger>__s_<index>`` on the way out. This network has no stream split;
+one synthesized with ``stream_splitting=True`` can also hold, for each split,
+a chain of ``Splitter`` units named ``Split_<index>_<hs|cs>`` (with ``_b<c>``
+for the chain's element *c* >= 2, and ``_<n>`` before it for a stream's
+*n*-th split on that side) and a ``Mixer`` named ``Mix_<index>_<hs|cs>`` where
+the branches re-join, both in ``HXN_sys`` and listed in ``HXN.new_splitters``
+and ``HXN.new_mixers`` (:doc:`04_configuring` shows one).
 
 All four process exchangers of this network end in ``_hs``: every match lies
 above the pinch, which is the same fact as the pinch diagram of
@@ -156,7 +163,12 @@ by inlet enthalpy, ascending for a cold stream and descending for a hot one,
 which is flow direction in both cases since a cold stream gains enthalpy as it
 goes and a hot stream loses it (ties, which only stages without duty can
 produce, put the stream's first side of the pinch first and its utility
-last).
+last). A stream split with ``stream_splitting=True`` changes this only where
+it splits: its life cycle also holds the stream's splits (``splits``) and the
+port where the whole stream enters (``entry``, the first splitter if it splits
+at its inlet), and the stages of its branches, which run in parallel, follow
+the stages before the split branch by branch, each in flow order and marked
+with its branch and flow fraction.
 
 Read stream 1, the longest life cycle here: it passes ``HX_1_2_hs``,
 ``HX_1_4_hs`` and ``HX_1_3_hs`` and then its utility exchanger ``Util_1_hs``,

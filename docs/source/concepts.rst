@@ -223,7 +223,9 @@ From targets to a network: the pinch-outward MER planner
 
 :func:`~hensmith.synthesize_network` takes the heat utilities of the process,
 runs the problem table above, plans a network *without stream splits* that
-reaches the MER targets whenever its search finds one, and realizes the plan
+reaches the MER targets whenever its search finds one (by default; with
+``stream_splitting=True`` it splits streams where MER needs them, see `Stream
+splitting`_ below), and realizes the plan
 as BioSTEAM exchangers. Streams are numbered in a rearranged order -- heated
 streams first, then cooled streams -- and every array, exchanger ID and life
 cycle uses that index. The order only breaks ties in the planner's search: the
@@ -282,7 +284,8 @@ same match are merged into one exchanger.
 
 **Repeated pairs.** The same hot and cold stream may be matched more than
 once on the same side: alternating two partners in series emulates a split,
-and some unsplit MER networks need it. Process exchangers are named
+and some unsplit MER networks need it (a real split is optional, see `Stream
+splitting`_). Process exchangers are named
 ``HX_<cold>_<hot>_hs`` above the pinch (the hot-side design) and
 ``HX_<hot>_<cold>_cs`` below it (the cold-side design), the first number being
 the stream at port 0; the *n*-th exchanger of the same pair on the same side,
@@ -293,9 +296,10 @@ counted in the order the hot stream meets them, gets the suffix ``_<n>`` for
 or across the two -- so that no two exchangers connect the same pair of
 streams, at the cost of the MER networks that need a repeated pair.
 
-**Best effort when splitting is needed.** A side whose pinch rules prove that
-MER needs a split, or whose search runs out of budget, gets a best-effort plan
-instead. Heat that a must stream cannot place (a *gap*) is moved to the
+**Best effort when splitting is needed.** By default, a side whose pinch rules
+prove that MER needs a split, or whose search runs out of budget, gets a
+best-effort plan instead (with ``stream_splitting=True`` it is planned with
+splits, see `Stream splitting`_). Heat that a must stream cannot place (a *gap*) is moved to the
 stream's pinch end, where it crosses the pinch at the cost of an equal amount
 of extra hot and cold utility, the *penalty*; greedy dives and a bisection of
 the gaps keep that penalty small, though not minimal in general. Such a
@@ -354,9 +358,73 @@ planned and the realized utilities, the ``'penalty'``, per side of the pinch
 and the gaps, the planner's own targets and pinch, the number of refinement
 rounds, the smallest approach inside any process exchanger, the matches that
 were shrunk (``'repaired'``), dropped (``'qmin_dropped'``, ``'dropped'``) or
-deviated from their plan (``'deviations'``), and the point-load streams. The
-full list is under the ``info`` keyword of
-:func:`~hensmith.synthesize_network`.
+deviated from their plan (``'deviations'``), and the point-load streams. With
+``stream_splitting=True`` it also holds the realized splits (``'splits'``), any
+mixer whose outlet is off its planned state (``'split_deviations'``) and, per
+side, the split candidate chosen (``'split'``). The full list is under the
+``info`` keyword of :func:`~hensmith.synthesize_network`.
+
+Stream splitting
+----------------
+
+By default hensmith does not split streams, so a side of the pinch whose
+pinch design rules prove that MER needs a split gets a best-effort network.
+``HeatExchangerNetwork(..., stream_splitting=True)`` (or
+``synthesize_network(..., stream_splitting=True, info={})``) lets the planner
+split a process stream into parallel branches that re-join. Only a side that
+no unsplit network serves at MER -- one with a pinch-rule proof, or whose
+unsplit search leaves a utility penalty -- is planned with splits; a side that
+an unsplit network serves is planned exactly as without the option, so a
+problem that needs no split gets the same network either way.
+
+**Branches.** A branch of flow fraction :math:`f` carries the parent stream's
+material at the parent's pressure, so at branch heat :math:`q` it is in the
+parent's state at heat :math:`q/f`: its temperature-enthalpy curve is the
+parent's with every heat times :math:`f`, and its heat capacity flow rate is
+:math:`f` times the parent's. Splitting a stream into branches whose fractions
+sum to one leaves the problem table unchanged, so a split never changes the
+targets; it changes only what the pinch design rules count (one stream per
+branch, each with :math:`f\,C`) and the approach inside each exchanger. The
+planner builds a split side from a portfolio of candidates -- splits at the
+pinch that repair the number and heat-capacity-flow rules, completed by the
+ordinary search, and a *vertical* construction that matches every stream's
+branches at the same position of the composite curves -- verifies every
+exchanger at every knot of both branch curves, and keeps the best candidate
+by a key that first avoids tiny exchangers or branches and re-joins at
+different temperatures ahead of another exchanger, then counts exchangers,
+extra branches and split stages. The theory (the lemmas, the constructions
+and their proofs) is in the module docstring of ``hensmith._splitting``.
+
+**Realization.** Each split becomes a chain of BioSTEAM ``Splitter`` units,
+one fewer than its branches (IDs ``Split_<stream>_<hs|cs>``, with ``_<n>`` for
+a stream's *n*-th split on that side and ``_b<c>`` for the chain's element
+:math:`c \ge 2`), and a rigorous, adiabatic ``Mixer`` (``Mix_<stream>_<hs|cs>``)
+where the branches re-join; neither is costed. A branch exchanger runs its
+fraction of the flow in the parent's states, with an enthalpy limit
+:math:`f` times the parent's, and every mixer starts at its planned state. The
+facility lists them in ``new_splitters`` and ``new_mixers`` and simulates them
+in ``HXN_sys`` with the exchangers; ``synthesis_info['splits']`` describes
+every split (:class:`~hensmith.hxn_synthesis.StreamSplit`), and a split
+stream's life cycle marks each branch stage with its branch and fraction.
+
+**The guarantee and its limits.** Without ``avoid_recycle``, every side that
+needs a split gets a split plan at MER on the planner's knots: the vertical
+construction always succeeds (up to a deficit of about 1e-9 of the total duty
+that the problem table's own tolerances already absorbed into the targets).
+With constant heat capacities the knots are exact and the realized network
+reaches the targets to round-off. With real thermodynamics the knots are
+chords of the exact curves, so a split exchanger can fall short of
+``T_min_app`` on the exact states by up to the chords' tolerance; the same
+refinement rounds as for unsplit networks close that, plus up to two rounds
+that try another candidate, and only an exchanger still short after them is
+shrunk (``'repaired'``, status ``'best_effort'``). With ``avoid_recycle``, a
+split that would repeat a stream pair is not used, and MER is then not
+guaranteed. The number of exchangers is minimized only among the candidates a
+side generates, not globally. The test suite reaches ``'mer'`` with splits on
+all 38 split-needing problems of its corpus and on the three regression
+systems that need splits, each checked on its actual stream graph: splitters,
+mixers at equilibrium, balances and the exact approach inside every exchanger.
+:doc:`tutorial/04_configuring` shows an example.
 
 Rigor and phase change
 ----------------------
@@ -426,10 +494,11 @@ anything listed in ``ignored``, and anything with zero duty, and sorts what is
 left by duty. Auxiliary exchangers -- a column's condenser and reboiler, a
 flash's feed heater -- are included like any other.
 
-**Convergence.** After synthesis each stream's stages are rewired in series,
-and the new exchangers are assembled into a ``System``, ``HXN_sys``, whose
-path follows the streams: every stage links to the next stage of the same
-stream, and the path is a topological order of that graph (Kahn's algorithm,
+**Convergence.** After synthesis each stream's stages are rewired in series
+(the branches of a split in parallel, from its splitter chain to its mixer),
+and the new units are assembled into a ``System``, ``HXN_sys``, whose path
+follows the streams: every stage links to the next stage of the same stream,
+and the path is a topological order of that graph (Kahn's algorithm,
 ties broken by the order of the exchangers). Where the graph has a cycle --
 a pair of streams matched both above and below the pinch, or repeated matches
 in alternating order -- the unit with the fewest unplaced predecessors comes
@@ -532,8 +601,14 @@ certificate network that is re-checked there (by plain arithmetic for
 constant heat capacity); the synthesized network must reach the targets and
 report ``'mer'``. For the other 38 (25 from the literature and 13 with real
 thermodynamics; 13 with more than ten streams) the pinch design rules prove
-that MER needs stream splitting, a proof re-derived in the test module; the
-network must never beat the targets and must report ``'best_effort'``. In both sets the targets must equal an independent
+that MER needs stream splitting, a proof re-derived in the test module; by
+default the network must never beat the targets and must report
+``'best_effort'``, and with ``stream_splitting=True`` it must reach them and
+report ``'mer'``, checked on its actual stream graph (splitters, mixers at
+equilibrium, every stream's closure). The 40 problems of the first set must
+also plan exactly as without the option (18 of them are synthesized both
+ways, and must give the same network). In both sets the
+targets must equal an independent
 reference -- a closed-form constant heat capacity cascade and the published
 values, or a dense-grid calculator for real thermodynamics -- and every
 material and energy balance and the exact internal approach of every
@@ -549,7 +624,9 @@ inside every process exchanger on exact states, (iv) is planned on the
 problem table's own cascade, and (v) recovers at least as much heat as a load
 recorded in the test file. A network that improves leaves slack in (v); those
 recorded numbers are lowered deliberately by a maintainer, never raised to
-make a failing test pass.
+make a failing test pass. Every case is synthesized again with
+``stream_splitting=True`` and held to the same checks, and the three cases
+that need stream splits for MER must then reach their targets.
 
 **Doctests.** The examples in the docstrings are executed as part of the test
 suite, so the numbers printed in the API reference are numbers the code
@@ -579,11 +656,16 @@ What it is not:
   of about 1,700 problems with 2 to 40 streams for which an unsplit MER
   network exists, and it does so on all 40 no-split problems of the test
   suite, but no proof covers every problem.
-- **Streams are not split.** Every stream stays a single branch through the
-  network. Where the pinch design rules prove that MER needs a split, the
-  network is a best-effort one whose penalty is small but not minimal in
-  general; repeated matches between the same two streams, alternating in
-  series, can approach a split only in the limit.
+- **By default, streams are not split.** Every stream stays a single branch
+  through the network. Where the pinch design rules prove that MER needs a
+  split, the network is a best-effort one whose penalty is small but not
+  minimal in general; repeated matches between the same two streams,
+  alternating in series, can approach a split only in the limit. With
+  ``stream_splitting=True`` such a side is split and reaches MER, within the
+  limits given under `Stream splitting`_: exact on constant heat capacity
+  streams, closed by refinement on real thermodynamics, not guaranteed with
+  ``avoid_recycle``, and with the number of exchangers minimized only among
+  the candidates the planner generates.
 - **Energy first, then units; no cost optimization.** MER always takes
   precedence over the number of exchangers, and an unsplit MER network can
   need many of them. The branch and bound reduces the number of exchangers
@@ -591,11 +673,12 @@ What it is not:
 - **Some networks cannot be represented.** Networks whose match order is
   cyclic are outside the planner's model. A side that needs a split without a
   pinch-rule proof spends its whole MER search budget before the best-effort
-  step, which costs time rather than quality.
+  step (or the split attempt), which costs time rather than quality.
 - **Flash failures inside some glides.** Thermosteam's TP flashes fail
   silently inside the glides of some mixtures (water and ethanol with 20-50 %
   ethanol, for instance); an exchanger simulated there can deviate from its
-  plan, and is then reported in ``synthesis_info['deviations']``.
+  plan, and is then reported in ``synthesis_info['deviations']`` (a split's
+  mixer, in ``synthesis_info['split_deviations']``).
 - **Only streams behind existing utility exchangers are integrated.** The
   facility sees a process stream only through a heat utility attached to a
   unit of the system. A duty carried some other way is invisible to it;

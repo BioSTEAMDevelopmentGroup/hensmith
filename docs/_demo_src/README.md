@@ -25,7 +25,7 @@ directories themselves.
 | `examples/ch01_quickstart.py` | `_static/images/examples/tutorial_01_quickstart_flowsheet_light.png`, `…_flowsheet_dark.png`, `_static/images/examples/tutorial_01_quickstart_pinch_diagram.png`; `_generated/ch01_results.txt`, `ch01_loads.txt`, `ch01_life_cycles.txt`, `ch01_summary.txt` |
 | `examples/ch02_pinch_analysis.py` | `_static/images/examples/tutorial_02_composite_curves.png`, `tutorial_02_grand_composite.png`; `_generated/ch02_threshold.txt`, `ch02_table.txt`, `ch02_compare.txt` |
 | `examples/ch03_network_anatomy.py` | `_static/images/examples/tutorial_03_hxn_flowsheet_light.png`, `…_hxn_flowsheet_dark.png`, `tutorial_03_pinch_diagram_minimal.png`; `_generated/ch03_flowsheet.txt`, `ch03_life_cycles.txt`, `ch03_stage.txt`, `ch03_pinch_Ts.txt`, `ch03_accounting.txt` |
-| `examples/ch04_configuring.py` | `_static/images/examples/tutorial_04_T_min_app_sweep.png`, `tutorial_04_ten_streams_pinch_diagram.png`; `_generated/ch04_sweep.txt`, `ch04_ignored.txt`, `ch04_ten_streams.txt` |
+| `examples/ch04_configuring.py` | `_static/images/examples/tutorial_04_T_min_app_sweep.png`, `tutorial_04_ten_streams_pinch_diagram.png`; `_generated/ch04_sweep.txt`, `ch04_splitting.txt`, `ch04_ignored.txt`, `ch04_ten_streams.txt` |
 | `make_hero_gif.py` | `_static/images/demo/hero_light.gif`, `hero_dark.gif` (8 s loop, 20 fps, 2000 × 720), `hero_light_still.png`, `hero_dark_still.png` (the frame-0 stills served under `prefers-reduced-motion`) |
 | `build_demo.py` | `_static/quickstart_demo.html` — the interactive quickstart demo, filled in from `quickstart_demo_template.html` |
 | `make_poster.py` | `_static/images/examples/quickstart_demo_poster.png` — the README poster that links to the demo (2400 × 1260) |
