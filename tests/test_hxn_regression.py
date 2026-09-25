@@ -60,9 +60,16 @@ a better network is intended. Never raise them to make a failing test pass
 ``test_hxn_regression_with_splitting`` synthesizes every case again with
 ``stream_splitting=True`` and holds it to the same checks (i)-(v). Cases
 4, 8 and 9 (``SPLIT_CASES``) must then reach their MER targets with split
-streams; every other case must give, bit for bit, the network it gives
-without the option (the same exchangers and duties, refine rounds and
-repairs).
+streams, held to the standard of the split corpus of ``test_hxn_mer``
+rather than to the looser 'mer' status of (ii): the strict split-aware
+checks G0-G10 (splitters, mixers at equilibrium, stream closure and
+wiring; ``_network_problems``), a synthesis report with nothing repaired,
+dropped or off its planned state and every split side free of leaks and
+pre-leaks (``_split_report_problems``), and both utilities within
+``MER_TOL`` of the targets (1e-10 of the total stream duty; at most
+1.75e-14 measured, case 9's cooling). Every other case must give, bit for
+bit, the network it gives without the option (the same exchangers and
+duties, refine rounds and repairs).
 """
 import warnings
 import pytest
@@ -72,6 +79,9 @@ from hensmith import HeatExchangerNetwork
 from hensmith.hxn_synthesis import problem_table, _pinch_cut
 # exact stream temperatures from forward property calls only (no flashes)
 from test_hxn_mer import _temperature, _min_approach, APPROACH_TOL
+# the split corpus's checks, for the cases whose MER needs splits
+from test_hxn_mer import (_network_problems, _network_record, _split_report_problems,
+                          MER_TOL)
 
 EB_TOLERANCE = 1e-6  # percent; converged networks close to ~1e-10 %
 MER_RTOL = 1e-9      # network may not beat the MER target by more than this x total duty
@@ -312,8 +322,18 @@ def test_hxn_regression_with_splitting(name):
     check_network(name, units, HXN, T_min_app)
     info = HXN.synthesis_info
     if name in SPLIT_CASES:
-        assert info['status'] == 'mer', name
-        assert info['splits'] and HXN.new_splitters and HXN.new_mixers, name
+        # held to the standard of the split corpus (test_hxn_mer): the
+        # strict split-aware checks G0-G10, a synthesis report with status
+        # 'mer', splits, and nothing repaired, dropped or off its planned
+        # state, and the utilities at the MER targets within MER_TOL
+        net = _network_record(units, HXN, T_min_app, True)
+        problems = _network_problems(net) + _split_report_problems(HXN, T_min_app)
+        atol = MER_TOL['real_thermo'] * net['total']
+        for label, got, target in zip(('heating', 'cooling'), actual_loads(HXN),
+                                      mer_targets(units, T_min_app)):
+            if not abs(got - target) <= atol:
+                problems.append(f'{label} {got!r} != target {target!r}')
+        assert not problems, '\n'.join([name, *problems])
         return
     default = synthesize(builder)[1]
     assert info['status'] == default.synthesis_info['status'] == 'mer', name

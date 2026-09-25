@@ -185,15 +185,18 @@ and also to those if it has no splitter.
 ``test_split_network_balanced_and_feasible`` / ``test_split_network_reaches_mer``
     Every SPLIT problem, synthesized with ``stream_splitting=True``, passes
     G0-G10 and reaches both hensmith's targets and the independent
-    reference within the NO_SPLIT tolerances (``_split_mer_problems``):
-    status 'mer', no side left to best effort, every exchanger at its
-    planned duty (``deviations``), nothing repaired (the refine rounds
-    closed every exact-state violation of a real-thermo plan), dropped or
-    dropped by ``Qmin``, every mixer outlet at its planned state, the
-    minimum approach kept, every split side free of leaks, pre-leaks,
-    cells below ``Qmin`` and failed strategies, and at most
+    reference within the NO_SPLIT tolerances (``MER_TOL``; see Tolerances
+    for the margins measured on these networks), with at most
     ``_SPLIT_MIX_CAP`` mixers per curved stream and side (which bounds the
-    mixers' enthalpy residuals on real thermo).
+    mixers' enthalpy residuals on real thermo; ``_split_mer_problems``).
+    Its synthesis report (``_split_report_problems``, which
+    ``test_hxn_regression`` applies too) shows status 'mer', no side left
+    to best effort, every exchanger at its planned duty (``deviations``),
+    nothing repaired (the refine rounds closed every exact-state violation
+    of a real-thermo plan), dropped or dropped by ``Qmin``, every mixer
+    outlet at its planned state (``split_deviations``), the minimum
+    approach kept, and every split side free of leaks, pre-leaks, cells
+    below ``Qmin`` and failed strategies.
 ``test_split_network_structure``
     Every realized split has two or more branches, each with a process
     exchanger and one fraction, the fractions summing to 1; each life cycle
@@ -247,14 +250,18 @@ Tolerances
   duty covers rounding and flash residuals (at most 5e-11 measured). The
   stored simulated certificate utilities, which are exact thermodynamics
   at the pinch, differ from the reference by the same amounts.
-* Achieved utilities (NO_SPLIT) vs hensmith's targets: 1e-12 of the total
-  stream duty for constant CP and 1e-10 for real thermodynamics (plus the
-  reference tolerance above when compared with the reference): about 100
-  times the largest deviation measured over the corpus (5e-15 and 1e-12,
+* Achieved utilities (NO_SPLIT, and SPLIT with ``stream_splitting=True``)
+  vs hensmith's targets: 1e-12 of the total stream duty for constant CP
+  and 1e-10 for real thermodynamics (plus the reference tolerance above
+  when compared with the reference): about 100 times the largest NO_SPLIT
+  deviation measured over the corpus (5e-15 and 1e-12,
   sorak_kravanja_ph13c7 and rtA10), the rounding of the constant-CP
   arithmetic and the residuals of the enthalpy flashes that realize a
-  real-thermo network. SPLIT networks may not beat the targets by more
-  than 1e-9 (rounding only).
+  real-thermo network. The SPLIT networks synthesized with stream
+  splitting are held to the same tolerances; their largest measured
+  deviations are 5.3e-15 (fs_15sp_tkm) and 2.56e-12 (rtB05_above_2h1c),
+  187 and 39 times below them. Without stream splitting, SPLIT networks
+  may not beat the targets by more than 1e-9 (rounding only).
 * Balances: energy balance error < 1e-6 % (``test_hxn_regression``);
   heat - cool == net duty within 1e-8 of the total duty; per exchanger hot
   duty == cold duty, and per stream network end states == original ones,
@@ -299,7 +306,7 @@ from hensmith._planner import plan_network
 from hensmith.hxn_synthesis import problem_table
 from hxn_mer_cases import NO_SPLIT, SPLIT, Q_UNITS, T_UNITS
 from test_hxn_planner import (NEAR_DOUBLE_PINCH, NEAR_THRESHOLD, _verify_side_cells,
-                              sides_from_knots, verify_core)
+                              sides_from_knots, streams_from, verify_core)
 
 # ---------------------------------------------------------------------------
 # Tolerances (justified in the module docstring)
@@ -1906,18 +1913,6 @@ BACKSTOP_FACILITY = ['smith2005_ex18_4_split', 'rtB12_above_2h1c_cond_boil_below
 PRELEAK_PROBLEMS = {'near_threshold': NEAR_THRESHOLD,
                     'near_double_pinch': NEAR_DOUBLE_PINCH}
 
-def _numeric_knots(dT, rows):
-    """Planner inputs (knots, is_hot, T_min_app) of a constant-CP problem
-    given as test_hxn_planner rows, as `_planner._plan_numeric` builds
-    them."""
-    knots, is_hot = [], []
-    for _, kind, T_in, T_out, CP in rows:
-        a, b = float(min(T_in, T_out)), float(max(T_in, T_out))
-        T = np.array([a, b])
-        knots.append((T, float(CP) * (T - a)))
-        is_hot.append(kind == 'h')
-    return knots, is_hot, float(dT)
-
 def _curved(case):
     """{(stream, side): whether the planner's curve of the stream on that
     side of the pinch has a kink (more than two knots), on the facility's
@@ -1929,18 +1924,42 @@ def _curved(case):
 
 def _split_mer_problems(case, net, candidate=None):
     """Everything that keeps the split network `net` of `case` from being
-    the MER network the synthesizer promises (test_split_network_reaches_mer);
-    `candidate`, if given, is the name every split side must have picked."""
-    HXN, T_min_app = net['HXN'], net['T_min_app']
-    info = HXN.synthesis_info
-    problems = []
-    if info['status'] != 'mer': problems.append(f"status {info['status']!r}")
+    the MER network the synthesizer promises (test_split_network_reaches_mer):
+    its synthesis report (`_split_report_problems`), its utilities vs
+    hensmith's targets and the reference, and its mixers per curved stream
+    and side; `candidate`, if given, is the name every split side must have
+    picked."""
+    HXN = net['HXN']
+    problems = _split_report_problems(HXN, net['T_min_app'], candidate)
     atol = MER_TOL[case['kind']] * net['total']
     for label, got, target, ref, ref_tol in _utilities(case, net):
         if not abs(got - target) <= atol:
             problems.append(f'{label} {got!r} != target {target!r}')
         if not abs(got - ref) <= atol + ref_tol:
             problems.append(f'{label} {got!r} != reference {ref!r}')
+    curved = _curved(case)
+    mixers = {}
+    for split in HXN.synthesis_info['splits']:
+        key = split.stream, split.side
+        mixers[key] = mixers.get(key, 0) + 1
+    for key, n in mixers.items():
+        if curved[key] and n > _splitting._SPLIT_MIX_CAP:
+            problems.append(f'stream {key[0]} {key[1]}: {n} mixers on a curved stream')
+    return problems
+
+def _split_report_problems(HXN, T_min_app, candidate=None):
+    """Everything in the synthesis report of the facility `HXN`, synthesized
+    with stream splitting, that keeps its network from being the MER
+    network the synthesizer promises, on any problem (no reference needed;
+    also test_hxn_regression): a status other than 'mer', no realized
+    split, anything repaired, dropped (by ``Qmin`` or otherwise) or off its
+    planned state (exchangers, mixers), the minimum approach lost, a side
+    left to best effort, and a split side with no candidate or with leaks,
+    pre-leaks, cells below ``Qmin`` or failed strategies; `candidate`, if
+    given, is the name every split side must have picked."""
+    info = HXN.synthesis_info
+    problems = []
+    if info['status'] != 'mer': problems.append(f"status {info['status']!r}")
     if not (HXN.new_splitters and HXN.new_mixers and info['splits']):
         problems.append('no split')
     for key in ('repaired', 'dropped', 'qmin_dropped', 'split_deviations', 'deviations'):
@@ -1961,14 +1980,6 @@ def _split_mer_problems(case, net, candidate=None):
         for key, empty in (('leak', 0.), ('preleak', 0.), ('small', []), ('errors', [])):
             if split[key] != empty: problems.append(f'{name}: {key} {split[key]!r}')
     if not split_sides: problems.append('no side split')
-    curved = _curved(case)
-    mixers = {}
-    for split in info['splits']:
-        key = split.stream, split.side
-        mixers[key] = mixers.get(key, 0) + 1
-    for key, n in mixers.items():
-        if curved[key] and n > _splitting._SPLIT_MIX_CAP:
-            problems.append(f'stream {key[0]} {key[1]}: {n} mixers on a curved stream')
     return problems
 
 @pytest.mark.parametrize('case', SPLIT, ids=_name)
@@ -2091,13 +2102,6 @@ def test_backstop_alone_reaches_mer(name, monkeypatch):
     # split side at MER from the pre-leaked root, with cells that pass the
     # independent check (test_hxn_planner); only the constructed problems
     # pre-leak
-    if name in PRELEAK_PROBLEMS:
-        knots, is_hot, T_min_app = _numeric_knots(*PRELEAK_PROBLEMS[name])
-    else:
-        k = _corpus_knots(_case(name))
-        knots, is_hot, T_min_app = k['knots'], k['is_hot'], k['T_min_app']
-    monkeypatch.setattr(_splitting, '_SPLIT_RULES', ())
-    monkeypatch.setattr(_splitting, '_CORE_STRATEGIES', ('V',))
     planned = {}
     plan_side = _planner._plan_side
     def spy(side, *args, **kwargs):
@@ -2105,7 +2109,15 @@ def test_backstop_alone_reaches_mer(name, monkeypatch):
         planned[side.name] = side, result
         return result
     monkeypatch.setattr(_planner, '_plan_side', spy)
-    plan = plan_network(knots, is_hot, T_min_app, stream_splitting=True)
+    k = None if name in PRELEAK_PROBLEMS else _corpus_knots(_case(name))
+    with _variant('V'):
+        if k is None:
+            dT, rows = PRELEAK_PROBLEMS[name]
+            plan = _planner._plan_numeric(streams_from(rows), dT,
+                                          stream_splitting=True)['plan']
+        else:
+            plan = plan_network(k['knots'], k['is_hot'], k['T_min_app'],
+                                stream_splitting=True)
     assert plan.status == 'mer'
     splits = {n: side['split'] for n, side in plan.info['sides'].items()
               if side['split'] is not None}
