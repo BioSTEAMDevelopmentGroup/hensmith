@@ -67,13 +67,52 @@ def _load_utility_costs(unit):
     owner = unit.owner
     if owner is not unit: owner._load_operation_costs()
 
+def _phase_flows(stream):
+    """Return the molar flows of `stream` by phase, {phase: array}."""
+    if isinstance(stream, bst.MultiStream):
+        return {phase: row.to_array()
+                for phase, row in zip(stream.phases, stream.imol.data.rows)}
+    return {stream.phase: stream.mol.to_array()}
+
+def _move_phase_flows(stream, inlets):
+    """
+    Give the multiphase `stream` the flows that `inlets` carry together,
+    keeping its temperature, pressure and phase split, without a flash.
+
+    Each chemical that `stream` carries keeps the fraction of its flow in
+    each phase (its phase flows are scaled by its new total over its old
+    one), so when every inlet scales by a common factor, every phase does,
+    to rounding; a chemical that it does not carry enters in the phases in
+    which it arrives (adding a phase that `stream` lacks). No float is
+    compared for equality and nothing is flashed, so the split does not
+    depend on the last bits of the flash that made it (a TP flash at the
+    stream's own temperature and pressure can even miss its two phases).
+    """
+    before = _phase_flows(stream)
+    carried = sum(before.values())
+    total = sum([s.mol.to_array() for s in inlets])
+    arriving = {}
+    for s in inlets:
+        for phase, flows in _phase_flows(s).items():
+            arriving[phase] = (arriving[phase] + flows if phase in arriving
+                               else flows)
+    new_phases = [i for i in arriving if i not in stream.phases]
+    if new_phases: stream.phases = (*stream.phases, *new_phases)
+    held = carried > 0.
+    scale = np.divide(total, carried, out=np.zeros_like(total), where=held)
+    none = np.zeros_like(total)
+    for phase in stream.phases:
+        stream.imol[phase] = np.where(held, before.get(phase, none) * scale,
+                                      arriving.get(phase, none))
+
 def _move_flows(unit):
     """
     Give the outlets of `unit`, a unit of a cached network, the flows that
     its inlets carry now, so that the network's convergence starts from
     the new flows (`HeatExchangerNetwork._cost` moves them in path order).
-    No enthalpy flash runs here: only the convergence, which the facility
-    guards, runs the rigorous units.
+    Nothing is flashed here (only the convergence, which the facility
+    guards, runs the rigorous units), and every outlet keeps its
+    temperature and pressure.
 
     - A splitter splits its feed at its fixed fractions (`Splitter._run`
       copies the feed's intensive state and flashes nothing).
@@ -81,31 +120,24 @@ def _move_flows(unit):
       rigorous mixer would flash).
     - Any other unit's outlet ``k`` takes the flows of its inlet ``k``.
 
-    A multiphase outlet keeps its temperature and pressure: its flows are
-    scaled to the new total and, if that does not reproduce the inlet
-    flows, replaced by them and split between the phases at its
-    temperature and pressure.
+    A single-phase outlet takes the flows in its phase. A multiphase
+    outlet keeps its phase split (`_move_phase_flows`): each chemical that
+    it carries keeps the fraction of its flow in each phase, and a
+    chemical new to it enters in the phase in which it arrives.
     """
     if isinstance(unit, bst.Splitter):
         unit._run()
     elif isinstance(unit, bst.Mixer):
         s_out, = unit.outs
         ins = unit.ins
-        mol = sum([s.mol for s in ins])
         if isinstance(s_out, bst.MultiStream):
-            s_out.F_mol = sum([s.F_mol for s in ins])
-            if not s_out.mol.sparse_equal(mol):
-                s_out.imol.mix_from([s.imol for s in ins])
-                s_out.vle(T=s_out.T, P=s_out.P)
+            _move_phase_flows(s_out, ins)
         else:
-            s_out.mol[:] = mol
+            s_out.mol[:] = sum([s.mol for s in ins])
     else:
         for s_in, s_out in zip(unit.ins, unit.outs):
             if isinstance(s_out, bst.MultiStream):
-                s_out.F_mol = s_in.F_mol
-                if not s_out.mol.sparse_equal(s_in.mol):
-                    s_out.copy_flow(s_in)
-                    s_out.vle(T=s_out.T, P=s_out.P)
+                _move_phase_flows(s_out, [s_in])
             else:
                 s_out.mol[:] = s_in.mol
 

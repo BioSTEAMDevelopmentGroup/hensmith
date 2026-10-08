@@ -3151,9 +3151,12 @@ def test_move_flows_moves_flows_only(monkeypatch):
     # the cached network's pre-copy: a splitter splits its feed's new flows
     # at its fixed fraction (and copies its state), a mixer's outlet takes
     # the summed flows of its inlets without the mixer running (its PH
-    # flash), keeping its temperature and pressure, multiphase or not
+    # flash) or any other flash, keeping its temperature and pressure,
+    # multiphase or not; a multiphase outlet keeps the phase fractions of
+    # each chemical it carries, and a chemical new to it enters in the
+    # phase in which it arrives
     from hensmith._heat_exchanger_network import _move_flows
-    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    bst.settings.set_thermo(['Water', 'Ethanol', 'Methanol'], cache=True)
     bst.main_flowsheet.set_flowsheet('move_flows')
     feed = bst.Stream('mf_feed', Water=80., Ethanol=20., T=340.,
                       units='kmol/hr')
@@ -3170,14 +3173,31 @@ def test_move_flows_moves_flows_only(monkeypatch):
     two_phase = mixers[1].outs[0]
     assert isinstance(two_phase, bst.MultiStream)
     assert 0. < two_phase.vapor_fraction < 1.
-    def failing(self): raise RuntimeError(f'{self.ID} was run')
-    monkeypatch.setattr(bst.Mixer, '_run', failing)
     def split(s): return np.array([s.imol['g'], s.imol['l']])
-    # all flows 10 % larger, then only the vapor's, each time with a new
-    # feed state, which the splitter's outlets take
-    for streams in ((feed, liquid, vapor), (vapor,)):
+    # the PH flash's split on the Linux CI, a few ulps from the Windows one
+    # (the same totals): 1.1 x its phases does not sum to 1.1 x the inlets
+    # bit for bit, so a pre-copy that kept the split only when they did
+    # (and else flashed at the outlet's T and P) made the outlet all liquid
+    two_phase.imol['g'] = [6.289623892768382, 8.32251116802309, 0.]
+    two_phase.imol['l'] = [43.71037610723162, 16.677488831976913, 0.]
+    assert split(two_phase).sum(0).tolist() == [50., 25., 0.]
+    def failing(self, *args, **kwargs):
+        raise RuntimeError(f'{type(self).__name__} was run')
+    monkeypatch.setattr(bst.Mixer, '_run', failing)
+    monkeypatch.setattr(tmo.equilibrium.VLE, '__call__', failing)
+    # all flows scaled by a common factor (several, so that no factor's
+    # rounding can let a bitwise check pass by chance), then only the
+    # vapor's, then with methanol, which the outlet does not carry yet, in
+    # the liquid; each time with a new feed state, which the splitter's
+    # outlets take
+    cases = [((feed, liquid, vapor), f)
+             for f in (1.1, 0.9, 1.3, 0.7, 1.7, 0.6, 1.25, 0.85)]
+    cases += [((vapor,), 1.1), ((), 'methanol')]
+    for streams, factor in cases:
         phase_flows = split(two_phase)
-        for s in streams: s.F_mol *= 1.1
+        if factor == 'methanol': liquid.imol['Methanol'] = 5.
+        else:
+            for s in streams: s.F_mol *= factor
         feed.T += 5.
         feed.P *= 1.1
         states = [(m.outs[0].T, m.outs[0].P) for m in mixers]
@@ -3190,17 +3210,70 @@ def test_move_flows_moves_flows_only(monkeypatch):
             assert (s.T, s.P) == state
             assert_allclose(s.mol, sum([i.mol for i in m.ins]), rtol=1e-15)
         if len(streams) == 3:
-            # every inlet 10 % larger: so is each phase of the two-phase
-            # outlet (the PH flash's split, kept)
-            assert_allclose(split(two_phase), 1.1 * phase_flows,
+            # every inlet scaled: so is each phase of the two-phase outlet
+            # (the PH flash's split, kept)
+            assert_allclose(split(two_phase), factor * phase_flows,
                             rtol=1e-14)
         else:
-            # the inlet flows, split between the phases at the outlet's T
-            # and P (thermosteam's TP flash gives all liquid here, although
-            # T lies between the bubble and dew points)
-            flashed = two_phase.copy()
-            flashed.vle(T=two_phase.T, P=two_phase.P)
-            assert_allclose(split(two_phase), split(flashed), rtol=1e-9)
+            # each chemical the outlet carries keeps its phase fractions;
+            # methanol, which it does not carry, enters in the phase in
+            # which it arrives (the liquid)
+            new = sum([i.mol for i in mixers[1].ins]).to_array()
+            old = phase_flows.sum(0)
+            carried = old > 0.
+            assert carried.tolist() == [True, True, False]
+            expected = np.zeros_like(phase_flows)
+            expected[:, carried] = (phase_flows[:, carried]
+                                    * (new[carried] / old[carried]))
+            expected[1, ~carried] = new[~carried]
+            assert_allclose(split(two_phase), expected, rtol=1e-14)
+    assert two_phase.imol['l', 'Methanol'] == 5.
+
+def test_move_flows_keeps_an_exchangers_phase_split(monkeypatch):
+    # an exchanger's multiphase outlet takes its inlet's flows by the same
+    # rule, without a flash: its phases scale with a scaled inlet, and a
+    # chemical new to it enters in the phase in which it arrives, here one
+    # that the outlet does not have yet
+    from hensmith._heat_exchanger_network import _move_flows
+    bst.settings.set_thermo(['Water', 'Ethanol', 'Methanol'], cache=True)
+    bst.main_flowsheet.set_flowsheet('move_flows_hx')
+    feed = bst.Stream('mfx_in', Water=50., Ethanol=25., T=340.,
+                      units='kmol/hr')
+    hx = bst.HXutility('MFX', ins=feed, V=0.4, rigorous=True)
+    hx.simulate()
+    out = hx.outs[0]
+    assert isinstance(out, bst.MultiStream)
+    assert 0. < out.vapor_fraction < 1.
+    def failing(self, *args, **kwargs):
+        raise RuntimeError(f'{type(self).__name__} was run')
+    monkeypatch.setattr(bst.HXutility, '_run', failing)
+    monkeypatch.setattr(tmo.equilibrium.VLE, '__call__', failing)
+    def split(s):
+        none = np.zeros(len(s.chemicals))
+        return np.array([s.imol[p].to_array() if p in s.phases else none
+                         for p in ('g', 'l', 's')])
+    T, P = out.T, out.P
+    for factor in (1.1, 0.9, 1.3):
+        phase_flows = split(out)
+        feed.F_mol *= factor
+        _move_flows(hx)
+        assert (out.T, out.P) == (T, P)
+        assert_allclose(split(out), factor * phase_flows, rtol=1e-14)
+    # more water, and methanol as a solid
+    phase_flows = split(out)
+    feed.phases = ('l', 's')
+    feed.imol['l', 'Water'] += 10.
+    feed.imol['s', 'Methanol'] = 2.
+    _move_flows(hx)
+    assert (out.T, out.P) == (T, P)
+    assert set(out.phases) == {'g', 'l', 's'}
+    assert_allclose(out.mol, feed.mol, rtol=1e-15)
+    new = feed.mol.to_array()
+    old = phase_flows.sum(0)
+    expected = phase_flows.copy()
+    expected[:, :2] *= new[:2] / old[:2]
+    expected[2, 2] = 2.
+    assert_allclose(split(out), expected, rtol=1e-14)
 
 def test_split_avoid_recycle_facility():
     # r002's only unsplit MER network matches H1 twice with C3, so with
