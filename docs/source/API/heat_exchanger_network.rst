@@ -7,7 +7,8 @@ HeatExchangerNetwork
 analysis over the heating and cooling utilities of a whole system,
 synthesizes a network of process heat exchangers that meets part of those
 duties by stream-to-stream exchange -- at the minimum energy requirement
-(MER) targets whenever it finds such a network without stream splits -- and
+(MER) targets whenever it finds such a network without stream splits, or,
+with ``stream_splitting=True``, with stream splits where MER needs them -- and
 reports the utility loads and capital cost that result. The original units,
 streams and heat exchangers are left untouched: the stream copies and
 synthesized exchangers live in a separate flowsheet named ``<sys>_HXN``. See
@@ -45,7 +46,7 @@ shows what each of them changes.
      - Run the analysis on stream copies with ideal thermodynamics; the synthesized exchangers inherit that thermo. Defaults to False.
    * - ``cache_network``
      - bool
-     - Reuse the network configuration of the previous simulation when the set of units contributing heat utilities is unchanged, updating only stream states and exchanger specifications: each process exchanger keeps the fraction of its stream's duty at which its enthalpy limit sat at synthesis, and the utility exchangers bring every stream to its new outlet. The reused network is not planned again, so it need not be at MER for the new duties. Defaults to False.
+     - Reuse the network configuration of the previous simulation when the set of units contributing heat utilities and ``stream_splitting`` are unchanged, updating only stream states and exchanger specifications: each process exchanger keeps the fraction of its stream's duty at which its enthalpy limit sat at synthesis (the splitters keep their branch fractions), and the utility exchangers bring every stream to its new outlet. The reused network is not planned again, so it need not be at MER for the new duties. Defaults to False.
    * - ``avoid_recycle``
      - bool
      - Never match the same hot/cold stream pair twice anywhere (on one side of the pinch or across the two), so that no two exchangers connect the same pair and form a recycle loop; this forbids the repeated matches some unsplit MER networks need. Defaults to False.
@@ -58,6 +59,9 @@ shows what each of them changes.
    * - ``sort_hus_by_T``
      - bool
      - Sort the heating utilities by inlet temperature descending and the cooling utilities ascending before the analysis, so that inlet temperature rather than signed duty (the default: smallest heating duty first, largest cooling duty first) sets the stream indices, which break ties in the planner's search. Defaults to False.
+   * - ``stream_splitting``
+     - bool
+     - Allow a process stream to be split into parallel branches that re-join. A side of the pinch that no unsplit network serves at MER is planned with splits and reaches the targets exactly on the planner's knots; sides that an unsplit network serves are never split, so a problem that needs no split gets the same network as with the default. Each split is a chain of ``Splitter`` units and a rigorous ``Mixer`` (adiabatic, no cost), listed in ``new_splitters`` and ``new_mixers``. With ``avoid_recycle``, a split that would repeat a stream pair is not used, and MER is then not guaranteed. Stored as an attribute of the same name, and part of the ``cache_network`` key. Defaults to False.
 
 Class attributes
 ----------------
@@ -119,10 +123,10 @@ the cached network.
      - Percent deviation from one of the ratio (twice the duty of each process exchanger, plus the new utility duties weighted by their agents' heat-transfer efficiency) / (the original utility duties weighted the same way), as computed in ``_cost``.
    * - ``synthesis_info``
      - dict
-     - The synthesis report (see the ``info`` keyword of :func:`synthesize_network`): ``'status'`` is ``'mer'`` when the network's utilities equal the MER targets and ``'best_effort'`` otherwise; next to it the targets, the planned and realized utilities, the penalty, per side of the pinch any proof that a split is needed, and the smallest approach inside any process exchanger. Kept from the synthesis that produced a cached network.
+     - The synthesis report (see the ``info`` keyword of :func:`synthesize_network`): ``'status'`` is ``'mer'`` when the network's utilities equal the MER targets and ``'best_effort'`` otherwise; next to it the targets, the planned and realized utilities, the penalty, per side of the pinch any proof that a split is needed, and the smallest approach inside any process exchanger. With ``stream_splitting``, also ``'stream_splitting'``, ``'splits'`` (the realized splits, :class:`~hensmith.hxn_synthesis.StreamSplit`), ``'split_deviations'`` and, per side, the split candidate chosen (``'split'``). Kept from the synthesis that produced a cached network.
    * - ``stream_life_cycles``
      - list[StreamLifeCycle]
-     - Ordered sequence of exchangers each stream passes through, aligned with ``original_heat_exchangers``.
+     - Ordered sequence of exchangers each stream passes through, aligned with ``original_heat_exchangers``; a split stream's life cycle also lists its splits and marks each branch stage with its branch and flow fraction.
    * - ``new_HXs``
      - list[HXprocess]
      - All synthesized process exchangers, the hot-side ones followed by the cold-side ones.
@@ -135,6 +139,12 @@ the cached network.
    * - ``new_HX_utils``
      - list[HXutility]
      - One rigorous utility exchanger per stream, bringing it from its last process exchanger (or its inlet, if it was not matched) to its outlet enthalpy.
+   * - ``new_splitters``
+     - list[Splitter]
+     - The splitters of the network's stream splits, every split's chain in order (IDs ``Split_<stream>_<hs|cs>``, with ``_<n>`` for a stream's *n*-th split on that side and ``_b<c>`` for the chain's element *c* >= 2); empty without a split, and always without ``stream_splitting``.
+   * - ``new_mixers``
+     - list[Mixer]
+     - One rigorous, adiabatic mixer per stream split, where its branches re-join (IDs ``Mix_<stream>_<hs|cs>``, with ``_<n>`` as for the splitters); empty without a split.
    * - ``original_heat_exchangers``
      - list[Unit]
      - The original heat exchangers behind the analyzed heat utilities, in stream order.
@@ -143,7 +153,7 @@ the cached network.
      - The original heat utilities rearranged into stream order, so that they align with ``stream_life_cycles``.
    * - ``HXN_sys``
      - System
-     - The system built from the synthesized exchangers, named ``<sys>_HXN`` and registered in ``HXN_flowsheet``; converged and summarized during costing.
+     - The system built from the synthesized exchangers (and the splitters and mixers of any stream split), named ``<sys>_HXN`` and registered in ``HXN_flowsheet``; converged and summarized during costing.
    * - ``HXN_flowsheet``
      - Flowsheet
      - The flowsheet ``<sys>_HXN`` holding the network's stream copies and exchangers.
@@ -161,7 +171,7 @@ the cached network.
      - One copy of each stream's inlet, in stream order, as prepared for the analysis; the synthesis works on further copies, so these keep their inlet state.
    * - ``stream_HXs_dict``
      - dict[int, list[Unit]]
-     - Exchangers that each stream index passes through: its process exchangers in flow order, then its utility exchanger.
+     - Exchangers that each stream index passes through: its process exchangers in flow order, then its utility exchanger. Where the stream splits, the order is topological: the exchangers before the split, those of its branches (branch by branch, each in flow order), then those after it.
    * - ``cold_indices``
      - list[int]
      - Stream indices of the heated (cold) streams.

@@ -8,7 +8,8 @@
 # for license details.
 """Tutorial chapter 04 (docs/source/tutorial/04_configuring.rst): configuring a
 HeatExchangerNetwork -- sweeping the minimum approach temperature to expose the
-utility/capital trade-off, scoping the analysis with ``ignored=``, and
+utility/capital trade-off, splitting streams where the targets need it
+(``stream_splitting=True``), scoping the analysis with ``ignored=``, and
 synthesizing a larger ten-stream system (the ten-stream case of the regression
 suite, inlined here rather than imported from ``tests``). Regions between
 ``# [start:x]`` / ``# [end:x]`` are literalinclude'd by the page; everything
@@ -109,6 +110,24 @@ def main():
         print(f'cooling utility: {HXN.original_cool_util_load:.4g} -> {HXN.actual_cool_util_load:.4g} kJ/hr')
         HXN.ignored = None
         # [end:ignored]
+    with capturing('ch04_splitting'):
+        # [start:splitting]
+        HXN.T_min_app = 15.          # the sweep's first best-effort network
+        for stream_splitting in (False, True):
+            HXN.stream_splitting = stream_splitting
+            sys.simulate()
+            info = HXN.synthesis_info
+            print(f'stream_splitting={stream_splitting}: {info["status"]}, '
+                  f'{len(HXN.new_HXs)} process exchangers, '
+                  f'{HXN.installed_costs["Heat exchangers"]:.4g} USD added installed cost')
+        print('splitters:', [u.ID for u in HXN.new_splitters])
+        print('mixers:   ', [u.ID for u in HXN.new_mixers])
+        print('process exchangers:', [hx.ID for hx in HXN.new_HXs])
+        print(info['splits'])
+        print(HXN.stream_life_cycles[3])
+        HXN.stream_splitting = False
+        HXN.T_min_app = 5.
+        # [end:splitting]
     with capturing('ch04_ten_streams'):
         # [start:ten_streams]
         bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)

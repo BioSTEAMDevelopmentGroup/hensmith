@@ -276,15 +276,18 @@ same stream curves this table was built from, so its own cascade *is* this
 table, and it reaches the targets whenever its search finds a network without
 stream splits that does (:doc:`../concepts` describes the planner). Where the
 pinch design rules prove that the targets need a stream split, which hensmith
-does not make, the status is ``best_effort`` and the network lies slightly
-above the targets instead; :doc:`04_configuring` shows both outcomes on this
-system.
+does not make by default, the status is ``best_effort`` and the network lies
+slightly above the targets instead; with ``stream_splitting=True`` hensmith
+splits streams there and reaches the targets. :doc:`04_configuring` shows all
+three outcomes on this system.
 
 Both directions of that statement are checked by the test suite, on the
 process side. ``tests/test_hxn_mer.py`` synthesizes 40 problems for which an
 unsplit MER network is known to exist and requires every one of them to reach
 its targets and report ``mer``, and 38 problems that provably need splits,
-which must never beat their targets and must report ``best_effort``.
+which by default must never beat their targets and must report
+``best_effort``, and with ``stream_splitting=True`` must reach them and report
+``mer``.
 ``tests/test_hxn_regression.py`` compares with its ``actual_loads`` helper,
 which sums ``unit_duty`` exactly as the second pair of lines above does. It
 synthesizes ten synthetic systems of increasing complexity and requires of

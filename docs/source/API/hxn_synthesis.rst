@@ -9,7 +9,10 @@ temperature-interval heat cascade of a set of process streams on their
 temperature-enthalpy curves and locates the pinch, :func:`synthesize_network`
 plans an unsplit network from the pinch outward on the same curves -- one that
 reaches the minimum energy requirement (MER) targets whenever its search finds
-one -- and realizes it as BioSTEAM exchangers, :class:`StreamLifeCycle`
+one, or, with ``stream_splitting=True``, a network with stream splits where a
+side of the pinch needs them -- and realizes it as BioSTEAM exchangers (and
+the splits as :class:`~hensmith.hxn_synthesis.StreamSplit` splitter chains and
+mixers), :class:`StreamLifeCycle`
 records the exchangers each stream ends up passing through, and
 :func:`plot_pinch_diagram` draws the result. All four are usable on their own,
 without a :class:`HeatExchangerNetwork` instance; :doc:`../concepts` explains
@@ -28,6 +31,9 @@ the method.
 .. autoclass:: hensmith.hxn_synthesis.LifeStage
    :no-members:
 
+.. autoclass:: hensmith.hxn_synthesis.StreamSplit
+   :no-members:
+
 .. autofunction:: plot_pinch_diagram
 
 .. note::
@@ -39,6 +45,11 @@ the method.
    stream at a pinch temperature; the synthesis itself plans on the stream
    curves and does not use them) are public in name only: they are not exported
    by ``hensmith``, and are not part of the supported API. Neither are the
-   private modules ``hensmith._curves`` (the stream temperature-enthalpy curves)
-   and ``hensmith._planner`` (the MER planner). Their signatures and behavior
-   may change without notice.
+   private modules ``hensmith._curves`` (the stream temperature-enthalpy curves),
+   ``hensmith._planner`` (the MER planner) and ``hensmith._splitting`` (stream
+   splitting: the split candidates and their theory, in its module docstring).
+   Their signatures and behavior may change without notice.
+   :class:`~hensmith.hxn_synthesis.StreamSplit` and
+   :class:`~hensmith.hxn_synthesis.LifeStage` are not exported by ``hensmith``
+   either; they are documented because synthesis results and life cycles hold
+   them.

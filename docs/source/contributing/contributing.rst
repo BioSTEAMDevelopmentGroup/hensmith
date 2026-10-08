@@ -9,7 +9,7 @@ change has to respect.
 Where the code lives
 --------------------
 
-The library is two public modules under ``hensmith/``, and two private ones
+The library is two public modules under ``hensmith/``, and three private ones
 behind them:
 
 ``hensmith/_heat_exchanger_network.py``
@@ -20,9 +20,9 @@ behind them:
 ``hensmith/hxn_synthesis.py``
     The problem table and pinch analysis (``problem_table``,
     ``ProblemTable``), network synthesis (``synthesize_network``: realizing
-    the planner's network as BioSTEAM exchangers and verifying it on exact
-    stream states), the per-stream bookkeeping of ``StreamLifeCycle``, and
-    ``plot_pinch_diagram``.
+    the planner's network as BioSTEAM exchangers, and its stream splits as
+    splitters and mixers, and verifying it on exact stream states), the
+    per-stream bookkeeping of ``StreamLifeCycle``, and ``plot_pinch_diagram``.
 
 ``hensmith/_curves.py`` (private)
     The piecewise-linear temperature-enthalpy curve of each process stream,
@@ -30,10 +30,17 @@ behind them:
     the synthesis work.
 
 ``hensmith/_planner.py`` (private)
-    The pinch-outward planner of unsplit networks at minimum energy
-    requirement, on numbers only (numpy; no BioSTEAM objects). Its module
-    docstring documents the model, the lemmas the search relies on and its
-    guarantees.
+    The pinch-outward planner of networks at minimum energy requirement,
+    unsplit unless ``stream_splitting`` is on, on numbers only (numpy; no
+    BioSTEAM objects). Its module docstring documents the model, the lemmas
+    the search relies on and its guarantees.
+
+``hensmith/_splitting.py`` (private)
+    Stream splitting for the planner (``stream_splitting=True``): the split
+    candidates of a side that no unsplit network serves at MER, verified cell
+    by cell, on numbers only. Its module docstring holds the theory: the
+    lemmas, the constructions and the proof that a split side always has an
+    MER candidate. Nothing in it runs when the option is off.
 
 ``hensmith/__init__.py`` re-exports the ``__all__`` of the two public modules
 and holds the biosteam registration block described in `The import
@@ -59,9 +66,11 @@ Tests live in ``tests/``:
     78 problems synthesized through the public facility: 40 for which an
     unsplit MER network provably exists, where the network must reach the
     targets, and 38 that provably need stream splits, where it must never
-    beat them; the targets are checked against independent references, and
-    every balance and the exact internal approach of every exchanger are
-    checked in both sets.
+    beat them by default and must reach them with ``stream_splitting=True``,
+    checked on the network's actual stream graph (splitters, mixers, every
+    stream's closure); the targets are checked against independent
+    references, and every balance and the exact internal approach of every
+    exchanger are checked in both sets.
 
 ``tests/test_hxn_regression.py``
     Ten synthetic systems of increasing complexity. For each, the synthesized
@@ -69,7 +78,9 @@ Tests live in ``tests/``:
     requirement targets of the problem table computed on the same streams
     (and must report ``'mer'`` exactly when it reaches them), must keep the
     minimum approach temperature inside every exchanger, and must recover at
-    least as much heat as the utility loads documented in the file.
+    least as much heat as the utility loads documented in the file. Every
+    system is synthesized again with ``stream_splitting=True``, and the
+    three that need stream splits must then reach their targets.
 
 Development environment
 -----------------------
