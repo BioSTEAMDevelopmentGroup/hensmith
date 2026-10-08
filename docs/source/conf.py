@@ -38,9 +38,13 @@ extensions = [
 ]
 
 autosummary_generate = False                          # API pages are hand-written
+# Flag options such as 'undoc-members' are on whenever their key is present,
+# whatever the value (False included), so undocumented members are left out
+# by omitting the key. With it on, a class default such as
+# StreamLifeCycle.splits = () was documented a second time next to its entry
+# in the class's Attributes section, and -W failed on the duplicate.
 autodoc_default_options = {
     'members': True,
-    'undoc-members': False,
     'show-inheritance': True,
 }
 autodoc_member_order = 'bysource'
