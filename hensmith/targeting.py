@@ -14,7 +14,8 @@ composite curves, the multiple-utility targets priced by biosteam
 (`PinchTargets.utility_targets`), the balanced composite curves, and the
 area, units, capital cost and total annualized cost targets
 (`PinchTargets.summary`); `supertarget` sweeps the minimum approach
-temperature for the least total annualized cost. `plot_composite_curves`,
+temperature for the least total annualized cost, and `network_report`
+compares a synthesized network with its targets. `plot_composite_curves`,
 `plot_grand_composite_curve` and `plot_supertargets` draw them.
 """
 import math
@@ -31,7 +32,7 @@ from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
     _contribution_key_level, _names_unit, _owner_chains, _unit_name)
 
-__all__ = ('PinchTargets', 'supertarget', 'Supertargets',
+__all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
            'plot_composite_curves', 'plot_grand_composite_curve',
            'plot_supertargets')
 
@@ -317,12 +318,16 @@ def _utility_films(utilities, h_utilities, agents=()):
     key must name an agent of `utilities`, of `agents` or of biosteam's
     default lists.
     """
-    if h_utilities is None: return [_H_DEFAULT] * len(utilities)
+    return _agent_films([u.agent for u in utilities], h_utilities, agents)
+
+def _agent_films(of, h_utilities, agents=()):
+    """`_utility_films` of the agents `of` (None for an unserved utility)."""
+    if h_utilities is None: return [_H_DEFAULT] * len(of)
     if not isinstance(h_utilities, Mapping):
-        return [_film_value(h_utilities, 'h_utilities')] * len(utilities)
+        return [_film_value(h_utilities, 'h_utilities')] * len(of)
     known = {a.ID for a in (*agents, *bst.HeatUtility.heating_agents,
                             *bst.HeatUtility.cooling_agents)}
-    known.update(u.ID for u in utilities if u.agent is not None)
+    known.update(a.ID for a in of if a is not None)
     values = {} # agent ID -> (key, value)
     unknown = []
     for key, value in h_utilities.items():
@@ -343,8 +348,8 @@ def _utility_films(utilities, h_utilities, agents=()):
     if unknown:
         raise ValueError('h_utilities keys that name no agent: '
                          f"{', '.join(map(repr, unknown))}")
-    return [values[u.ID][1] if u.ID in values else _H_DEFAULT
-            for u in utilities]
+    return [values[a.ID][1] if a is not None and a.ID in values
+            else _H_DEFAULT for a in of]
 
 def _T_at(segments, i, H):
     """Temperature of the segments `i` (see `_composite`) at heat `H`."""
@@ -498,8 +503,9 @@ class PinchTargets:
     (`utility_targets`) priced by biosteam, the balanced composite curves,
     and the targets of area, units, capital cost and total annualized cost
     (`summary`). Build it from heat utilities with `from_heat_utilities` (as
-    `hensmith.hxn_synthesis.synthesize_network` prepares them) or from
-    streams as `problem_table` takes them.
+    `hensmith.hxn_synthesis.synthesize_network` prepares them), from a
+    facility with `HeatExchangerNetwork.targets`, or from streams as
+    `problem_table` takes them.
 
     Parameters
     ----------
@@ -1774,6 +1780,302 @@ class Supertargets:
         return (f'<{type(self).__name__}: {n} point{"s" if n != 1 else ""}, '
                 f'T_min_app {lo:g}-{hi:g} K, optimum {self.T_min_app:.4g} K '
                 f'(TAC {self.optimum["TAC"]:.3e} USD/yr){bound}>')
+
+
+def _profile_area(x, dT, inv_U, ID):
+    """
+    Area [m²] of counter-current heat transfer over the duties `x` [kJ/hr]
+    (ascending) at the driving forces `dT` [K] there, linear in between (each
+    stretch at its log-mean temperature difference), with an overall 1/U of
+    `inv_U` [m²·K/kW]; inf with a RuntimeWarning naming the exchanger `ID`
+    at a driving force of `_DT_ZERO` or less.
+    """
+    if dT.min() <= _DT_ZERO:
+        warn(f'{ID} transfers heat at a driving force of {dT.min():.6g} K',
+             RuntimeWarning)
+        return math.inf
+    d1, d2 = dT[:-1], dT[1:]
+    with np.errstate(divide='ignore', invalid='ignore'):
+        LMTD = np.where(np.abs(d1 - d2) <= 1e-12 * np.maximum(d1, d2), d1,
+                        (d1 - d2) / np.log(d1 / d2))
+    return float(np.sum(np.diff(x) / LMTD)) * inv_U / 3600.
+
+def _stage_profile(curve, H0, sign, f, Q):
+    """
+    ``(knots, T)`` of a stream of `curve` through an exchanger whose duty x
+    runs from 0 to `Q` [kJ/hr] while the stream's enthalpy on the stage
+    (fraction `f` of the whole flow) is ``H0 + sign * x``: the duties in (0,
+    Q) at the breakpoints of the curve, and its temperature [K] at duties.
+    """
+    knots = sign * (f * curve.H - H0)
+    return (knots[(knots > 0.) & (knots < Q)],
+            lambda x: np.interp((H0 + sign * x) / f, curve.H, curve.T))
+
+def _check_targets(HXN, targets):
+    """Raise a ValueError unless `targets` are those of the process
+    streams of `HXN`'s network, in its stream order and current states."""
+    hxs = HXN.original_heat_exchangers
+    units = targets.units
+    if (units is None or len(units) != len(hxs)
+            or any(u is not hx for u, hx in zip(units, hxs))):
+        raise ValueError("targets must be of the network's process streams "
+                         "(the units of HXN.original_heat_exchangers, in that "
+                         'order), as HXN.targets() makes them')
+    if targets.force_ideal_thermo != bool(HXN.force_ideal_thermo):
+        raise ValueError(f'targets have force_ideal_thermo='
+                         f'{targets.force_ideal_thermo}, the network '
+                         f'{bool(HXN.force_ideal_thermo)}')
+    if targets.force_ideal_thermo: return
+    for c, hx in zip(targets.curves, hxs):
+        H_in, H_out = hx.ins[0].H, hx.outs[0].H
+        if (abs(c.H_in - H_in) > 1e-9 * abs(H_in)
+                or abs(c.H_out - H_out) > 1e-6 * abs(c.H_out - c.H_in)):
+            raise ValueError(f'targets are not of the current states of '
+                             f'{_unit_label(hx)} (simulated since?): make '
+                             'them again with HXN.targets()')
+
+def _network_areas(HXN, targets, h, h_utilities, agents):
+    """
+    ``{ID: (area, area_biosteam)}`` [m²] of the process exchangers and then
+    the utility exchangers of `HXN` with duty (see `network_report`), with
+    the film coefficients `h` (an (N,) array) and `h_utilities` (as
+    `PinchTargets.area_target` takes them; `agents`, more agents its keys
+    may name). A furnace takes no area.
+    """
+    curves = targets.curves
+    is_hot = targets.is_hot
+    stages = {} # unit -> [(stream index, life stage)]
+    for lc in HXN.stream_life_cycles:
+        for st in lc.life_cycle:
+            stages.setdefault(st.unit, []).append((lc.index, st))
+    process = [hx for hx in HXN.new_HXs if hx.total_heat_transfer > 1e-12]
+    utility = [hx for hx in HXN.new_HX_utils
+               if hx.heat_utilities and hx.total_heat_transfer > 1e-12]
+    of = [hx.heat_utilities[0].agent for hx in utility]
+    areas = {}
+    for hx in process:
+        (i, si), (j, sj) = stages[hx]
+        if not is_hot[i]: (i, si), (j, sj) = (j, sj), (i, si)
+        # x from the hot inlet (the cold outlet) end
+        Q = si.H_in - si.H_out
+        knots_h, T_h = _stage_profile(curves[i], si.H_in, -1., si.fraction, Q)
+        knots_c, T_c = _stage_profile(curves[j], sj.H_out, -1., sj.fraction, Q)
+        x = np.unique(np.concatenate([[0., Q], knots_h, knots_c]))
+        areas[hx.ID] = (
+            _profile_area(x, T_h(x) - T_c(x), 1. / h[i] + 1. / h[j], hx.ID),
+            hx.design_results.get('Area', 0.) / _FT2_PER_M2)
+    for hx, agent, h_agent in zip(utility, of,
+                                  _agent_films(of, h_utilities, agents)):
+        if agent.isfuel:
+            areas[hx.ID] = (0., 0.)
+            continue
+        (i, si), = stages[hx]
+        hu = hx.heat_utilities[0]
+        # x from the process outlet (the utility inlet) end
+        H_in, H_out = si.H_in, si.H_out
+        heating = H_out > H_in
+        Q = abs(H_out - H_in)
+        knots, T_p = _stage_profile(curves[i], H_out, -1. if heating else 1.,
+                                    si.fraction, Q)
+        x = np.unique(np.concatenate([[0., Q], knots]))
+        T_a, T_b = hu.inlet_utility_stream.T, hu.outlet_utility_stream.T
+        T_u = T_a + (T_b - T_a) * x / Q
+        dT = T_u - T_p(x) if heating else T_p(x) - T_u
+        areas[hx.ID] = (
+            _profile_area(x, dT, 1. / h[i] + 1. / h_agent, hx.ID),
+            hx.design_results.get('Area', 0.) / _FT2_PER_M2)
+    return areas
+
+def network_report(HXN, targets=None, **options):
+    """
+    Compare the heat exchanger network that a `HeatExchangerNetwork`
+    facility synthesized with the targets of its process streams: energy,
+    utilities, number of units, area, capital cost and total annualized cost
+    (TAC) of both, side by side.
+
+    Parameters
+    ----------
+    HXN : HeatExchangerNetwork
+        A simulated facility.
+    targets : PinchTargets, optional
+        Targets of the facility's process streams, as
+        `HeatExchangerNetwork.targets` makes them (the same units in the
+        same order, the same thermodynamic basis and the units' current
+        states). Defaults to ``HXN.targets()``.
+    **options
+        Options of `PinchTargets.summary`. The film coefficients `h` and
+        `h_utilities` and the economics `interest`, `years`,
+        `operating_hours` and `tea` apply to the network and the targets
+        alike (the operating hours default to the system's, if it has them
+        and neither `operating_hours` nor `tea` is given); the agents, `P`,
+        `heat_exchanger_type` and `material` to the targets only (the
+        network keeps biosteam's agents and costs).
+
+    Returns
+    -------
+    dict
+        'T_min_app' and 'targets_T_min_app' [K], of the facility and of the
+        targets; 'status' (``HXN.synthesis_info['status']``); 'applied',
+        whether the network has a process exchanger; 'Q_hot' and 'Q_cold',
+        the heat of the network's heating and cooling utilities [kJ/hr],
+        process side (`HXN.actual_heat_util_load` is utility side);
+        'utilities', ``{agent ID: {'duty', 'utility_duty', 'cost'}}``
+        [kJ/hr, kJ/hr, USD/hr] (duty process side, a magnitude);
+        'utility_cost' [USD/hr]; 'N_units', the exchangers with duty (a
+        furnace included), of which 'N_process_units' and
+        'N_utility_units'; 'area', the network's area like for like with
+        the area target (see Notes) [m²]; 'area_biosteam', the area biosteam
+        sized [m²]; 'exchanger_areas', ``{ID: (area, area_biosteam)}`` of
+        each exchanger with duty [m²]; 'purchase_cost' and 'installed_cost'
+        of all the network's exchangers [USD]; 'annualized_capital_cost',
+        'operating_cost' and 'TAC' [USD/yr], as `PinchTargets.summary`
+        computes them; 'targets', `PinchTargets.summary` of the targets.
+
+    Raises
+    ------
+    RuntimeError
+        If the facility was not simulated.
+    ValueError
+        If `targets` are not those of the facility's process streams in
+        their current states, or for an invalid option.
+    TypeError
+        For an unknown option.
+
+    Notes
+    -----
+    The network's 'area' is sized as the area target is: each exchanger
+    with the film coefficients of its two sides (1 kW/m²/K by default),
+    counter-current (a correction factor of 1), and integrated along the
+    exact temperature profiles of its streams (their curves in the targets)
+    against the process duty; a utility's temperature is linear in the duty
+    between its inlet and outlet, and a furnace takes no area (as fuel in
+    the targets). 'area_biosteam' is biosteam's own sizing: heuristic
+    overall coefficients (0.5 kW/m²/K, but 1 for condensing against
+    boiling, which no film coefficients reproduce), a correction factor for
+    two shells, the log-mean of the terminal temperature differences
+    (which overstates the mean difference along a glide) and the utility
+    duty (the process duty divided by the heat transfer efficiency).
+
+    The capital and utility costs are those of the whole network
+    (`HXN.new_HXs` and `HXN.new_HX_utils`), not the facility's costs,
+    which are the differences from the original exchangers (and zero for
+    a network without process exchangers: the facility then keeps the
+    original exchangers, to which the utility exchangers of the network,
+    reported here, are equivalent).
+
+    The targets are estimates, and the network may beat some of them:
+
+    - the network serves each stream with one agent at its outlet (biosteam's
+      rule: the first agent of the list that can), while the targets place
+      the agents on the grand composite curve, so the network may use other
+      agents than the targets (with Linnhoff & Hindmarsh's problem at
+      10 K, medium pressure steam and chilled water where the targets need
+      only low pressure steam and cooling water);
+    - the area target is a minimum only for equal film coefficients and the
+      same utilities: that problem's network takes 54.06 m² against a target
+      of 59.68 m², with hotter steam and colder coolant;
+    - the units target counts S - 1 per region between zeros of the
+      balanced grand composite curve: a network needs fewer units where a
+      subset of streams balances (6 against 7 in that problem) or where one
+      agent serves a stream the targets split between levels, and more for
+      repeated matches and splits.
+
+    Examples
+    --------
+    The liquids of the second example of `HeatExchangerNetwork` at 10 K,
+    with stream splitting, so that the network reaches the energy targets:
+
+    >>> import biosteam as bst
+    >>> from hensmith import network_report
+    >>> bst.main_flowsheet.set_flowsheet('network_report_example')
+    >>> bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    >>> def process_stream(ID, T_in, T_out, P, **kmol_hr):
+    ...     inlet = bst.Stream(ID + '_in', T=T_in, P=P, phase='l',
+    ...                        units='kmol/hr', **kmol_hr)
+    ...     return bst.HXutility(ID, ins=inlet, T=T_out, rigorous=False)
+    >>> units = [process_stream('H1', 400., 320., 5e5, Water=60.),
+    ...          process_stream('H2', 390., 330., 5e5, Ethanol=30.),
+    ...          process_stream('C1', 310., 410., 5e5, Water=150.),
+    ...          process_stream('H3', 360., 300., 101325., Water=200.)]
+    >>> HXN = bst.HeatExchangerNetwork('HXN', T_min_app=10.,
+    ...                                stream_splitting=True)
+    >>> sys = bst.System.from_units('sys', units=[*units, HXN])
+    >>> sys.simulate()
+    >>> report = network_report(HXN)
+    >>> targets = report['targets']
+    >>> report['status'], report['applied']
+    ('mer', True)
+
+    The network reaches the hot utility target [kW], but serves each stream
+    with one agent at its outlet: medium pressure steam and chilled water,
+    where the targets need mostly low pressure steam and cooling water
+    [USD/hr]:
+
+    >>> round(report['Q_hot'] / 3600, 3), round(targets['Q_hot'] / 3600, 3)
+    (102.821, 102.821)
+    >>> sorted(report['utilities'])
+    ['chilled_water', 'cooling_water', 'medium_pressure_steam']
+    >>> round(report['utility_cost'], 3), round(targets['utility_cost'], 3)
+    (5.496, 3.58)
+
+    With hotter steam and colder coolant, its area [m²] is below the area
+    target (biosteam's own sizing in between), and it needs fewer units than
+    the estimate:
+
+    >>> round(report['area'], 2), round(report['area_biosteam'], 2), round(targets['area'], 2)
+    (50.62, 66.33, 70.3)
+    >>> report['N_units'], targets['N_units']
+    (7, 9)
+    >>> round(report['TAC']), round(targets['TAC'])  # USD/yr
+    (62041, 39396)
+
+    """
+    if not hasattr(HXN, 'new_HXs_hot_side'):
+        raise RuntimeError('simulate the heat exchanger network before '
+                           'reporting on it')
+    if targets is None: targets = HXN.targets()
+    else: _check_targets(HXN, targets)
+    options = dict(options)
+    if options.get('operating_hours') is None and options.get('tea') is None:
+        hours = getattr(getattr(HXN, 'system', None), 'operating_hours', None)
+        if hours is not None: options['operating_hours'] = hours
+    options = targets._check_options(options)
+    get = options.get
+    crf, hours = _economics(get('interest'), get('years'),
+                            get('operating_hours'), get('tea'))
+    areas = _network_areas(
+        HXN, targets, targets._film_coefficients(get('h')),
+        get('h_utilities'),
+        [*(get('heating_agents') or ()), *(get('cooling_agents') or ())])
+    process = [hx for hx in HXN.new_HXs if hx.ID in areas]
+    utility = [hx for hx in HXN.new_HX_utils if hx.ID in areas]
+    hus = [hu for hx in utility for hu in hx.heat_utilities if hu.agent]
+    utilities = {}
+    for ID, group in bst.HeatUtility.heat_utilities_by_agent(hus).items():
+        utilities[ID] = {'duty': abs(sum([hu.unit_duty for hu in group])),
+                         'utility_duty': abs(sum([hu.duty for hu in group])),
+                         'cost': sum([hu.cost for hu in group])}
+    utility_cost = sum([hu.cost for hu in hus], 0.)
+    exchangers = HXN.new_HXs + HXN.new_HX_utils
+    installed = sum([hx.installed_cost for hx in exchangers], 0.)
+    annualized = crf * installed
+    operating = hours * utility_cost
+    return {
+        'T_min_app': HXN.T_min_app, 'targets_T_min_app': targets.T_min_app,
+        'status': HXN.synthesis_info['status'], 'applied': bool(HXN.new_HXs),
+        'Q_hot': sum([hu.unit_duty for hu in hus if hu.unit_duty > 0.], 0.),
+        'Q_cold': -sum([hu.unit_duty for hu in hus if hu.unit_duty < 0.], 0.),
+        'utilities': utilities, 'utility_cost': utility_cost,
+        'N_units': len(process) + len(utility),
+        'N_process_units': len(process), 'N_utility_units': len(utility),
+        'area': sum([a for a, _ in areas.values()], 0.),
+        'area_biosteam': sum([a for _, a in areas.values()], 0.),
+        'exchanger_areas': areas,
+        'purchase_cost': sum([hx.purchase_cost for hx in exchangers], 0.),
+        'installed_cost': installed, 'annualized_capital_cost': annualized,
+        'operating_cost': operating, 'TAC': annualized + operating,
+        'targets': targets.summary(**options),
+    }
 
 
 def plot_composite_curves(targets, kind='real', utilities=None, ax=None,

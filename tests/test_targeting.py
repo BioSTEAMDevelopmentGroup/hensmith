@@ -21,7 +21,12 @@ C. Supertargets: the area target against closed forms and an independent
    integration, the units target on references with process and utility
    pinches, the capital costs against biosteam's own costing, the
    economics, and the sweep against a closed-form optimum.
-D. Plots: stable gids whose data equal the curves.
+D. The facility and the report: the facility's targets equal the
+   synthesis's bit for bit (before and after a simulation, with approach
+   contributions and with replaced heat utilities), the report's areas
+   against terminal log-mean temperature differences, and no side effects
+   on the flowsheet, the agents' stream dumps or a later synthesis.
+E. Plots: stable gids whose data equal the curves.
 
 Reference A: H1 400 -> 300 K and C1 330 -> 440 K, both 1 kW/K, at
 T_min_app = 10 K: 50 kW hot and 40 kW cold utility, shifted pinch 390 K.
@@ -35,11 +40,13 @@ import numpy as np
 import pytest
 import biosteam as bst
 from numpy.testing import assert_allclose
-from hensmith import (PinchTargets, Supertargets, supertarget, plot_composite_curves,
-                      plot_grand_composite_curve, plot_supertargets)
+from hensmith import (HeatExchangerNetwork, PinchTargets, Supertargets, supertarget,
+                      network_report, plot_composite_curves, plot_grand_composite_curve,
+                      plot_supertargets)
 from hensmith.hxn_synthesis import _problem_table, temperature_interval_pinch_analysis
-from hensmith.targeting import _exchanger_costs, _economics
-from test_hxn import build_system, cp_units, KEMP, simulate_HXN, _gid_artists
+from hensmith.targeting import _exchanger_costs, _economics, _profile_area
+from test_hxn import (build_system, cp_units, KEMP, simulate_HXN, simulate_strictly,
+                      _gid_artists)
 from test_hxn_contributions import classic_cascade
 import test_hxn_targets
 
@@ -207,6 +214,14 @@ def kemp_hxn():
     """KEMP synthesized by the facility at 10 K."""
     units = cp_units('test_targeting_kemp_hxn', KEMP, K)
     sys, HXN = simulate_HXN(units, 10.)
+    return units, HXN
+
+@pytest.fixture(scope='module')
+def kemp_hxn_replaced():
+    """KEMP synthesized by the facility at 10 K, replacing the units' heat
+    utilities."""
+    units = cp_units('test_targeting_kemp_hxn_replaced', KEMP, K)
+    sys, HXN = simulate_HXN(units, 10., replace_unit_heat_utilities=True)
     return units, HXN
 
 @pytest.fixture(scope='module')
@@ -880,6 +895,201 @@ def test_sweep(monkeypatch):
     with pytest.raises(ValueError, match='> 0 K with approach contributions'):
         supertarget(partial, [0., 5.])
     assert np.ptp(supertarget(partial, [5., 20.], refine=0)['Q_hot']) > 0.
+
+# %% Facility and report
+
+def terminal_area(hx):
+    """Area [m2] of an exchanger of constant heat capacity streams from its
+    terminal temperatures, with U = 0.5 kW/m2/K and the process duty."""
+    if isinstance(hx, bst.HXprocess):
+        hot = 0 if hx.ins[0].H > hx.outs[0].H else 1
+        hi, ho = hx.ins[hot], hx.outs[hot]
+        ci, co = hx.ins[1 - hot], hx.outs[1 - hot]
+        Q = hi.H - ho.H
+        d1, d2 = hi.T - co.T, ho.T - ci.T
+    else:
+        hu = hx.heat_utilities[0]
+        pi, po = hx.ins[0], hx.outs[0]
+        ui, uo = hu.inlet_utility_stream.T, hu.outlet_utility_stream.T
+        Q = abs(po.H - pi.H)
+        if po.H > pi.H: d1, d2 = ui - po.T, uo - pi.T
+        else: d1, d2 = po.T - ui, pi.T - uo
+    LMTD = d1 if abs(d1 - d2) < 1e-9 else (d1 - d2) / math.log(d1 / d2)
+    return Q / kW / (0.5 * LMTD)
+
+def test_facility_targets_bitwise(kemp_hxn, kemp_hxn_replaced):
+    def assert_synthesis_targets(t, HXN):
+        info = HXN.synthesis_info
+        assert (t.Q_hot, t.Q_cold) == (info['Q_hot_target'], info['Q_cold_target'])
+    for k, contributions in enumerate((None, {'C1': 2.})):
+        units = cp_units(f'test_targeting_facility_{k}', KEMP, K)
+        HXN = HeatExchangerNetwork('HXN', T_min_app=10., units=units,
+                                   approach_contributions=contributions)
+        before = HXN.targets() # from the units' heat utilities
+        sys = bst.System.from_units('sys', units=[*units, HXN])
+        simulate_strictly(sys)
+        after = HXN.targets() # from the network's process streams
+        for t in (before, after):
+            assert_synthesis_targets(t, HXN)
+            assert t.labels == ['C1', 'C3', 'H2', 'H4']
+            assert t.T_min_app == 10. and t.force_ideal_thermo is False
+            assert t.approach_contributions == (None if contributions is None
+                                                else (2., None, None, None))
+        assert all(u is hx for u, hx in zip(after.units, HXN.original_heat_exchangers))
+        assert all(a is b for a, b in zip(after.heat_utilities, HXN.original_heat_utils))
+        # another minimum approach temperature (the facility's is unchanged)
+        assert HXN.targets(20.).Q_hot == after.at(20.).Q_hot != after.Q_hot
+        assert HXN.T_min_app == 10.
+    assert_synthesis_targets(kemp_hxn[1].targets(), kemp_hxn[1])
+    # the units' heat utilities now carry the network's (H2 and C3 are served
+    # by process exchangers alone), but the targets are those of the
+    # original streams
+    units, HXN = kemp_hxn_replaced
+    assert sorted(u.ID for u in units if not u.heat_utilities[0].duty) == ['C3', 'H2']
+    t = HXN.targets()
+    assert_synthesis_targets(t, HXN)
+    assert t.labels == ['C1', 'C3', 'H2', 'H4']
+    with pytest.raises(RuntimeError, match='before targeting'):
+        HeatExchangerNetwork('test_targeting_alone').targets()
+
+#: Keys of `network_report`.
+REPORT_KEYS = ['T_min_app', 'targets_T_min_app', 'status', 'applied', 'Q_hot', 'Q_cold',
+               'utilities', 'utility_cost', 'N_units', 'N_process_units', 'N_utility_units',
+               'area', 'area_biosteam', 'exchanger_areas', 'purchase_cost', 'installed_cost',
+               'annualized_capital_cost', 'operating_cost', 'TAC', 'targets']
+
+def test_network_report(kemp_hxn):
+    units, HXN = kemp_hxn
+    report = network_report(HXN)
+    assert list(report) == REPORT_KEYS
+    assert report['applied'] is True and report['status'] == 'mer'
+    assert report['T_min_app'] == report['targets_T_min_app'] == 10.
+    exchangers = HXN.new_HXs + HXN.new_HX_utils
+    assert report['installed_cost'] == pytest.approx(
+        sum(hx.installed_cost for hx in exchangers), rel=1e-12)
+    assert report['purchase_cost'] == pytest.approx(
+        sum(hx.purchase_cost for hx in exchangers), rel=1e-12)
+    sized = [hx for hx in exchangers if 'Area' in hx.design_results]
+    assert report['area_biosteam'] == pytest.approx(
+        sum(hx.design_results['Area'] for hx in sized) / 10.763, rel=1e-12)
+    # like-for-like areas: the medium pressure steam heater (efficiency 0.9)
+    # is sized on the process duty
+    areas = report['exchanger_areas']
+    assert sorted(areas) == sorted(hx.ID for hx in sized)
+    for hx in sized:
+        assert areas[hx.ID][0] == pytest.approx(terminal_area(hx), rel=1e-9), hx.ID
+    MP = [hx for hx in HXN.new_HX_utils if hx.ID in areas
+          and hx.heat_utilities[0].agent.ID == 'medium_pressure_steam']
+    assert len(MP) == 1 and MP[0].heat_utilities[0].duty == pytest.approx(72000. / 0.9)
+    assert round(report['area'], 2) == 54.06
+    assert report['area'] < report['targets']['area']
+    # the network has fewer units than the estimate (H2 and C3 balance)
+    assert (report['N_units'], report['N_process_units'], report['N_utility_units']) == (6, 4, 2)
+    assert report['targets']['N_units'] == 7
+    assert report['Q_hot'] >= report['targets']['Q_hot'] * (1 - 1e-9)
+    assert report['Q_hot'] == pytest.approx(20 * kW, rel=1e-9)
+    assert report['Q_cold'] == pytest.approx(60 * kW, rel=1e-9)
+    assert sorted(report['utilities']) == ['chilled_water', 'medium_pressure_steam']
+    steam = report['utilities']['medium_pressure_steam']
+    assert steam['duty'] == pytest.approx(20 * kW) and steam['utility_duty'] == pytest.approx(20 * kW / 0.9)
+    assert report['utility_cost'] == pytest.approx(
+        sum(u['cost'] for u in report['utilities'].values()), rel=1e-12)
+    assert report['utility_cost'] > report['targets']['utility_cost']
+    crf = _economics()[0]
+    assert report['annualized_capital_cost'] == crf * report['installed_cost']
+    assert report['operating_cost'] == 8000. * report['utility_cost']
+    assert report['TAC'] == report['annualized_capital_cost'] + report['operating_cost']
+    assert report['targets'] == HXN.targets().summary()
+    # options: film coefficients and the system's operating hours
+    halved = network_report(HXN, h=2., h_utilities=2.)
+    assert halved['area'] == pytest.approx(report['area'] / 2, rel=1e-12)
+    assert halved['targets']['area'] == pytest.approx(report['targets']['area'] / 2, rel=1e-12)
+    HXN.system.operating_hours = 4000.
+    try:
+        hours = network_report(HXN)
+        assert hours['operating_cost'] == 4000. * report['utility_cost']
+        assert hours['targets']['operating_cost'] == 4000. * report['targets']['utility_cost']
+        assert network_report(HXN, operating_hours=100.)['operating_cost'] == (
+            100. * report['utility_cost'])
+    finally:
+        HXN.system.operating_hours = None
+    with pytest.raises(TypeError, match='unexpected options'):
+        network_report(HXN, hours=1.)
+    with pytest.raises(RuntimeError, match='simulate the heat exchanger network'):
+        network_report(HeatExchangerNetwork('test_targeting_report_alone'))
+    # targets of the same streams in the facility's stream order (KEMP's own
+    # order arranges like the facility's), and of other ones
+    hus = [u.heat_utilities[0] for u in units]
+    same = PinchTargets.from_heat_utilities(hus, 10.)
+    assert network_report(HXN, same)['targets'] == report['targets']
+    with pytest.raises(ValueError, match="of the network's process streams"):
+        network_report(HXN, PinchTargets.from_heat_utilities(hus[::-1], 10.))
+    with pytest.raises(ValueError, match='force_ideal_thermo'):
+        network_report(HXN, PinchTargets.from_heat_utilities(hus, 10., force_ideal_thermo=True))
+    inlet = HXN.original_heat_exchangers[0].ins[0]
+    T = inlet.T
+    try: # a stale state
+        inlet.T = T + 1.
+        with pytest.raises(ValueError, match='current states'):
+            network_report(HXN, same)
+    finally:
+        inlet.T = T
+    assert network_report(HXN, same)['targets'] == report['targets']
+    # no process match: the report describes the utility exchangers
+    rows = [('H1', 320., 300., 1.), ('C1', 330., 340., 1.)]
+    _, alone = simulate_HXN(cp_units('test_targeting_report_utilities', rows), 10.)
+    report = network_report(alone)
+    assert report['applied'] is False and alone.installed_costs['Heat exchangers'] == 0.
+    assert (report['N_units'], report['N_process_units']) == (2, 0)
+    for hx in alone.new_HX_utils:
+        assert report['exchanger_areas'][hx.ID][0] == pytest.approx(terminal_area(hx), rel=1e-9)
+    assert report['installed_cost'] == sum(hx.installed_cost for hx in alone.new_HX_utils) > 0.
+    # a zero (or crossed) driving force
+    with pytest.warns(RuntimeWarning, match='HX transfers heat at a driving force of 0 K'):
+        assert _profile_area(np.array([0., 1.]), np.array([5., 0.]), 2., 'HX') == math.inf
+    assert _profile_area(np.array([0., kW]), np.array([5., 5.]), 2., 'HX') == 2. / 5.
+
+def test_no_side_effects(kemp_hxn):
+    units, HXN = kemp_hxn
+    # the furnace case of test_capital_target_formula: the network heats C1
+    # in a furnace
+    _, furnace_HXN = simulate_HXN(cp_units('test_targeting_side_effects', FURNACE), 10.)
+    report = network_report(furnace_HXN)
+    assert 'natural_gas' in report['utilities']
+    furnace = [hx.ID for hx in furnace_HXN.new_HX_utils
+               if hx.heat_utilities and hx.heat_utilities[0].agent
+               and hx.heat_utilities[0].agent.isfuel]
+    assert len(furnace) == 1 and report['exchanger_areas'][furnace[0]] == (0., 0.)
+    gas = agent('natural_gas')
+    def furnace_cost():
+        # priced with the agent's own stream dump (on which it leaves its
+        # streams), in a temporary flowsheet
+        with bst.Flowsheet('test_targeting_furnace_cost'):
+            hu = bst.HeatUtility()
+            hu(10 * kW, 450., 500., agent=gas)
+            cost = hu.cost
+            hu.empty()
+        return cost
+    furnace_cost()
+    before = furnace_cost()
+    facilities = (HXN, furnace_HXN)
+    Q = [[float(hx.Q).hex() for hx in facility.new_HXs] for facility in facilities]
+    agents = bst.HeatUtility.heating_agents + bst.HeatUtility.cooling_agents
+    dumps = [(a.utility_stream_dump, list(a.utility_stream_dump)) for a in agents]
+    registered = lambda: {ID: id(s) for ID, s in bst.main_flowsheet.stream.data.items()}
+    registry = registered()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        for facility in facilities:
+            facility.targets().summary()
+            network_report(facility)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert registered() == registry
+    for a, (dump, items) in zip(agents, dumps):
+        assert a.utility_stream_dump is dump and a.utility_stream_dump == items
+    assert furnace_cost() == before
+    for facility in facilities: simulate_strictly(facility.system)
+    assert [[float(hx.Q).hex() for hx in facility.new_HXs] for facility in facilities] == Q
 
 # %% Plots
 

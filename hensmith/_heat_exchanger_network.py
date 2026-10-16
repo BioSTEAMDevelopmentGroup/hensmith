@@ -954,6 +954,104 @@ class HeatExchangerNetwork(bst.Facility):
             file=file, **kwargs,
         )
 
+    def targets(self, T_min_app=None):
+        """
+        The pinch analysis targets of the facility's process streams (see
+        `hensmith.targeting.PinchTargets`): energy, utilities, area, units,
+        capital and total annualized cost.
+
+        Parameters
+        ----------
+        T_min_app : float, optional
+            Minimum approach temperature [K]. Defaults to the facility's
+            `T_min_app`.
+
+        Returns
+        -------
+        PinchTargets
+            The targets, with the facility's `approach_contributions` and
+            `force_ideal_thermo`.
+
+        Raises
+        ------
+        RuntimeError
+            If the facility has neither `units` nor a system (it learns its
+            system when the system is first simulated).
+
+        Notes
+        -----
+        After a simulation, the streams are those of
+        `original_heat_exchangers`, in the network's stream order, at the
+        units' current states: right after a synthesis, the energy targets
+        at the facility's `T_min_app` equal ``synthesis_info['Q_hot_target']``
+        and ``synthesis_info['Q_cold_target']`` bit for bit. The approach
+        contributions are resolved against `original_heat_utils` (the
+        original heat utilities, kept even where
+        `replace_unit_heat_utilities` overwrote them). Before any
+        simulation, the streams are those of the heat utilities the next
+        simulation would take, prepared as the synthesis prepares them.
+        Nothing is stored: with `cache_network`, the targets follow the
+        units' current states, not those of the network's synthesis.
+
+        Examples
+        --------
+        The liquids of the second example of the class at 10 K (whose
+        unsplit network falls short of the energy targets):
+
+        >>> import biosteam as bst
+        >>> bst.main_flowsheet.set_flowsheet('HXN_targets_example')
+        >>> bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+        >>> def process_stream(ID, T_in, T_out, P, **kmol_hr):
+        ...     inlet = bst.Stream(ID + '_in', T=T_in, P=P, phase='l',
+        ...                        units='kmol/hr', **kmol_hr)
+        ...     return bst.HXutility(ID, ins=inlet, T=T_out, rigorous=False)
+        >>> units = [process_stream('H1', 400., 320., 5e5, Water=60.),
+        ...          process_stream('H2', 390., 330., 5e5, Ethanol=30.),
+        ...          process_stream('C1', 310., 410., 5e5, Water=150.),
+        ...          process_stream('H3', 360., 300., 101325., Water=200.)]
+        >>> HXN = bst.HeatExchangerNetwork('HXN', T_min_app=10.)
+        >>> sys = bst.System.from_units('sys', units=[*units, HXN])
+        >>> sys.simulate()
+        >>> HXN.synthesis_info['status']
+        'best_effort'
+
+        The targets [kW] are the synthesis's own, bit for bit:
+
+        >>> targets = HXN.targets()
+        >>> targets.labels
+        ['C1', 'H3', 'H1', 'H2']
+        >>> round(targets.Q_hot / 3600, 3), round(targets.Q_cold / 3600, 3)
+        (102.821, 209.035)
+        >>> info = HXN.synthesis_info
+        >>> targets.Q_hot == info['Q_hot_target'], targets.Q_cold == info['Q_cold_target']
+        (True, True)
+
+        At another minimum approach temperature:
+
+        >>> HXN.targets(20.)
+        <PinchTargets: 4 streams, T_min_app = 20 K, Q_hot = 4.834e+05 kJ/hr, Q_cold = 8.658e+05 kJ/hr>
+
+        """
+        from .targeting import PinchTargets
+        if T_min_app is None: T_min_app = self.T_min_app
+        if (hasattr(self, 'original_heat_exchangers')
+                and hasattr(self, 'original_heat_utils')):
+            hxs = self.original_heat_exchangers
+            hus = self.original_heat_utils # in stream order
+            cold = set(self.cold_indices)
+            return PinchTargets._from_exchangers(
+                hxs, [i not in cold for i in range(len(hxs))], T_min_app,
+                self._network_contributions(hus), self.force_ideal_thermo,
+                None, hus)
+        if self.system is None and not self.units:
+            raise RuntimeError('simulate the system (or give the facility its '
+                               'units) before targeting')
+        hx_utils = self._get_original_heat_utilties()
+        hx_utils.sort(key=lambda x: x.duty) # as `_cost` sorts them
+        return PinchTargets.from_heat_utilities(
+            hx_utils, T_min_app, self._network_contributions(hx_utils),
+            self.force_ideal_thermo, self.sort_hus_by_T)
+
     def get_original_hxs_associated_with_streams(self): # pragma: no cover
         original_units = self.system.units
         original_heat_utils = self.original_heat_utils
