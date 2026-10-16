@@ -11,29 +11,62 @@ Targeting: what any heat exchanger network of a set of process streams can
 achieve, before (or instead of) synthesizing one. `PinchTargets` holds the
 problem table of the streams and derives from it the composite and grand
 composite curves, the multiple-utility targets priced by biosteam
-(`PinchTargets.utility_targets`) and the balanced composite curves;
-`plot_composite_curves` and `plot_grand_composite_curve` draw them.
+(`PinchTargets.utility_targets`), the balanced composite curves, and the
+area, units, capital cost and total annualized cost targets
+(`PinchTargets.summary`); `supertarget` sweeps the minimum approach
+temperature for the least total annualized cost. `plot_composite_curves`,
+`plot_grand_composite_curve` and `plot_supertargets` draw them.
 """
 import math
 from collections import namedtuple
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from numbers import Integral, Real
 from warnings import warn
 import numpy as np
 import biosteam as bst
 from ._curves import _T_EQ
 from ._planner import _approach_contributions, _contribution_value
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
-    _arrange_heat_utilities, _process_streams, _explicit_contributions)
+    _arrange_heat_utilities, _process_streams, _explicit_contributions,
+    _contribution_key_level, _names_unit, _owner_chains, _unit_name)
 
-__all__ = ('PinchTargets', 'plot_composite_curves',
-           'plot_grand_composite_curve')
+__all__ = ('PinchTargets', 'supertarget', 'Supertargets',
+           'plot_composite_curves', 'plot_grand_composite_curve',
+           'plot_supertargets')
 
 #: Kinds of the constraint positions of the grand composite curve (see
 #: `_positions`): the heat arriving at a grid temperature (before its point
 #: loads), the heat leaving it (after them), and the heat just above and
 #: just below a utility level strictly between two grid temperatures.
 _ARRIVING, _LEAVING, _ABOVE, _BELOW = 0, 1, 2, 3
+
+#: Square feet per square meter, biosteam's own factor in `HX._design`.
+_FT2_PER_M2 = 10.763
+
+#: Default film coefficient [kW/m²/K]. A pair gives U = 0.5, biosteam's
+#: heuristic overall heat transfer coefficient (except condensing against
+#: boiling).
+_H_DEFAULT = 1.0
+
+#: Btu per kJ, biosteam's factor in `HX._cost` (furnace).
+_BTU_PER_KJ = 0.947817
+
+#: Default economics: interest rate, years of annualization and operating
+#: hours per year (a capital recovery factor of 0.16275).
+_INTEREST, _YEARS, _OPERATING_HOURS = 0.10, 10, 8000.
+
+#: Default minimum approach temperatures of `supertarget` [K].
+_T_MIN_APPS = np.arange(1., 41.)
+
+#: A vertical temperature difference at or below this is a zero driving
+#: force [K].
+_DT_ZERO = 1e-9
+
+#: The options of `PinchTargets.summary` (and `supertarget`).
+_SUMMARY_OPTIONS = ('heating_agents', 'cooling_agents', 'h', 'h_utilities',
+                    'P', 'heat_exchanger_type', 'material', 'interest',
+                    'years', 'operating_hours', 'tea')
 
 UtilityTarget = namedtuple('UtilityTarget', (
     'ID', 'agent', 'heating', 'level', 'duty', 'utility_duty', 'flow', 'cost',
@@ -255,14 +288,216 @@ def _utility_member(u):
     return (np.array([T_a, T_b]), np.array([0., u.duty]),
             np.array([0., u.duty]))
 
+def _euler(regions):
+    """Euler's S - 1 per connected component of the members of `regions`
+    (sets; members of one region are connected)."""
+    components = []
+    for members in regions:
+        if not members: continue
+        component = set(members)
+        for other in [c for c in components if c & component]:
+            component |= other
+            components.remove(other)
+        components.append(component)
+    return sum(len(c) - 1 for c in components)
+
+def _film_value(x, label):
+    """A film coefficient [kW/m²/K]: ``float(x)`` for a finite real number
+    > 0 (not a bool); a ValueError naming `label` otherwise."""
+    if isinstance(x, Real) and not isinstance(x, (bool, np.bool_)):
+        value = float(x)
+        if math.isfinite(value) and value > 0.: return value
+    raise ValueError(f'{label} must be a finite number > 0 kW/m2/K, not {x!r}')
+
+def _utility_films(utilities, h_utilities, agents=()):
+    """
+    The film coefficient [kW/m²/K] of each of `utilities` from
+    `h_utilities`: None (`_H_DEFAULT`), a number, or a mapping from agent
+    IDs or agents to numbers (`_H_DEFAULT` for an agent it leaves out). A
+    key must name an agent of `utilities`, of `agents` or of biosteam's
+    default lists.
+    """
+    if h_utilities is None: return [_H_DEFAULT] * len(utilities)
+    if not isinstance(h_utilities, Mapping):
+        return [_film_value(h_utilities, 'h_utilities')] * len(utilities)
+    known = {a.ID for a in (*agents, *bst.HeatUtility.heating_agents,
+                            *bst.HeatUtility.cooling_agents)}
+    known.update(u.ID for u in utilities if u.agent is not None)
+    values = {} # agent ID -> (key, value)
+    unknown = []
+    for key, value in h_utilities.items():
+        if isinstance(key, bst.UtilityAgent): ID = key.ID
+        elif isinstance(key, str): ID = key
+        else:
+            raise TypeError('h_utilities keys must be agent IDs (str) or '
+                            f'UtilityAgent objects, not {type(key).__name__!r} '
+                            f'({key!r})')
+        value = _film_value(value, f'h_utilities of key {key!r}')
+        if ID not in known and not isinstance(key, bst.UtilityAgent):
+            unknown.append(key)
+        other, other_value = values.setdefault(ID, (key, value))
+        if other_value != value:
+            raise ValueError(f'h_utilities keys {other!r} and {key!r} give agent '
+                             f'{ID!r} different values: {other_value!r} and '
+                             f'{value!r}')
+    if unknown:
+        raise ValueError('h_utilities keys that name no agent: '
+                         f"{', '.join(map(repr, unknown))}")
+    return [values[u.ID][1] if u.ID in values else _H_DEFAULT
+            for u in utilities]
+
+def _T_at(segments, i, H):
+    """Temperature of the segments `i` (see `_composite`) at heat `H`."""
+    Ha, Hb, Ta, Tb = (x[i] for x in segments[:4])
+    with np.errstate(invalid='ignore'): # inf - inf on a furnace's flat
+        T = Ta + (Tb - Ta) * (H - Ha) / (Hb - Ha)
+    return np.where(Ta == Tb, Ta, T)
+
+def _bath(hot, cold):
+    """
+    Area [m²] of vertical heat transfer between the `hot` and `cold`
+    segments (`_composite`, weighted by 1/h [m²·K/kW]): Bath's formula,
+    exact on the stretches between the breakpoints of both curves, where
+    both and every member are linear. A hot stretch at infinite temperature
+    (fuel) takes no area. inf with a RuntimeWarning at a driving force of
+    `_DT_ZERO` or less.
+    """
+    if not (hot[0].size and cold[0].size): return 0.
+    end = min(hot[1][-1], cold[1][-1])
+    X = np.unique(np.concatenate([hot[0], hot[1], cold[0], cold[1]]))
+    X = X[(X >= 0.) & (X <= end)]
+    x, y = X[:-1], X[1:]
+    keep = y - x > 1e-12 * end
+    x, y = x[keep], y[keep]
+    m = 0.5 * (x + y)
+    i = np.searchsorted(hot[0], m, 'right') - 1
+    j = np.searchsorted(cold[0], m, 'right') - 1
+    Th_x, Th_y = _T_at(hot, i, x), _T_at(hot, i, y)
+    finite = np.isfinite(Th_x) # not fuel
+    x, y, i, j = x[finite], y[finite], i[finite], j[finite]
+    d1 = Th_x[finite] - _T_at(cold, j, x)
+    d2 = Th_y[finite] - _T_at(cold, j, y)
+    zero = np.flatnonzero(np.minimum(d1, d2) <= _DT_ZERO)
+    if zero.size:
+        k = zero[0]
+        warn('vertical heat transfer at zero driving force between H = '
+             f'{x[k]:.6g} and {y[k]:.6g} kJ/hr', RuntimeWarning)
+        return math.inf
+    with np.errstate(divide='ignore', invalid='ignore'):
+        LMTD = np.where(np.abs(d1 - d2) <= 1e-12 * np.maximum(d1, d2), d1,
+                        (d1 - d2) / np.log(d1 / d2))
+    return float(np.sum((y - x) * (hot[4][i] + cold[4][j]) / 3600. / LMTD))
+
+def _check_exchanger(heat_exchanger_type, material):
+    """Raise a ValueError unless biosteam knows the shell and tube
+    `heat_exchanger_type` and `material`."""
+    from biosteam.units.heat_exchange import Cb_dict
+    from biosteam.units.design_tools.specification_factors import (
+        shell_and_tube_material_factor_coefficients as materials)
+    types = [i for i in Cb_dict if i != 'Furnace']
+    if heat_exchanger_type not in types:
+        raise ValueError(f'heat_exchanger_type must be one of {types}, not '
+                         f'{heat_exchanger_type!r}')
+    if material not in materials:
+        raise ValueError(f'material must be one of {list(materials)}, not '
+                         f'{material!r}')
+
+def _exchanger_costs(A, P=101325., heat_exchanger_type='Floating head',
+                     material='Carbon steel/carbon steel'):
+    """
+    ``(purchase, installed, type)`` [USD] of one heat exchanger of area `A`
+    [ft²] at pressure `P` [Pa], as biosteam's `HX._cost` and
+    `Unit._load_costs` cost it: a double pipe below 150 ft², else a shell
+    and tube of `heat_exchanger_type` and `material` with 20 ft tubes.
+    ``(inf, inf, None)`` for an infinite area (or one beyond the
+    correlations), ``(nan, nan, None)`` for nan.
+    """
+    from biosteam.units.heat_exchange import (
+        Cb_dict, p2, compute_double_pipe_purchase_cost)
+    from biosteam.units.design_tools.specification_factors import (
+        compute_shell_and_tube_material_factor,
+        shell_and_tube_material_factor_coefficients)
+    _check_exchanger(heat_exchanger_type, material)
+    if math.isnan(A): return math.nan, math.nan, None
+    if math.isinf(A): return math.inf, math.inf, None
+    P_psi = P * 14.7 / 101325
+    L = 20 # ft, as biosteam assumes
+    try:
+        if A < 150: # double pipe
+            p = P_psi / 600
+            F_p = 0.8510 + 0.1292 * p + 0.0198 * p**2
+            F_m = 2
+            if A < 2.1718:
+                F_l = A / 2.1718
+                A = 2.1718
+            else:
+                F_l = 1
+            kind = 'Double pipe'
+            C_b = compute_double_pipe_purchase_cost(A, bst.CE)
+        else: # shell and tube
+            F_m = compute_shell_and_tube_material_factor(
+                A, *shell_and_tube_material_factor_coefficients[material])
+            F_l = np.polyval(p2, L) # L == 20 is not > 20 in biosteam
+            p = P_psi / 100
+            F_p = 0.9803 + 0.018 * p + 0.0017 * p**2
+            kind = heat_exchanger_type
+            C_b = Cb_dict[kind](A, bst.CE)
+    except OverflowError:
+        return math.inf, math.inf, None
+    F = F_l * F_p * F_m
+    return C_b * F, C_b * (bst.HX._F_BM_default[kind] + F - 1.), kind
+
+def _furnace_costs(Q):
+    """``(purchase, installed)`` [USD] of a furnace of utility duty `Q`
+    [kJ/hr], as biosteam's `HX._cost` costs it (500 psi)."""
+    from biosteam.units.heat_exchange import compute_furnace_purchase_cost
+    C_b = compute_furnace_purchase_cost(Q * _BTU_PER_KJ, bst.CE)
+    S = 500 / 500
+    F_P = 0.986 - 0.0035 * S + 0.0175 * S * S
+    return C_b * F_P, C_b * (bst.HX._F_BM_default['Furnace'] + F_P - 1.)
+
+def _real(x, name):
+    """``float(x)`` of a finite real number (not a bool); a ValueError
+    naming `name` otherwise."""
+    if isinstance(x, Real) and not isinstance(x, (bool, np.bool_)):
+        value = float(x)
+        if math.isfinite(value): return value
+    raise ValueError(f'{name} must be a finite number, not {x!r}')
+
+def _economics(interest=None, years=None, operating_hours=None, tea=None):
+    """
+    ``(crf, hours)``: the capital recovery factor [1/yr] and the operating
+    hours per year. Each keyword takes precedence over `tea` (its `IRR`,
+    ``duration[1] - duration[0]`` and `operating_hours`, unless None), which
+    takes precedence over the defaults.
+    """
+    if tea is not None:
+        if interest is None: interest = tea.IRR
+        if years is None: years = tea.duration[1] - tea.duration[0]
+        if operating_hours is None: operating_hours = tea.operating_hours
+    interest = _real(_INTEREST if interest is None else interest, 'interest')
+    years = _real(_YEARS if years is None else years, 'years')
+    hours = _real(_OPERATING_HOURS if operating_hours is None
+                  else operating_hours, 'operating_hours')
+    if interest <= -1.:
+        raise ValueError(f'interest must be > -1, not {interest!r}')
+    if years <= 0.:
+        raise ValueError(f'years must be > 0, not {years!r}')
+    if hours < 0.:
+        raise ValueError(f'operating_hours must be >= 0, not {hours!r}')
+    if interest == 0.: return 1. / years, hours
+    fn = (1. + interest) ** years
+    return interest * fn / (fn - 1.), hours
+
 
 class PinchTargets:
     """
     Pinch analysis targets of a set of process streams: the problem table
     (`hensmith.hxn_synthesis.problem_table`) and what follows from it, the
     composite and grand composite curves, the targets of several utilities
-    (`utility_targets`) priced by biosteam, and the balanced composite
-    curves. Build it from heat utilities with `from_heat_utilities` (as
+    (`utility_targets`) priced by biosteam, the balanced composite curves,
+    and the targets of area, units, capital cost and total annualized cost
+    (`summary`). Build it from heat utilities with `from_heat_utilities` (as
     `hensmith.hxn_synthesis.synthesize_network` prepares them) or from
     streams as `problem_table` takes them.
 
@@ -385,6 +620,42 @@ class PinchTargets:
     temperature. `balanced_grand_composite_curve` is the cascade net of the
     utilities, zero at the process pinch and at every utility pinch.
 
+    *Area target.* `area_target` is Bath's formula [Townsend84]_ on the
+    balanced composite curves: vertical heat transfer, counter-current (a
+    correction factor of 1), each stretch between breakpoints of either
+    curve at its log-mean temperature difference, ``A = sum_i (1 /
+    LMTD_i) sum_j q_ij / h_j``, over the real temperatures (with approach
+    contributions too) and with a film coefficient h per stream and per
+    utility (1 kW/m²/K by default, so a pair has biosteam's heuristic
+    overall coefficient of 0.5 kW/m²/K; condensing against boiling, where
+    biosteam takes 1, is not reproduced). The sum is exact on the
+    piecewise-linear curves, a stream's share of a stretch being linear in
+    the heat. Fuel takes no area, and the area is inf (with a
+    RuntimeWarning) at a zero driving force, as at ``T_min_app = 0``.
+
+    *Units target.* `units_target` applies Euler's N = S - 1 to each region
+    of the balanced grand composite curve between its zeros (the process
+    pinch and the utility pinches), S counting the streams with heat in the
+    region and the utilities acting in it. Where the curve stays zero, each
+    piece between grid temperatures is balanced on its own: on each side of
+    the pinch such pieces count S - 1 per group of them linked by common
+    streams, so a stream across several counts once. It is an estimate, not
+    a bound: it assumes one component per region, and a balanced subset of
+    streams needs fewer units.
+
+    *Capital and total annualized cost.* `capital_cost_target` divides the
+    area target into as many shells of equal area as the units target (less
+    one furnace for all fuel) [Linnhoff90]_ and costs each with biosteam's
+    correlations at one pressure (biosteam takes each exchanger's highest
+    inlet pressure: its pressure factor is up to about 12 % higher for
+    high pressure steam heaters): a double pipe below 150 ft² (whose cost
+    jumps from 3,208 to 20,516 USD at 150 ft²; the floating head
+    correlation, not monotone below about 126 ft², is not used there), a
+    shell and tube of any area above. The furnace is costed on the fuel's
+    utility duty. `summary` adds the total annualized cost, the installed
+    (bare module) cost times the capital recovery factor plus the utility
+    cost times the operating hours: no Lang factor and no working capital.
+
     Examples
     --------
     One hot stream cooled 400 -> 300 K and one cold stream heated 330 ->
@@ -439,11 +710,45 @@ class PinchTargets:
     >>> round(hot_H[-1] / 3600, 6), round(cold_H[-1] / 3600, 6)
     (150.0, 150.0)
 
+    The area target [m²] with film coefficients of 1 kW/m²/K, the units
+    target (the balanced grand composite curve is zero at the utility
+    pinches of low pressure steam and cooling water and from the pinch down
+    to 330 K, which leaves five regions of two streams or utilities each),
+    and the capital cost target, five double pipes of equal area [USD]:
+
+    >>> round(targets.area_target(utilities), 2)
+    24.14
+    >>> targets.units_target(utilities)
+    {'above': 2, 'below': 3, 'total': 5}
+    >>> capital = targets.capital_cost_target(utilities)
+    >>> capital['N_shells'], capital['type'], round(capital['installed_cost'])
+    (5, 'Double pipe', 33991)
+
+    All targets, with the total annualized cost [USD/yr] at 10 % interest
+    over 10 years and 8000 operating hours a year:
+
+    >>> {key: round(value, 2) for key, value in targets.summary().items()}
+    {'T_min_app': 10.0, 'Q_hot': 180000.0, 'Q_cold': 144000.0,
+     'utility_cost': 1.66, 'area': 24.14, 'N_units': 5, 'N_shells': 5,
+     'purchase_cost': 23150.38, 'installed_cost': 33991.4,
+     'annualized_capital_cost': 5531.94, 'operating_cost': 13247.77,
+     'TAC': 18779.71}
+
     The same streams at another minimum approach temperature (the curves
     are reused):
 
     >>> targets.at(20.)
     <PinchTargets: 2 streams, T_min_app = 20 K, Q_hot = 2.160e+05 kJ/hr, Q_cold = 1.800e+05 kJ/hr>
+
+    References
+    ----------
+    .. [Townsend84] Townsend, D. W., & Linnhoff, B. (1984). Surface area
+        targets for heat exchanger networks. IChemE 11th Annual Research
+        Meeting, Bath, UK.
+    .. [Linnhoff90] Linnhoff, B., & Ahmad, S. (1990). Cost optimum heat
+        exchanger networks - 1. Minimum energy and capital using simple
+        models for capital cost. Computers & Chemical Engineering, 14(7),
+        729-750.
 
     """
     def __init__(self, streams_inlet, streams_quenched, is_hot, T_min_app=5.,
@@ -935,6 +1240,541 @@ class PinchTargets:
         positions, B = self._balanced_positions(utilities)
         return positions[0].copy(), B
 
+    # %% Supertargets
+
+    def _film_coefficients(self, h):
+        """The film coefficient of each stream [kW/m²/K] from `h` (see
+        `area_target`), an (N,) array."""
+        N = self.is_hot.size
+        if h is None: return np.full(N, _H_DEFAULT)
+        if isinstance(h, Mapping): return self._film_mapping(h)
+        if isinstance(h, (Sequence, np.ndarray)) and not isinstance(h, (str, bytes)):
+            values = list(h)
+            if len(values) != N:
+                raise ValueError(f'{len(values)} film coefficients h given for '
+                                 f'{N} streams')
+            return np.array([_film_value(v, f'h[{j}]')
+                             for j, v in enumerate(values)])
+        return np.full(N, _film_value(h, 'h'))
+
+    def _film_mapping(self, h):
+        """
+        `_film_coefficients` of a mapping whose keys are stream indices or
+        name units as approach contribution keys do (see
+        `hensmith.hxn_synthesis._mapping_contributions`): the key of the
+        lowest level on the owner chain of a stream's unit wins, and a stream
+        index is below its unit. Keys of the same level for a unit must give
+        it the same value.
+        """
+        N = self.is_hot.size
+        units = self.units or ()
+        universe = _owner_chains(units)
+        items = []
+        unknown = []
+        for key, value in h.items():
+            if isinstance(key, bst.HeatUtility):
+                raise TypeError('a heat utility cannot be a key of h (biosteam '
+                                'replaces the heat utilities of a unit at every '
+                                "simulation): use a stream index, its unit "
+                                "(hu.unit), the unit's ID or (owner.ID, "
+                                'unit.ID)')
+            if isinstance(key, Integral) and not isinstance(key, (bool, np.bool_)):
+                if not 0 <= key < N: unknown.append(key)
+            elif not (isinstance(key, (bst.Unit, str))
+                      or isinstance(key, tuple) and len(key) == 2
+                      and all(isinstance(i, str) for i in key)):
+                raise TypeError('h keys must be stream indices (int), units, '
+                                'unit IDs (str) or (owner.ID, unit.ID) tuples, '
+                                f'not {type(key).__name__!r} ({key!r})')
+            elif not any(_names_unit(key, u) for u in universe):
+                unknown.append(key)
+            items.append((key, _film_value(value, f'h of key {key!r}')))
+        if unknown:
+            raise ValueError('h keys that name no stream: '
+                             f"{', '.join(map(repr, unknown))} (a key is a "
+                             'stream index or, for targets of heat utilities, '
+                             'a unit, the ID of a unit without an owner, or '
+                             '(owner.ID, unit.ID))')
+        unit_items = [(k, v) for k, v in items if not isinstance(k, Integral)]
+        for unit in universe:
+            first = {} # level -> (key, value)
+            for key, value in unit_items:
+                level = _contribution_key_level(key, unit)
+                if level is None: continue
+                other, other_value = first.setdefault(level, (key, value))
+                if other_value != value:
+                    raise ValueError(
+                        f'h keys {other!r} and {key!r} give unit '
+                        f'{_unit_name(unit)!r} different values at the same '
+                        f'level: {other_value!r} and {value!r}')
+        values = np.full(N, _H_DEFAULT)
+        for j in range(N):
+            best = None # (level, value) of the nearest key
+            for key, value in items:
+                if isinstance(key, Integral):
+                    level = -1 if key == j else None
+                else:
+                    level = _contribution_key_level(key, units[j])
+                if level is not None and (best is None or level < best[0]):
+                    best = (level, value)
+            if best is not None: values[j] = best[1]
+        return values
+
+    def _area(self, utilities, h, h_utilities):
+        """`area_target` with resolved film coefficients (`h`, an (N,)
+        array; `h_utilities`, one per utility)."""
+        if any(u.agent is None for u in utilities): return math.nan
+        hot, cold = self._balanced_segments(
+            utilities, 1. / h, [1. / x for x in h_utilities])
+        return _bath(hot, cold)
+
+    def area_target(self, utilities=None, h=None, h_utilities=None):
+        """
+        The area target [m²] of vertical heat transfer between the balanced
+        composite curves: Bath's formula (see Notes of the class).
+
+        Parameters
+        ----------
+        utilities : list[UtilityTarget], optional
+            Defaults to `utility_targets` with the default agents.
+        h : float, Sequence[float] or Mapping, optional
+            Film coefficient of the streams [kW/m²/K]: one for all, one per
+            stream in stream order, or a mapping from stream indices (int)
+            or, for targets of heat utilities, keys that name units as
+            approach contribution keys do (a unit, the ID of a unit without
+            an owner, or ``(owner.ID, unit.ID)``; an auxiliary unit takes the
+            value of its owner's key unless a key names it). The nearest key
+            wins, a stream index first; streams left out take 1. Labels are
+            not keys. Defaults to 1 for every stream.
+        h_utilities : float or Mapping, optional
+            Film coefficient of the utilities [kW/m²/K]: one for all, or a
+            mapping from agent IDs or agents (the others take 1). Defaults
+            to 1.
+
+        Returns
+        -------
+        float
+            The area [m²]: inf (with a RuntimeWarning) at a zero driving
+            force, nan if part of a utility target is unserved.
+
+        """
+        if utilities is None: utilities = self.utility_targets()
+        return self._area(utilities, self._film_coefficients(h),
+                          _utility_films(utilities, h_utilities))
+
+    def units_target(self, utilities=None):
+        """
+        An estimate of the number of units: Euler's S - 1 per region of the
+        balanced grand composite curve between its zeros (see Notes of the
+        class).
+
+        Parameters
+        ----------
+        utilities : list[UtilityTarget], optional
+            Defaults to `utility_targets` with the default agents.
+
+        Returns
+        -------
+        dict
+            ``{'above': int, 'below': int, 'total': int}``: the units of the
+            regions above the process pinch, below it, and both.
+
+        """
+        if utilities is None: utilities = self.utility_targets()
+        positions, B = self._balanced_positions(utilities)
+        T, _, kind, k = positions
+        P = T.size
+        tol = self._tol
+        Ts, Hl, Hr = self.grid['Ts'], self.grid['Hl'], self.grid['Hr']
+        # each stream's cumulative enthalpy at every position, between the
+        # virtual top and bottom ones
+        H = np.where(kind == _ARRIVING, Hr[:, k], Hl[:, k])
+        inner = np.flatnonzero((kind == _ABOVE) | (kind == _BELOW))
+        if inner.size:
+            ki = k[inner]
+            f = (T[inner] - Ts[ki + 1]) / (Ts[ki] - Ts[ki + 1])
+            H[:, inner] = Hr[:, ki + 1] + (Hl[:, ki] - Hr[:, ki + 1]) * f
+        H = np.column_stack([Hr[:, 0], H, Hl[:, -1]])
+        cuts = [-1, *np.flatnonzero(B <= tol).tolist(), P]
+        gaps = [_gap(positions, u.level) for u in utilities if u.duty > tol]
+        pinch = int(np.flatnonzero(
+            (T == Ts[self._k_pinch])
+            & (kind == (_ARRIVING if self.cut == 'below' else _LEAVING)))[0])
+        # the members of each region (streams j, utilities -1 - i), grouped:
+        # consecutive regions of one gap between two zeros (where the curve
+        # stays zero, each piece balanced on its own) on one side of the
+        # pinch form one group
+        groups = [] # [above, [members of each region], zero]
+        for c0, c1 in zip(cuts[:-1], cuts[1:]):
+            heat = np.abs(H[:, c1 + 1] - H[:, c0 + 1])
+            members = {*np.flatnonzero(heat > tol).tolist(),
+                       *(-1 - i for i, g in enumerate(gaps) if c0 < g <= c1)}
+            side = c1 <= pinch
+            zero = 0 <= c0 and c1 == c0 + 1 < P
+            if zero and groups and groups[-1][2] and groups[-1][0] == side:
+                groups[-1][1].append(members)
+            else:
+                groups.append([side, [members], zero])
+        above = below = 0
+        for side, regions, _ in groups:
+            N = _euler(regions)
+            if side: above += N
+            else: below += N
+        return {'above': above, 'below': below, 'total': above + below}
+
+    def _capital(self, utilities, h, h_utilities, P, heat_exchanger_type,
+                 material):
+        """`capital_cost_target` with resolved film coefficients (see
+        `_area`), and the units target."""
+        _check_exchanger(heat_exchanger_type, material)
+        A = self._area(utilities, h, h_utilities)
+        N = self.units_target(utilities)['total']
+        fuel = [u for u in utilities if u.agent is not None and u.agent.isfuel]
+        N_shells = N - (1 if fuel else 0) # one furnace for all fuel
+        if A > 0. and N_shells < 1: N_shells = 1
+        elif A == 0.: N_shells = 0
+        if N_shells:
+            shell_area = A / N_shells
+            purchase, installed, kind = _exchanger_costs(
+                shell_area * _FT2_PER_M2, P, heat_exchanger_type, material)
+            purchase *= N_shells
+            installed *= N_shells
+        else: # no area, or nan
+            shell_area = purchase = installed = A
+            kind = None
+        furnace_duty = sum((u.utility_duty for u in fuel), 0.)
+        if fuel:
+            furnace_purchase, furnace_installed = _furnace_costs(furnace_duty)
+            purchase += furnace_purchase
+            installed += furnace_installed
+        return {'area': A, 'N_shells': N_shells, 'shell_area': shell_area,
+                'type': kind, 'furnace_duty': furnace_duty,
+                'purchase_cost': purchase, 'installed_cost': installed}, N
+
+    def capital_cost_target(self, utilities=None, h=None, h_utilities=None,
+                            P=101325., heat_exchanger_type='Floating head',
+                            material='Carbon steel/carbon steel'):
+        """
+        The capital cost target: the area target in as many shells of equal
+        area as the units target (less a furnace), costed with biosteam's
+        correlations, plus a furnace for the fuel (see Notes of the class).
+
+        Parameters
+        ----------
+        utilities : list[UtilityTarget], optional
+            Defaults to `utility_targets` with the default agents.
+        h, h_utilities : optional
+            Film coefficients, as `area_target` takes them.
+        P : float, optional
+            Pressure of every shell [Pa]. Defaults to 101325.
+        heat_exchanger_type : str, optional
+            biosteam's type of the shell and tube exchangers ('Floating
+            head', 'Fixed head', 'U tube', 'Kettle vaporizer' or 'Double
+            pipe'). Defaults to 'Floating head'.
+        material : str, optional
+            biosteam's shell and tube material. Defaults to 'Carbon
+            steel/carbon steel'.
+
+        Returns
+        -------
+        dict
+            'area' [m²]; 'N_shells', the number of shells; 'shell_area', the
+            area of each [m²]; 'type', biosteam's type of each ('Double pipe'
+            below 150 ft², None without shells or with an infinite area);
+            'furnace_duty', the utility duty of the fuel [kJ/hr];
+            'purchase_cost' and 'installed_cost' (bare module) [USD]. inf
+            with an infinite area, nan with an unserved utility.
+
+        """
+        if utilities is None: utilities = self.utility_targets()
+        return self._capital(utilities, self._film_coefficients(h),
+                             _utility_films(utilities, h_utilities), P,
+                             heat_exchanger_type, material)[0]
+
+    def _check_options(self, options):
+        """The options of `summary` (agents as lists), after raising for
+        any that `summary` would reject, before pricing anything."""
+        unknown = [i for i in options if i not in _SUMMARY_OPTIONS]
+        if unknown:
+            raise TypeError(f"unexpected options: {', '.join(map(repr, unknown))} "
+                            f'(the options are {", ".join(_SUMMARY_OPTIONS)})')
+        options = dict(options)
+        for key in ('heating_agents', 'cooling_agents'):
+            if options.get(key) is not None: options[key] = list(options[key])
+        get = options.get
+        _economics(get('interest'), get('years'), get('operating_hours'),
+                   get('tea'))
+        _check_exchanger(get('heat_exchanger_type', 'Floating head'),
+                         get('material', 'Carbon steel/carbon steel'))
+        self._film_coefficients(get('h'))
+        _utility_films((), get('h_utilities'),
+                       [*(get('heating_agents') or ()),
+                        *(get('cooling_agents') or ())])
+        return options
+
+    def summary(self, **options):
+        """
+        The targets of energy, area, units, capital and total annualized
+        cost (TAC), pricing the utilities once.
+
+        Parameters
+        ----------
+        **options
+            `heating_agents` and `cooling_agents` (as `utility_targets`
+            takes them); `h` and `h_utilities` (as `area_target` takes
+            them); `P`, `heat_exchanger_type` and `material` (as
+            `capital_cost_target` takes them); `interest` (default 0.10),
+            `years` (default 10) and `operating_hours` (per year, default
+            8000), each taken from `tea` when not given and `tea` is (its
+            `IRR`, ``duration[1] - duration[0]`` and `operating_hours`
+            unless None).
+
+        Returns
+        -------
+        dict
+            'T_min_app' [K]; 'Q_hot' and 'Q_cold' [kJ/hr], process side;
+            'utility_cost' [USD/hr]; 'area' [m²]; 'N_units', the units
+            target; 'N_shells'; 'purchase_cost' and 'installed_cost' [USD];
+            'annualized_capital_cost', the installed cost times the capital
+            recovery factor, 'operating_cost', the utility cost times the
+            operating hours, and their sum 'TAC' [USD/yr].
+
+        """
+        options = self._check_options(options)
+        get = options.get
+        heating_agents = get('heating_agents')
+        cooling_agents = get('cooling_agents')
+        crf, hours = _economics(get('interest'), get('years'),
+                                get('operating_hours'), get('tea'))
+        utilities = self.utility_targets(heating_agents, cooling_agents)
+        h_utilities = _utility_films(
+            utilities, get('h_utilities'),
+            [*(heating_agents or ()), *(cooling_agents or ())])
+        capital, N = self._capital(
+            utilities, self._film_coefficients(get('h')), h_utilities,
+            get('P', 101325.), get('heat_exchanger_type', 'Floating head'),
+            get('material', 'Carbon steel/carbon steel'))
+        utility_cost = sum((u.cost for u in utilities), 0.)
+        annualized = crf * capital['installed_cost']
+        operating = hours * utility_cost
+        return {'T_min_app': self.T_min_app, 'Q_hot': self.Q_hot,
+                'Q_cold': self.Q_cold, 'utility_cost': utility_cost,
+                'area': capital['area'], 'N_units': N,
+                'N_shells': capital['N_shells'],
+                'purchase_cost': capital['purchase_cost'],
+                'installed_cost': capital['installed_cost'],
+                'annualized_capital_cost': annualized,
+                'operating_cost': operating, 'TAC': annualized + operating}
+
+
+def _least_TAC(records):
+    """Index of the record of least TAC (nan counts as inf)."""
+    TAC = np.array([r['TAC'] for r in records], dtype=float)
+    return int(np.argmin(np.where(np.isnan(TAC), math.inf, TAC)))
+
+def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
+                scale_contributions=False, **options):
+    """
+    Sweep the minimum approach temperature for the least total annualized
+    cost (TAC) target: supertargeting [Ahmad90]_.
+
+    Parameters
+    ----------
+    targets : PinchTargets
+        The streams (their curves are reused: no flash).
+    T_min_apps : Sequence[float], optional
+        Minimum approach temperatures to evaluate [K], finite and >= 0 (> 0
+        with approach contributions); sorted and made unique. Defaults to 1,
+        2, ..., 40 K.
+    refine : int, optional
+        Rounds of refinement around the least TAC. Defaults to 3.
+    n_refine : int, optional
+        Evaluations per round of refinement. Defaults to 8.
+    scale_contributions : bool, optional
+        Scale the specified approach contributions of `targets` with the
+        minimum approach temperature (see `PinchTargets.at`). Defaults to
+        False.
+    **options
+        Options of `PinchTargets.summary`.
+
+    Returns
+    -------
+    Supertargets
+
+    Notes
+    -----
+    Each minimum approach temperature is evaluated with
+    ``targets.at(T_min_app, scale_contributions).summary(**options)``. Only
+    the streams without an approach contribution follow the minimum approach
+    temperature (``T_min_app / 2`` each), unless `scale_contributions`
+    scales the specified ones by ``T_min_app / targets.T_min_app`` too, the
+    contribution scaling of [Ahmad90]_; with every stream specified, the
+    sweep needs it.
+
+    The TAC is not smooth (the units target jumps, so do biosteam's
+    correlations at 150 ft², and the pinch can move), so the sweep is a
+    grid search: each round of refinement evaluates `n_refine` evenly spaced
+    temperatures between the neighbors of the least TAC so far, so after r
+    rounds the spacing is the grid's times (2/9)**r for the defaults. A
+    least TAC at the smallest or largest temperature evaluated is flagged
+    (`Supertargets.at_bound`).
+
+    Examples
+    --------
+    One hot stream cooled 400 -> 300 K and one cold stream heated 290 ->
+    390 K, both 1 kW/K. Up to 10 K they balance with no utility in a single
+    exchanger of 20 m² (215 ft², a shell and tube); above it the utilities
+    add units, and three double pipes of less than 150 ft² each cost less,
+    so on a coarse grid the least total annualized cost (TAC) is at 15 K:
+
+    >>> import biosteam as bst, thermosteam as tmo
+    >>> from hensmith import PinchTargets, supertarget
+    >>> fluid = tmo.Chemical('Fluid', search_db=False, phase='l', MW=1.,
+    ...                      Cn=3.6, default=True)
+    >>> bst.settings.set_thermo([fluid])
+    >>> bst.main_flowsheet.set_flowsheet('supertargeting_example')
+    >>> H1 = bst.HXutility('H1', ins=bst.Stream('H1_in', Fluid=1000., T=400.),
+    ...                    T=300., rigorous=False)
+    >>> C1 = bst.HXutility('C1', ins=bst.Stream('C1_in', Fluid=1000., T=290.),
+    ...                    T=390., rigorous=False)
+    >>> H1.simulate(); C1.simulate()
+    >>> targets = PinchTargets.from_heat_utilities(
+    ...     [H1.heat_utilities[0], C1.heat_utilities[0]], T_min_app=10.)
+    >>> grid = [5., 10., 15., 20., 25., 30.]
+    >>> sweep = supertarget(targets, grid, refine=0)
+    >>> sweep
+    <Supertargets: 6 points, T_min_app 5-30 K, optimum 15 K (TAC 4.949e+03 USD/yr)>
+    >>> sweep['N_units'], sweep['area'].round(2)
+    (array([1, 1, 3, 3, 4, 4]), array([20.  , 20.  , 13.88, 11.07,  9.73,  9.17]))
+
+    Refining around it finds the least TAC just above 10 K, with almost no
+    utility and the area already in three double pipes:
+
+    >>> sweep = supertarget(targets, grid)
+    >>> sweep
+    <Supertargets: 30 points, T_min_app 5-30 K, optimum 10.05 K (TAC 3.510e+03 USD/yr)>
+    >>> sweep.optimum['N_shells'], round(sweep.optimum['area'], 2)
+    (3, 19.89)
+
+    References
+    ----------
+    .. [Ahmad90] Ahmad, S., Linnhoff, B., & Smith, R. (1990). Cost optimum
+        heat exchanger networks - 2. Targets and design for detailed capital
+        cost models. Computers & Chemical Engineering, 14(7), 751-767.
+
+    """
+    if T_min_apps is None: T_min_apps = _T_MIN_APPS
+    T = np.asarray(T_min_apps, dtype=float)
+    if T.ndim != 1 or not T.size:
+        raise ValueError('T_min_apps must be a non-empty sequence of '
+                         'temperatures [K]')
+    if not np.all(np.isfinite(T)):
+        raise ValueError(f'T_min_apps must be finite, not {T_min_apps!r}')
+    contributions = targets.approach_contributions
+    if contributions is None:
+        if np.any(T < 0.):
+            raise ValueError(f'T_min_apps must be >= 0 K, not {T_min_apps!r}')
+    elif np.any(T <= 0.):
+        raise ValueError('T_min_apps must be > 0 K with approach '
+                         f'contributions, not {T_min_apps!r}')
+    for value, name, low in ((refine, 'refine', 0), (n_refine, 'n_refine', 1)):
+        if (not isinstance(value, Integral) or isinstance(value, (bool, np.bool_))
+                or value < low):
+            raise ValueError(f'{name} must be an int >= {low}, not {value!r}')
+    if (contributions is not None and not scale_contributions
+            and all(c is not None for c in contributions)):
+        raise ValueError('every stream has an approach contribution, so '
+                         'T_min_app changes nothing: pass '
+                         'scale_contributions=True to scale them with it')
+    options = targets._check_options(options)
+    def evaluate(T_min_app):
+        return targets.at(T_min_app, scale_contributions).summary(**options)
+    records = [evaluate(float(x)) for x in np.unique(T)]
+    for _ in range(refine):
+        records.sort(key=lambda r: r['T_min_app'])
+        i = _least_TAC(records)
+        lo = records[max(i - 1, 0)]['T_min_app']
+        hi = records[min(i + 1, len(records) - 1)]['T_min_app']
+        if hi - lo <= 1e-6: break
+        evaluated = np.array([r['T_min_app'] for r in records])
+        for x in np.linspace(lo, hi, n_refine + 2)[1:-1]:
+            if np.abs(evaluated - x).min() > 1e-12:
+                records.append(evaluate(float(x)))
+    return Supertargets(targets, records, options, scale_contributions)
+
+
+class Supertargets:
+    """
+    The targets of a sweep of the minimum approach temperature, as
+    `supertarget` returns them.
+
+    Parameters
+    ----------
+    targets : PinchTargets
+        The streams swept.
+    records : list[dict]
+        `PinchTargets.summary` at each minimum approach temperature.
+    options : dict, optional
+        Options of `PinchTargets.summary` of the records.
+    scale_contributions : bool, optional
+        Whether the approach contributions were scaled (see
+        `PinchTargets.at`). Defaults to False.
+
+    Attributes
+    ----------
+    targets : PinchTargets
+        The streams swept.
+    options : dict
+        Options of `PinchTargets.summary` of the records.
+    scale_contributions : bool
+        Whether the approach contributions were scaled.
+    records : list[dict]
+        `PinchTargets.summary` at each minimum approach temperature,
+        ascending.
+    optimum : dict
+        The record of least TAC (the first of equal ones; nan counts as
+        inf).
+    T_min_app : float
+        Minimum approach temperature of `optimum` [K].
+    at_bound : bool
+        Whether `optimum` is at the smallest or largest temperature
+        evaluated: the least TAC may lie beyond the sweep.
+
+    Notes
+    -----
+    ``sweep[key]`` is the array of a key of the records over the sweep (for
+    instance ``sweep['TAC']``), and `to_frame` a pandas DataFrame of them
+    indexed by 'T_min_app'.
+
+    """
+    def __init__(self, targets, records, options=None,
+                 scale_contributions=False):
+        if not records: raise ValueError('Supertargets needs at least one record')
+        self.targets = targets
+        self.options = dict(options or {})
+        self.scale_contributions = scale_contributions
+        self.records = sorted(records, key=lambda r: r['T_min_app'])
+        i = _least_TAC(self.records)
+        self.optimum = self.records[i]
+        self.T_min_app = self.optimum['T_min_app']
+        self.at_bound = i in (0, len(self.records) - 1)
+
+    def __getitem__(self, key):
+        return np.array([r[key] for r in self.records])
+
+    def to_frame(self):
+        """The records as a pandas DataFrame indexed by 'T_min_app'."""
+        import pandas as pd
+        return pd.DataFrame(self.records).set_index('T_min_app')
+
+    def __repr__(self):
+        n = len(self.records)
+        lo, hi = self.records[0]['T_min_app'], self.records[-1]['T_min_app']
+        bound = ', at the bound' if self.at_bound else ''
+        return (f'<{type(self).__name__}: {n} point{"s" if n != 1 else ""}, '
+                f'T_min_app {lo:g}-{hi:g} K, optimum {self.T_min_app:.4g} K '
+                f'(TAC {self.optimum["TAC"]:.3e} USD/yr){bound}>')
+
 
 def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                           file=None, dpi=300):
@@ -1181,6 +2021,83 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
                 previous = y
     ax.set_xlabel('heat cascaded [kJ·h$^{-1}$]')
     ax.set_ylabel('shifted T [°C]')
+    ax.grid(alpha=0.3)
+    if file: fig.savefig(file, dpi=dpi, bbox_inches='tight')
+    return fig, ax
+
+def plot_supertargets(sweep, ax=None, file=None, dpi=300):
+    """
+    Draw the total annualized cost (TAC) of a sweep of the minimum approach
+    temperature, its annualized capital and operating parts, and the least
+    TAC.
+
+    Parameters
+    ----------
+    sweep : Supertargets
+    ax : matplotlib.axes.Axes, optional
+        Axes to draw on; a new figure is created if not given.
+    file : str, optional
+        If given, the figure is saved to this path.
+    dpi : int, optional
+        Resolution used when saving.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+    ax : matplotlib.axes.Axes
+
+    Notes
+    -----
+    Artists carry stable gids: 'TAC', 'Capital' (the annualized capital
+    cost), 'Operating' and 'Optimum'.
+
+    Examples
+    --------
+    The streams of `PinchTargets`:
+
+    >>> import biosteam as bst, thermosteam as tmo
+    >>> from hensmith import PinchTargets, supertarget, plot_supertargets
+    >>> fluid = tmo.Chemical('Fluid', search_db=False, phase='l', MW=1.,
+    ...                      Cn=3.6, default=True)
+    >>> bst.settings.set_thermo([fluid])
+    >>> bst.main_flowsheet.set_flowsheet('targeting_example')
+    >>> H1 = bst.HXutility('H1', ins=bst.Stream('H1_in', Fluid=1000., T=400.),
+    ...                    T=300., rigorous=False)
+    >>> C1 = bst.HXutility('C1', ins=bst.Stream('C1_in', Fluid=1000., T=330.),
+    ...                    T=440., rigorous=False)
+    >>> H1.simulate(); C1.simulate()
+    >>> targets = PinchTargets.from_heat_utilities(
+    ...     [H1.heat_utilities[0], C1.heat_utilities[0]], T_min_app=10.)
+    >>> sweep = supertarget(targets)
+    >>> sweep
+    <Supertargets: 63 points, T_min_app 1-40 K, optimum 3.905 K (TAC 1.818e+04 USD/yr)>
+    >>> fig, ax = plot_supertargets(sweep)
+    >>> [line.get_gid() for line in ax.get_lines() if line.get_gid()]
+    ['TAC', 'Capital', 'Operating', 'Optimum']
+    >>> import matplotlib.pyplot as plt
+    >>> plt.close(fig)
+
+    """
+    import matplotlib.pyplot as plt
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6, 4))
+    else:
+        fig = ax.figure
+    T = sweep['T_min_app']
+    ax.plot(T, sweep['TAC'], color='k', lw=2, label='total annualized cost',
+            gid='TAC')
+    ax.plot(T, sweep['annualized_capital_cost'], color='#2e6db4', lw=1.5,
+            label='annualized capital cost', gid='Capital')
+    ax.plot(T, sweep['operating_cost'], color='#d62728', lw=1.5,
+            label='operating cost', gid='Operating')
+    optimum = sweep.optimum
+    ax.axvline(optimum['T_min_app'], color='k', ls='--', lw=0.8)
+    ax.plot([optimum['T_min_app']], [optimum['TAC']], 'o', mfc='w', mec='k',
+            ms=7, zorder=4, label=f"optimum {optimum['T_min_app']:.3g} K",
+            gid='Optimum')
+    ax.set_xlabel('$T_{min,app}$ [K]')
+    ax.set_ylabel('cost [USD·yr$^{-1}$]')
+    ax.legend(loc='best', fontsize=8)
     ax.grid(alpha=0.3)
     if file: fig.savefig(file, dpi=dpi, bbox_inches='tight')
     return fig, ax
