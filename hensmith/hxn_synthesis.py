@@ -15,7 +15,7 @@ default and with stream splits where needed if `stream_splitting` (on
 cycles (`StreamLifeCycle`) and pinch diagrams (`plot_pinch_diagram`).
 """
 from collections import namedtuple
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 import heapq
 import math
 import re
@@ -768,28 +768,128 @@ def _pinch_cut(table):
     arriving = table.residual - point_total
     return 'below' if arriving[k] <= table.residual[k] else 'above'
 
+def _unit_name(unit):
+    """``(owner.ID, unit.ID)``: how messages name a unit (``(ID, ID)`` for
+    a unit without an owner)."""
+    return unit.owner.ID, unit.ID
+
+def _names_unit(key, unit):
+    """Whether the approach contribution key `key` (of a valid type, see
+    `_check_contribution_key`) names `unit`: the unit itself, or one with
+    its owner's ID and its ID (a stale auxiliary that its owner rebuilt);
+    ``(owner.ID, unit.ID)``; or the ID of a unit without an owner."""
+    if isinstance(key, bst.Unit):
+        return key is unit or _unit_name(key) == _unit_name(unit)
+    if isinstance(key, tuple): return key == _unit_name(unit)
+    return key == unit.ID and unit.owner is unit
+
+def _contribution_key_level(key, unit):
+    """The number of steps along the owner chain of `unit` (`unit`,
+    ``unit._owner``, ...) to the first unit that `key` names, or None."""
+    level = 0
+    while unit is not None:
+        if _names_unit(key, unit): return level
+        unit = getattr(unit, '_owner', None)
+        level += 1
+    return None
+
+def _check_contribution_key(key):
+    """Raise a TypeError unless `key` is a unit, a str or a pair of str."""
+    if isinstance(key, bst.HeatUtility):
+        raise TypeError('a heat utility cannot be an approach_contributions '
+                        'key (biosteam replaces the heat utilities of a unit '
+                        'at every simulation): use its unit (hu.unit), the '
+                        "unit's ID or (owner.ID, unit.ID), a sequence, or a "
+                        'callable')
+    if isinstance(key, (bst.Unit, str)): return
+    if (isinstance(key, tuple) and len(key) == 2
+            and all(isinstance(i, str) for i in key)): return
+    raise TypeError('approach_contributions keys must be units, unit IDs '
+                    '(str) or (owner.ID, unit.ID) tuples, not '
+                    f'{type(key).__name__!r} ({key!r})')
+
+def _owner_chains(units):
+    """Every unit on the owner chains of `units`, once each."""
+    found = {}
+    for unit in units:
+        while unit is not None and id(unit) not in found:
+            found[id(unit)] = unit
+            unit = getattr(unit, '_owner', None)
+    return list(found.values())
+
+def _mapping_contributions(hus, mapping, units):
+    """
+    `_stream_contributions` of a mapping from keys naming units to
+    contributions: checks the types of keys and values, then that every key
+    names a unit of the universe (the owner chains of the units of `hus`
+    and of `units`), then that no two keys of the same level for a unit of
+    the universe give it different values (None and nan are equal); then
+    each heat utility takes the value of the key of the lowest level on its
+    unit's owner chain (None without one).
+    """
+    items = []
+    for key, value in mapping.items():
+        _check_contribution_key(key)
+        items.append((key, _contribution_value(value, f'key {key!r}')))
+    universe = _owner_chains([hu.unit for hu in hus] + list(units or ()))
+    unknown = [key for key, _ in items
+               if not any(_names_unit(key, u) for u in universe)]
+    if unknown:
+        raise ValueError('approach_contributions keys that name no unit: '
+                         f"{', '.join(map(repr, unknown))} (a key is a unit, "
+                         'the ID of a unit without an owner, or (owner.ID, '
+                         'unit.ID))')
+    for unit in universe:
+        first = {} # level -> (key, value)
+        for key, value in items:
+            level = _contribution_key_level(key, unit)
+            if level is None: continue
+            other, other_value = first.setdefault(level, (key, value))
+            if other_value != value:
+                raise ValueError(
+                    f'approach_contributions keys {other!r} and {key!r} '
+                    f'give unit {_unit_name(unit)!r} different values at the '
+                    f'same level: {other_value!r} and {value!r}')
+    values = []
+    for hu in hus:
+        best = None # (level, value) of the nearest key
+        for key, value in items:
+            level = _contribution_key_level(key, hu.unit)
+            if level is not None and (best is None or level < best[0]):
+                best = (level, value)
+        values.append(None if best is None else best[1])
+    return values
+
 def _stream_contributions(hus, approach_contributions, units=None):
     """
     Resolve `approach_contributions` to one approach temperature
     contribution per heat utility of `hus`, in the given order (zero-duty
     ones included): a list of float, or None where unspecified (nan becomes
-    None; not filled with ``T_min_app / 2``). Accepts None (all
-    unspecified) or a sequence aligned with `hus` (not a str or bytes);
-    `units` is reserved for keys that name units.
+    None; not filled with ``T_min_app / 2``). Accepts the forms of
+    `synthesize_network`'s parameter: None (all unspecified), a mapping
+    whose keys name units (see `_mapping_contributions`), a sequence
+    aligned with `hus` (not a str or bytes), or a callable of a heat
+    utility (called once per heat utility, in order). `units` adds units
+    (with their owner chains) to those that keys may name and that are
+    checked for conflicting keys, whether or not they hold a heat utility
+    of `hus`.
     """
     N = len(hus)
     x = approach_contributions
     if x is None: return [None] * N
-    if not isinstance(x, (Sequence, np.ndarray)) or isinstance(x, (str, bytes)):
-        raise TypeError('approach_contributions must be a sequence with one '
-                        'value per heat utility, not '
-                        f'{type(x).__name__!r}')
-    values = list(x)
-    if len(values) != N:
-        raise ValueError(f'{len(values)} approach contributions given for '
-                         f'{N} heat utilities')
-    return [_contribution_value(v, f'heat utility {k}')
-            for k, v in enumerate(values)]
+    if isinstance(x, Mapping): return _mapping_contributions(hus, x, units)
+    if isinstance(x, (Sequence, np.ndarray)) and not isinstance(x, (str, bytes)):
+        values = list(x)
+        if len(values) != N:
+            raise ValueError(f'{len(values)} approach contributions given for '
+                             f'{N} heat utilities')
+        return [_contribution_value(v, f'heat utility {k}')
+                for k, v in enumerate(values)]
+    if callable(x):
+        return [_contribution_value(x(hu), f'unit {_unit_name(hu.unit)!r}')
+                for hu in hus]
+    raise TypeError('approach_contributions must be a mapping, a sequence or '
+                    f'a callable, not {type(x).__name__!r}')
 
 def _explicit_contributions(hus, approach_contributions, T_min_app,
                             units=None):
@@ -1928,18 +2028,42 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         and ``synthesis_info['splits']`` (`HeatExchangerNetwork`). With
         `avoid_recycle`, a split that would repeat a stream pair is not
         used, and MER is then not guaranteed. Defaults to False.
-    approach_contributions : Sequence[float or None], optional
+    approach_contributions : Mapping, Sequence or callable, optional
         Approach temperature contribution of each process stream [K]: a
         match between hot stream h and cold stream c must keep ``c_h +
         c_c`` instead of `T_min_app` (see Notes, "Approach
-        contributions"). One value per heat utility, aligned with `hus` as
-        given (before the heating utilities are placed first; zero-duty
-        utilities included): None or nan (unspecified, ``T_min_app / 2``),
-        or a finite number > 0 (`T_min_app` must then be finite and > 0
-        too). Checked before any stream is copied or flashed; a wrong
-        length raises a ValueError. If every value is unspecified, the
-        result is the default one. Defaults to None (every stream
-        contributes ``T_min_app / 2``).
+        contributions"). A value is None or nan (unspecified: ``T_min_app
+        / 2``) or a finite number > 0 (`T_min_app` must then be finite and
+        > 0 too). Given as one of:
+
+        - a mapping ``{key: value}`` whose keys name units: a unit (the
+          same object, or one with the same ID and owner's ID: a stale
+          auxiliary that its owner rebuilt), ``(owner.ID, unit.ID)`` (the
+          unit's own ID twice for a unit without an owner) or the ID of a
+          unit without an owner (a bare auxiliary ID such as
+          ``'condenser'`` names nothing). A heat utility takes the value of
+          the key nearest to its unit along the unit's chain of owners: a
+          unit's own key beats its owner's, which beats the owner's owner's
+          (e.g. ``'D1'`` covers the condenser and the reboiler of column
+          D1, and ``('D1', 'condenser')`` overrides it for the condenser).
+          A None or nan value wins at its level like any other. Heat
+          utility keys are rejected (BioSTEAM replaces them at every
+          simulation). A key that names neither the unit of a heat utility
+          of `hus` nor one of its owners, or two keys of the same level for
+          a unit with different values, raise a ValueError;
+        - a sequence (or `numpy.ndarray`; not a str or bytes) with one
+          value per heat utility, aligned with `hus` as given (before the
+          heating utilities are placed first; zero-duty utilities
+          included); a wrong length raises a ValueError;
+        - a callable ``f(hu)`` returning the value of a heat utility,
+          called once per heat utility in the order of `hus`.
+
+        Anything else raises a TypeError. Checked and resolved before any
+        stream is copied or flashed. If every value is unspecified, the
+        result is the default one. The contributions as used are reported
+        in ``info['approach_contributions']`` in stream order, not in the
+        order of `hus`. Defaults to None (every stream contributes
+        ``T_min_app / 2``).
 
     Returns
     -------
@@ -2212,6 +2336,22 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     (80.0, 450.0)
     >>> round(info['Q_hot_target'] / 3600., 6), round(info['Q_cold_target'] / 3600., 6)
     (80.0, 450.0)
+
+    With an approach temperature contribution of 2 K for the hot stream
+    (keyed by its unit) and the default ``T_min_app / 2 = 5`` K for the
+    cold streams, every match needs 7 K instead of 10 K, so the targets
+    fall to those of ``T_min_app = 7`` K, and every exchanger's `dT`
+    guard is 7 K less 1e-6 K:
+
+    >>> info = {}
+    >>> result = synthesize_network(hus, T_min_app=10., info=info,
+    ...                             approach_contributions={units[3]: 2.})
+    >>> info['status'], round(info['Q_hot_target'] / 3600., 6), round(info['Q_cold_target'] / 3600., 6)
+    ('mer', 74.0, 444.0)
+    >>> info['approach_contributions']
+    array([5., 5., 5., 2.])
+    >>> sorted({round(hx.dT, 6) for hx in result[0] + result[1]})
+    [6.999999]
 
     References
     ----------

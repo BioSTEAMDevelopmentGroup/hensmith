@@ -11,24 +11,39 @@ Tests of per-stream approach temperature contributions
 (``approach_contributions``): a match between hot stream h and cold stream c
 must keep ``c_h + c_c`` instead of ``T_min_app``.
 
-A. Default unchanged: unspecified contributions (None, nan, or every stream
-   at ``T_min_app / 2``) give the default plans and problem tables bit for
-   bit, compared in-process with ``float.hex`` and ``tobytes``.
+A. Default unchanged: unspecified contributions (None, nan, an empty
+   mapping, a callable returning None, or every stream at
+   ``T_min_app / 2``) give the default plans, problem tables and facility
+   networks bit for bit, compared in-process with ``float.hex`` and
+   ``tobytes``.
 B. Uniform contributions: every stream at ``x`` plans the network of
    ``T_min_app = 2x`` on a shifted scale offset by a constant, and on
    real-thermo cases all hot streams at ``a`` and all cold ones at ``b``
    give the default targets at ``T_min_app = a + b`` (references that do
    not use the contribution code); mixed contributions give targets between
-   those of the smallest and of the largest pair requirement.
+   those of the smallest and of the largest pair requirement. A hot
+   stream's contribution that reproduces the shifts of a smaller
+   ``T_min_app`` gives that default network bit for bit.
 C. Non-uniform contributions against INDEPENDENT references: a closed-form
    constant-CP cascade with the classic symmetric shifts (hot streams down
    by ``c_j``, cold streams up by ``c_j``; hensmith's shifted scale is that
    scale less ``T_min_app / 2``), and a walk of every planned match on
    recomputed constant-CP temperatures that checks each pair's requirement
    at both ends (the minimum for linear profiles). The exactness check, the
-   repair and the realization enforce each pair's own requirement.
-D. Validation of the value domain (None or nan, else a finite number > 0)
-   and of the sequence form.
+   repair and the realization enforce each pair's own requirement. The
+   facility (split and unsplit, constant CP and real thermodynamics)
+   reaches the contribution-aware problem table's targets, keeps every
+   pair's requirement on the exact states of its streams (independent
+   recomputation) and gives each exchanger its pair's ``dT`` guard; each
+   stream's pinch temperature is the shifted pinch plus its own shift.
+D. Keys and validation: the value domain (None or nan, else a finite
+   number > 0); the mapping, sequence and callable forms; keys naming
+   units, auxiliary units through their owners (the nearest key wins) and
+   stale auxiliaries; unknown keys, conflicting keys and bad values,
+   checked before any stream is flashed and, in the facility, even for
+   idle units.
+E. The ``cache_network`` rule: a cached network is reused while the
+   explicit contributions resolve to the same values per stream.
 """
 import math
 import random
@@ -36,11 +51,13 @@ import numpy as np
 import pytest
 import biosteam as bst
 from numpy.testing import assert_allclose
-from hensmith import hxn_synthesis
+from hensmith import hxn_synthesis, HeatExchangerNetwork
 from hensmith import _planner as P
-from hensmith.hxn_synthesis import problem_table, synthesize_network
-from test_hxn import cp_units, KEMP, R002 as R002_UNITS, planned_split
-from test_hxn_regression import internal_approach, CASES
+from hensmith.hxn_synthesis import problem_table, synthesize_network, _pinch_cut
+from test_hxn import (cp_units, KEMP, R002 as R002_UNITS, planned_split,
+                      simulate_HXN, simulate_strictly)
+from test_hxn_regression import (internal_approach, actual_loads, CASES,
+                                 STATUS_RTOL, CASCADE_RTOL)
 from test_hxn_mer import _build, _case, _kelvin, APPROACH_TOL
 from test_hxn_planner import (streams_from, check_network, duty_scale,
                               random_problem, R002, LINNHOFF4, HARD,
@@ -142,6 +159,66 @@ def by_duty(units):
     return sorted((hx.heat_utilities[0] for hx in units),
                   key=lambda hu: hu.duty)
 
+def required(HXN, hx, of_unit):
+    """The required approach of a synthesized process exchanger: the sum of
+    its two streams' contributions, `of_unit` of their original units."""
+    return sum(of_unit(HXN.original_heat_exchangers[i])
+               for i in hxn_synthesis._stream_ports(hx))
+
+def sampled_approach(hx, n=21):
+    """The smallest hot-minus-cold temperature difference of a process
+    exchanger at `n` uniform duty points, from PH flashes of copies of its
+    streams (any mixture; at least the exact minimum)."""
+    def T(stream, H):
+        s = stream.copy()
+        s.vle(H=H, P=stream.P)
+        return s.T
+    dH = [s_in.H - s_out.H for s_in, s_out in zip(hx.ins, hx.outs)]
+    h = 0 if dH[0] >= dH[1] else 1
+    hot_in, hot_out = hx.ins[h], hx.outs[h]
+    cold_in, cold_out = hx.ins[1 - h], hx.outs[1 - h]
+    return min(T(hot_in, hot_in.H - q) - T(cold_in, max(cold_out.H - q,
+                                                        cold_in.H))
+               for q in np.linspace(0., hot_in.H - hot_out.H, n))
+
+def network_record(HXN):
+    """Every number of a facility's network that the default path must
+    keep, as hex or bytes."""
+    hx = lambda x: float(x).hex()
+    info = HXN.synthesis_info
+    return ([(u.ID, hx(u.Q), hx(u.dT)) for u in HXN.new_HXs],
+            [hx(u.Q) for u in HXN.new_HX_utils], # an int 0 if served
+            HXN.pinch_Ts.tobytes(), hx(info['min_approach']), info['status'],
+            [u.ID for u in HXN.new_splitters])
+
+def contribution_table(units, T, of_unit):
+    """The problem table of the units' process streams with their
+    contributions (`of_unit` of each unit), prepared as the facility
+    prepares them, and the total duty."""
+    hus = by_duty(units)
+    inlets, outlets, is_hot = unit_streams([hu.unit for hu in hus])
+    table = problem_table(inlets, outlets, is_hot, T, approach_contributions=[
+        of_unit(hu.unit) for hu in hus])
+    return table, sum(abs(hu.duty) for hu in hus)
+
+def quickstart(name):
+    """The system of `HeatExchangerNetwork`'s first example: column D1
+    (condenser and reboiler), its product coolers D1_H1 and D1_H2, and
+    flash F1 (its heater)."""
+    bst.main_flowsheet.set_flowsheet(name)
+    bst.settings.set_thermo(['Water', 'Methanol', 'Glycerol'], cache=True)
+    feed1 = bst.Stream('feed1', flow=(8000, 100, 25))
+    feed2 = bst.Stream('feed2', flow=(10000, 1000, 10))
+    D1 = bst.ShortcutColumn('D1', ins=feed1,
+                            outs=('distillate', 'bottoms_product'),
+                            LHK=('Methanol', 'Water'), y_top=0.99,
+                            x_bot=0.01, k=2, is_divided=True)
+    D1_H1 = bst.HXutility('D1_H1', ins=D1.outs[1], T=300)
+    D1_H2 = bst.HXutility('D1_H2', ins=D1.outs[0], T=300)
+    F1 = bst.Flash('F1', ins=feed2, outs=('vapor', 'liquid'), V=0.9,
+                   P=101325)
+    return D1, D1_H1, D1_H2, F1
+
 # ---------------------------------------------------------------------------
 # A. Default unchanged
 # ---------------------------------------------------------------------------
@@ -202,6 +279,35 @@ def test_default_problem_table_bit_for_bit(name):
             inlets, outlets, is_hot, T, curves,
             approach_contributions=contributions)) == reference
 
+def default_network_units(name):
+    """(units, T_min_app, stream_splitting) of a facility test case."""
+    if name == 'r002':
+        return cp_units('contributions_default_r002', R002_UNITS, 300.), 10., False
+    if name == 'case_05_boiling_cold':
+        return (*CASES[name][0](), False)
+    return (*_build(_case(name)), True)
+
+@pytest.mark.parametrize('name', ['r002', 'case_05_boiling_cold',
+                                  'smith2005_ex18_2_split'])
+def test_default_networks_bit_for_bit(name):
+    # the facility with unspecified contributions in every form, or every
+    # stream at T_min_app / 2, synthesizes the default network to the bit
+    units, T, splitting = default_network_units(name)
+    sys, HXN = simulate_HXN(units, T, f'contributions_default_{name}',
+                            stream_splitting=splitting)
+    reference = network_record(HXN)
+    assert HXN._resolved_contributions is None
+    for contributions in ({}, {u: NAN for u in units}, lambda hu: None,
+                          {u: T / 2 for u in units}, None):
+        HXN.approach_contributions = contributions
+        simulate_strictly(sys)
+        assert network_record(HXN) == reference
+        info = HXN.synthesis_info
+        assert (info['approach_contributions'] == T / 2).all()
+        assert (float(info['min_approach_margin']).hex()
+                == float(info['min_approach'] - T).hex())
+    if splitting: assert HXN.new_splitters
+
 # ---------------------------------------------------------------------------
 # B. Uniform contributions
 # ---------------------------------------------------------------------------
@@ -239,6 +345,42 @@ def test_uniform_contributions_equal_doubled_T_min_app(name):
                - plan_ref.info['min_approach']) <= 1e-9
     assert abs(plan.info['min_approach_margin']
                - (plan_ref.info['min_approach'] - 2. * x)) <= 1e-9
+
+def test_uniform_contributions_in_the_facility():
+    # KEMP: every unit at 5 K with T_min_app = 4 synthesizes the network of
+    # T_min_app = 10
+    units = cp_units('contributions_uniform', KEMP, 300.)
+    sys, HXN = simulate_HXN(units, 10., 'contributions_uniform')
+    ref = [(hx.ID, hx.Q) for hx in HXN.new_HXs]
+    HXN.T_min_app = 4.
+    HXN.approach_contributions = {u: 5. for u in units}
+    simulate_strictly(sys)
+    assert [hx.ID for hx in HXN.new_HXs] == [ID for ID, _ in ref]
+    assert_allclose([hx.Q for hx in HXN.new_HXs], [Q for _, Q in ref],
+                    rtol=1e-9)
+    assert all(hx.dT == 10. - 1e-6 for hx in HXN.new_HXs)
+    assert (HXN.synthesis_info['approach_contributions'] == 5.).all()
+
+def test_contributions_equal_to_a_shift_are_exact():
+    # r002 at T_min_app = 10 with H1 at 2 K has the shifts of the default
+    # run at 7 K (hot 5 + 2, cold 5 - 5), so its network is that one to the
+    # bit
+    units = cp_units('contributions_shift_7', R002_UNITS, 300.)
+    sys, HXN = simulate_HXN(units, 7., 'contributions_shift_7')
+    reference = network_record(HXN)
+    min_approach = HXN.synthesis_info['min_approach']
+    units = cp_units('contributions_shift_10', R002_UNITS, 300.)
+    sys, HXN = simulate_HXN(units, 10., 'contributions_shift_10',
+                            approach_contributions={units[3]: 2.})
+    info = HXN.synthesis_info
+    assert network_record(HXN) == reference
+    assert info['status'] == 'mer'
+    assert (float(info['min_approach_margin']).hex()
+            == float(min_approach - 7.).hex())
+    assert info['approach_contributions'].tolist() == [5., 5., 5., 2.]
+    assert all(hx.dT == 7. - 1e-6 for hx in HXN.new_HXs)
+    assert round(info['Q_hot_target'] / 3600., 6) == 74.
+    assert round(info['Q_cold_target'] / 3600., 6) == 444.
 
 @pytest.mark.parametrize('name', ['case_05_boiling_cold',
                                   'case_08_two_condensers'])
@@ -422,9 +564,184 @@ def test_exact_check_and_repair_per_pair():
         hxn_synthesis._realize(plan, new, curves, knots, streams_inlet,
                                is_hot, shift[:3])
 
+def facility_case(name):
+    """(units, T_min_app, stream_splitting, contributions by unit) of a
+    facility case with contributions: the corpus factors on constant-CP
+    split cases, and hand values in the case's own unit order on
+    real-thermo ones."""
+    if name in CASES:
+        units, T = CASES[name][0]()
+        values, splitting = {
+            'case_04_report_case': ([1., 4., 2., 6.], True),
+            'case_08_two_condensers': ([1., 4., 2., 6., 3., 0.5], False),
+        }[name]
+        return units, T, splitting, dict(zip(units, values))
+    case = _case(name)
+    units, T = _build(case)
+    scale = T_UNITS[case['T_unit']][0]
+    return units, T, True, dict(zip(units, [
+        scale * c for c in corpus_contributions(case)]))
+
+@pytest.mark.parametrize('name', ['smith2005_ex18_2_split',
+                                  '7sp4_dolan1990_dt10K',
+                                  'case_04_report_case',
+                                  'case_08_two_condensers'])
+def test_facility_contributions_split_and_unsplit(name):
+    # the facility reaches the contribution-aware problem table's targets
+    # and keeps every pair's own requirement on the exact stream states
+    units, T, splitting, C = facility_case(name)
+    sys, HXN = simulate_HXN(units, T, f'contributions_{name}',
+                            stream_splitting=splitting,
+                            approach_contributions=C)
+    info = HXN.synthesis_info
+    # Theorem M with splitting; observed for case_08 (unsplit)
+    assert info['status'] == 'mer'
+    table, total = contribution_table(units, T, C.get)
+    heat, cool = actual_loads(HXN)
+    assert abs(heat - table.hot_util_load) <= STATUS_RTOL * total
+    assert abs(cool - table.cold_util_load) <= STATUS_RTOL * total
+    assert abs(HXN.energy_balance_percent_error) < 1e-6
+    for hx in HXN.new_HXs:
+        r = required(HXN, hx, C.get)
+        assert internal_approach(hx) >= r - APPROACH_TOL, hx.ID
+        assert abs(hx.dT - (r - 1e-6)) <= 1e-12, hx.ID
+    assert info['min_approach_margin'] >= -APPROACH_TOL
+    assert info['approach_contributions'].tolist() == [
+        C[hx] for hx in HXN.original_heat_exchangers]
+    planned = info['plan_targets']
+    assert abs(planned['Q_hot'] - table.hot_util_load) <= CASCADE_RTOL * total
+    assert abs(planned['Q_cold'] - table.cold_util_load) <= CASCADE_RTOL * total
+    assert abs(planned['pinch_T'] - table.pinch_T) <= 1e-9
+    assert planned['cut'] == _pinch_cut(table)
+    if splitting: assert HXN.new_splitters and info['splits']
+
+@pytest.mark.parametrize('sort_hus_by_T', [False, True])
+def test_pinch_Ts_per_stream(sort_hus_by_T):
+    # KEMP (300 K above the classic temperatures) at 10 K with C1 at 2, H2
+    # at 6 and C3 at 1 K (H4 at the default 5 K): 7 kW of heating (closed
+    # form, see test_problem_table_matches_classic_cascade); every stream's
+    # pinch temperature is the shifted pinch plus its own shift
+    units = cp_units('contributions_pinch_Ts', KEMP, 300.)
+    C1, H2, C3, H4 = units
+    hand = {C1: 2., H2: 6., C3: 1., H4: 5.}
+    sys, HXN = simulate_HXN(units, 10., 'contributions_pinch_Ts',
+                            sort_hus_by_T=sort_hus_by_T,
+                            approach_contributions={C1: 2., H2: 6., 'C3': 1.})
+    info = HXN.synthesis_info
+    assert info['status'] == 'mer' # observed
+    assert round(info['Q_hot_target'] / 3600., 6) == 7.
+    hxs = HXN.original_heat_exchangers
+    assert info['approach_contributions'].tolist() == [hand[hx] for hx in hxs]
+    pinch_T = info['plan_targets']['pinch_T']
+    expected = {'C1': 379., 'C3': 380., 'H2': 387., 'H4': 386.}
+    for i, hx in enumerate(hxs):
+        hot = i not in HXN.cold_indices
+        T_p = pinch_T + 5. + (hand[hx] if hot else -hand[hx])
+        T_in, T_out = HXN.inlet_Ts[i], HXN.outlet_Ts[i]
+        # every stream reaches the pinch (C3 starts there)
+        assert min(T_in, T_out) <= T_p <= max(T_in, T_out), hx.ID
+        assert abs(HXN.pinch_Ts[i] - T_p) <= 1e-9, hx.ID
+        assert abs(T_p - expected[hx.ID]) <= 1e-9, hx.ID
+
 # ---------------------------------------------------------------------------
-# D. Validation
+# D. Keys and validation
 # ---------------------------------------------------------------------------
+
+def test_contribution_keys_on_auxiliary_units():
+    # column D1 holds its condenser and reboiler as auxiliary units, flash F1
+    # its heater; D1_H1 and D1_H2 have no owner
+    D1, D1_H1, D1_H2, F1 = quickstart('contributions_keys')
+    units = [D1, D1_H1, D1_H2, F1]
+    bst.System.from_units('contributions_keys', units=units).simulate()
+    hus = bst.process_tools.heat_exchanger_utilities_from_units(units)
+    IDs = [hu.unit.ID for hu in hus]
+    assert sorted(IDs) == ['D1_H1', 'D1_H2', 'condenser', 'heat_exchanger',
+                           'reboiler']
+    none = dict.fromkeys(IDs)
+
+    def resolve(x):
+        return dict(zip(IDs, hxn_synthesis._stream_contributions(hus, x)))
+
+    # an owner's key covers its auxiliary units; the nearest key wins
+    assert resolve({'D1': 3.}) == none | {'condenser': 3., 'reboiler': 3.}
+    assert resolve({'D1': 3., ('D1', 'condenser'): 1.}) == none | {
+        'condenser': 1., 'reboiler': 3.}
+    assert resolve({D1: 3., D1.condenser: 1.}) == none | {
+        'condenser': 1., 'reboiler': 3.}
+    assert resolve({F1: 2., D1_H1: 4., 'D1_H2': 1.,
+                    ('D1_H1', 'D1_H1'): 4.}) == none | {
+        'heat_exchanger': 2., 'D1_H1': 4., 'D1_H2': 1.}
+    # None and nan are an explicit default at their level
+    for unspecified in (None, NAN):
+        assert resolve({'D1': 3., ('D1', 'condenser'): unspecified}) == (
+            none | {'reboiler': 3.})
+    assert resolve({D1: None, 'D1': NAN}) == none
+    # same-level keys must agree; a bare auxiliary ID names nothing
+    assert resolve({D1: 3., 'D1': 3., ('D1', 'D1'): 3.})['reboiler'] == 3.
+    for x in ({D1_H1: 4., 'D1_H1': 3.}, {D1: 3., 'D1': 2.},
+              {D1: None, 'D1': 3.}, {'D1': 3., D1.reboiler: 1.,
+                                     ('D1', 'reboiler'): 2.}):
+        with pytest.raises(ValueError, match='different values at the same '
+                                             'level'):
+            resolve(x)
+    with pytest.raises(ValueError, match="name no unit: 'condenser', "
+                                         r"\('D1', 'nope'\)"):
+        resolve({'condenser': 1., ('D1', 'nope'): 1., 'D1': 2.})
+    # sequence (aligned with hus) and callable (once per heat utility, in
+    # order) forms; heat utility and other keys are rejected
+    assert hxn_synthesis._stream_contributions(
+        hus, [1., None, NAN, 2., 3.]) == [1., None, None, 2., 3.]
+    calls = []
+    def f(hu):
+        calls.append(hu)
+        return 2. if hu.unit.owner is D1 else None
+    assert resolve(f) == none | {'condenser': 2., 'reboiler': 2.}
+    assert [id(hu) for hu in calls] == [id(hu) for hu in hus]
+    with pytest.raises(TypeError, match='a heat utility cannot be an '
+                                        r'approach_contributions key.*hu\.unit'):
+        resolve({hus[0]: 1.})
+    for key in (1, ('D1',), ('D1', 'condenser', 'x'), ('D1', 1), D1.ins[0]):
+        with pytest.raises(TypeError, match='keys must be units'):
+            resolve({key: 1.})
+    # stale auxiliary units: biosteam.HXutilities rebuilds its exchangers at
+    # every simulation, and a key holding an old one names the new one
+    bst.main_flowsheet.set_flowsheet('contributions_stale')
+    bst.settings.set_thermo(['Water'], cache=True)
+    water = bst.Stream('water', Water=100., T=300., P=5e6, units='kmol/hr')
+    U = bst.HXutilities('U', ins=water, T=500., rigorous=False)
+    U.simulate()
+    old = U.heat_exchangers[0]
+    U.simulate()
+    stale_hus = bst.process_tools.heat_exchanger_utilities_from_units([U])
+    assert len(stale_hus) > 1
+    assert all(hu.unit is not old for hu in stale_hus)
+    assert hxn_synthesis._stream_contributions(stale_hus, {old: 2., 'U': 3.}) \
+        == [2.] + [3.] * (len(stale_hus) - 1)
+
+def test_contribution_keys_in_the_facility():
+    # the facility, simulated twice: every key resolves to the hand values
+    D1, D1_H1, D1_H2, F1 = quickstart('contributions_keys_facility')
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5., approach_contributions={
+        'D1': 1., ('D1', 'condenser'): 1.5, F1: 1., 'D1_H1': 4.,
+        D1.reboiler: 2.})
+    sys = bst.System.from_units('contributions_keys_facility',
+                                units=[D1, D1_H1, D1_H2, F1, HXN])
+    hand = {'condenser': 1.5, 'reboiler': 2., 'heat_exchanger': 1.,
+            'D1_H1': 4., 'D1_H2': 2.5}
+    of_unit = lambda unit: hand[unit.ID]
+    for _ in range(2):
+        simulate_strictly(sys)
+        info = HXN.synthesis_info
+        assert info['status'] == 'mer' # observed
+        assert info['approach_contributions'].tolist() == [
+            hand[hx.ID] for hx in HXN.original_heat_exchangers]
+        assert info['min_approach_margin'] >= -APPROACH_TOL
+        assert len({round(hx.dT, 6) for hx in HXN.new_HXs}) > 1
+        for hx in HXN.new_HXs:
+            r = required(HXN, hx, of_unit)
+            assert abs(hx.dT - (r - 1e-6)) <= 1e-12, hx.ID
+            # ternary streams (internal_approach takes binaries at most)
+            assert sampled_approach(hx) >= r - APPROACH_TOL, hx.ID
 
 def test_invalid_contributions(monkeypatch):
     streams = streams_from(LINNHOFF4)
@@ -480,3 +797,102 @@ def test_invalid_contributions(monkeypatch):
         synthesize_network(hus, 0., approach_contributions=[1., 1., 1., 1.])
     with pytest.raises(AssertionError, match='copied'): # valid: flashes next
         synthesize_network(hus, 10., approach_contributions=[1., 2., None, 4.])
+    # mappings and callables: keys and values are checked before any flash
+    for x, error, match in [
+            ({'nope': 1., 'C1': 2.}, ValueError, "name no unit: 'nope'"),
+            ({hus[0]: 1.}, TypeError, 'a heat utility cannot be'),
+            ({'C1': 2., ('H1', 'H1'): -1.}, ValueError,
+             r"approach contribution of key \('H1', 'H1'\) must be"),
+            (lambda hu: 0. if hu.unit.ID == 'C2' else None, ValueError,
+             r"approach contribution of unit \('C2', 'C2'\) must be"),
+            ({'C1': 2., units[0]: 3.}, ValueError, 'different values')]:
+        with pytest.raises(error, match=match):
+            synthesize_network(hus, 10., approach_contributions=x)
+    with pytest.raises(ValueError, match='T_min_app must be finite and > 0'):
+        synthesize_network(hus, 0., approach_contributions={'C1': 2.})
+    # a zero-duty heat utility of hus may be keyed (it is then dropped)
+    idle_in = bst.Stream('idle_in', Fluid=1000., T=400., units='kmol/hr')
+    idle = bst.HXutility('idle', ins=idle_in, T=400., rigorous=False)
+    idle.simulate()
+    assert idle.heat_utilities[0].duty == 0.
+    for x in ({idle: 3., 'C1': 2.}, lambda hu: 3.):
+        with pytest.raises(AssertionError, match='copied'):
+            synthesize_network(hus + idle.heat_utilities, 10.,
+                               approach_contributions=x)
+
+def test_invalid_contributions_in_the_facility():
+    # bad keys and values raise at simulate, even when their unit is idle;
+    # valid keys of idle or ignored units have no effect
+    units = cp_units('contributions_invalid_facility', R002_UNITS, 300.)
+    idle_in = bst.Stream('idle_in', Fluid=1000., T=400., units='kmol/hr')
+    idle = bst.HXutility('idle', ins=idle_in, T=400., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=10., ignored=[units[0]])
+    sys = bst.System.from_units('contributions_invalid_facility',
+                                units=[*units, idle, HXN])
+    simulate_strictly(sys)
+    reference = network_record(HXN)
+    for x, error, match in [
+            ({'nope': 1.}, ValueError, 'name no unit'),
+            ([1.] * 3, TypeError, 'must be a mapping or a callable'),
+            (np.ones(3), TypeError, 'must be a mapping or a callable'),
+            ({units[1].heat_utilities[0]: 1.}, TypeError,
+             'a heat utility cannot be'),
+            ({idle: -1.}, ValueError, 'approach contribution of key'),
+            ({idle: 2., 'idle': 3.}, ValueError, 'different values'),
+            ({units[0]: 2., ('C1', 'C1'): None}, ValueError,
+             'different values')]:
+        HXN.approach_contributions = x
+        with pytest.raises(error, match=match):
+            sys.simulate()
+    for x in ({units[0]: 3., idle: 2.}, {idle: 2., 'idle': 2., 'C2': NAN}):
+        HXN.approach_contributions = x
+        simulate_strictly(sys)
+        assert network_record(HXN) == reference
+        assert HXN._resolved_contributions is None
+
+# ---------------------------------------------------------------------------
+# E. Cache
+# ---------------------------------------------------------------------------
+
+def test_cache_reuses_unless_contributions_change():
+    # a cached network is reused while the explicit contributions resolve
+    # to the same values per stream; T_min_app is not part of the key
+    units = cp_units('contributions_cache', KEMP, 300.)
+    C = {units[0]: 2., 'H2': 6.}
+    sys, HXN = simulate_HXN(units, 10., 'contributions_cache',
+                            cache_network=True, approach_contributions=C)
+    by_ID = lambda: dict(zip([hx.ID for hx in HXN.original_heat_exchangers],
+                             HXN._resolved_contributions))
+    assert by_ID() == {'C1': 2., 'H2': 6., 'C3': None, 'H4': None}
+    first = HXN.HXN_sys
+
+    def simulate(reused):
+        network = HXN.HXN_sys
+        simulate_strictly(sys)
+        assert (HXN.HXN_sys is network) == reused
+        assert HXN._synthesis_options == (False,)
+        return HXN.HXN_sys
+
+    simulate(True)
+    C['H2'] = 3.
+    second = simulate(False)
+    assert second is not first
+    assert by_ID() == {'C1': 2., 'H2': 3., 'C3': None, 'H4': None}
+    hand = {'C1': 2., 'H2': 3., 'C3': 5., 'H4': 5.}
+    for hx in HXN.new_HXs:
+        r = required(HXN, hx, lambda unit: hand[unit.ID])
+        assert abs(hx.dT - (r - 1e-6)) <= 1e-12, hx.ID
+    # observed: C1-H2 5 K, C1-H4 7 K, C3-H2 8 K
+    assert {round(hx.dT, 6) for hx in HXN.new_HXs} == {4.999999, 6.999999,
+                                                       7.999999}
+    HXN.approach_contributions = lambda hu: {'C1': 2., 'H2': 3.}.get(hu.unit.ID)
+    simulate(True)
+    HXN.T_min_app = 8.
+    simulate(True)
+    HXN.approach_contributions = None
+    simulate(False)
+    assert HXN._resolved_contributions is None
+    HXN.approach_contributions = {}
+    simulate(True)
+    HXN.T_min_app = 9.
+    simulate(True)
