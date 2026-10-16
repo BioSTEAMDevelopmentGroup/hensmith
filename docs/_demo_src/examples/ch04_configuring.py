@@ -9,7 +9,9 @@
 """Tutorial chapter 04 (docs/source/tutorial/04_configuring.rst): configuring a
 HeatExchangerNetwork -- sweeping the minimum approach temperature to expose the
 utility/capital trade-off, splitting streams where the targets need it
-(``stream_splitting=True``), scoping the analysis with ``ignored=``, and
+(``stream_splitting=True``), giving streams their own approach temperature
+contributions (``approach_contributions=``), scoping the analysis with
+``ignored=``, and
 synthesizing a larger ten-stream system (the ten-stream case of the regression
 suite, inlined here rather than imported from ``tests``). Regions between
 ``# [start:x]`` / ``# [end:x]`` are literalinclude'd by the page; everything
@@ -128,6 +130,32 @@ def main():
         HXN.stream_splitting = False
         HXN.T_min_app = 5.
         # [end:splitting]
+    with capturing('ch04_contributions'):
+        # [start:contributions]
+        HXN.approach_contributions = {
+            'D1': 1.,      # the column's condenser and reboiler: phase change
+            F1: 1.,        # the flash's heater boils its feed
+        }                  # the two product coolers keep T_min_app / 2 = 2.5 K
+        sys.simulate()
+        info = HXN.synthesis_info
+        print(f"status: {info['status']}, {len(HXN.new_HXs)} process exchangers, "
+              f"{HXN.installed_costs['Heat exchangers']:.4g} USD added installed cost")
+        print(f'heating {HXN.actual_heat_util_load:.4g} kJ/hr, '
+              f'cooling {HXN.actual_cool_util_load:.4g} kJ/hr')
+        contributions = info['approach_contributions']   # by stream, as used
+        print('contributions by stream [K]:', contributions)
+        required = {}                                    # each match: its two streams' sum
+        for c, life_cycle in zip(contributions, HXN.stream_life_cycles):
+            for stage in life_cycle.life_cycle:
+                if stage.unit in HXN.new_HXs:
+                    required[stage.unit] = required.get(stage.unit, 0.) + c
+        for hx in HXN.new_HXs:
+            print(f'{hx.ID:<10} requires {required[hx]:.1f} K, Q = {hx.Q:.4g} kJ/hr')
+        print(f"smallest approach {info['min_approach']:.3f} K, "
+              f"margin over the requirement {info['min_approach_margin']:.2g} K")
+        HXN.approach_contributions = None
+        # [end:contributions]
+    assert info['min_approach_margin'] >= -1e-6 - 1e-9
     with capturing('ch04_ten_streams'):
         # [start:ten_streams]
         bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)

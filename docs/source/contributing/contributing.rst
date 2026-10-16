@@ -82,6 +82,13 @@ Tests live in ``tests/``:
     system is synthesized again with ``stream_splitting=True``, and the
     three that need stream splits must then reach their targets.
 
+``tests/test_hxn_contributions.py``
+    Approach temperature contributions: default bit-for-bit identity
+    in-process, uniform contributions against a doubled ``T_min_app`` and
+    against uniform real-thermodynamics runs, closed-form targets and
+    per-pair exact approaches on corpus and real-thermodynamics cases, key
+    resolution and validation, and the ``cache_network`` rule.
+
 Development environment
 -----------------------
 

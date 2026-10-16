@@ -33,7 +33,8 @@ used to shift hot streams in the problem table and required between the
 streams everywhere inside every synthesized exchanger:
 
 - in :func:`~hensmith.problem_table`, where every hot stream's temperature is
-  shifted *down* by ``T_min_app`` before the streams are compared, so that two
+  shifted *down* by ``T_min_app`` (with approach contributions, every stream
+  by its own shift; see below) before the streams are compared, so that two
   streams which meet on the shifted scale are really ``T_min_app`` apart;
 - in the planner of :func:`~hensmith.synthesize_network`, which admits a
   match only if the two streams stay at least ``T_min_app`` apart at every
@@ -41,8 +42,8 @@ streams everywhere inside every synthesized exchanger:
   not only at its two ends; and
 - on every synthesized process exchanger, whose approach is verified on the
   exact states of its two streams, again along its whole length. The
-  exchanger itself is a ``biosteam.HXprocess`` constructed with
-  ``dT=T_min_app - 1e-6``, a guard against rounding only.
+  exchanger itself is a ``biosteam.HXprocess`` constructed with ``dT`` equal
+  to its pair's required approach minus 1e-6, a guard against rounding only.
 
 Lowering ``T_min_app`` lowers the utility targets and raises exchanger area;
 raising it does the reverse. It is the parameter in hensmith that sets the
@@ -76,7 +77,8 @@ outlet, for instance); what a non-equilibrium end state departs from
 equilibrium at its own end temperature becomes a flat there.
 
 **The shifted grid.** Hot streams are shifted down by ``T_min_app``; cold
-streams are not. The grid ``Ts`` is the sorted (descending) union of the
+streams are not (with approach contributions, every stream by its own shift;
+see below). The grid ``Ts`` is the sorted (descending) union of the
 shifted breakpoints of all curves, temperatures closer than 1e-9 K being one
 grid point. Every temperature at which any stream's curve bends or jumps is
 therefore a grid point, and between two consecutive grid points every stream
@@ -174,6 +176,128 @@ demand of the whole set of streams. That identity is the table's own
 consistency check -- whatever the algorithm does with the cascade, it can
 neither invent nor destroy energy.
 
+Approach temperature contributions
+----------------------------------
+
+A single ``T_min_app`` holds every match to the same driving-force floor,
+whether its streams condense and boil with high film coefficients or are
+gases with low ones. Each stream :math:`j` may therefore carry its own
+*approach temperature contribution* :math:`c_j`, in K, as described by Kemp
+(2007): a process match between hot stream :math:`h` and cold stream :math:`c`
+must keep :math:`c_h + c_c` everywhere inside it, on the exact states, and a
+stream without a contribution contributes ``T_min_app / 2``, so that without
+contributions every pair requires ``T_min_app`` exactly as before. A small
+contribution suits a condensing or boiling stream, a large one a gas.
+:func:`~hensmith.problem_table` takes the contributions as a sequence aligned
+with its streams, :func:`~hensmith.synthesize_network` as a sequence aligned
+with its heat utilities, a mapping or a callable, and
+:class:`~hensmith.HeatExchangerNetwork` as a mapping or a callable (see
+below).
+
+**The shift.** Writing :math:`\Delta T_{min}` for ``T_min_app``, every stream
+is shifted by its own amount, :math:`T^* = T - \mathrm{shift}_j`, with
+
+.. math::
+
+   \mathrm{shift}_h = \tfrac{1}{2} \Delta T_{min} + c_h \quad \text{(hot)},
+   \qquad
+   \mathrm{shift}_c = \tfrac{1}{2} \Delta T_{min} - c_c \quad \text{(cold)},
+
+so that
+
+.. math::
+
+   T^*_h \ge T^*_c \iff T_h - T_c \ge \mathrm{shift}_h - \mathrm{shift}_c
+                     = c_h + c_c.
+
+Two streams that meet on the shifted scale are therefore exactly their pair's
+required approach apart, and the problem table above is built on that scale
+with no other change. A contribution is None or nan (unspecified) or a finite
+number greater than zero. Zero is excluded so that every pair's requirement
+stays positive: a match allowed to touch would have no driving force at its
+pinch and need an infinite area, and its ``HXprocess`` guard, the
+requirement less 1e-6 K, would turn negative. Whenever a contribution is
+given, ``T_min_app`` must be finite and positive as well, since it sets the
+default ``T_min_app / 2``; without contributions ``T_min_app = 0`` is
+accepted as before.
+
+**The default is unchanged, bit for bit.** An unspecified stream gets
+exactly the default shifts, ``T_min_app`` if hot and 0 if cold
+(:math:`x/2 + x/2 = x` and :math:`x/2 - x/2 = 0` hold exactly in floating
+point), and with nothing specified the code takes the old expression
+literally. A run without contributions, with every contribution unspecified
+or with every one equal to ``T_min_app / 2`` gives the same targets and the
+same network, number for number.
+
+**One shifted scale for the planner.** The planner's search sees one curve
+per stream on the shifted scale, not the shifts themselves, and on that scale
+a match is feasible exactly when its real streams keep their pair's
+requirement. The MER targets, the pinch design rules, the remaining problem
+analysis and the guarantee of `Stream splitting`_ below therefore carry over
+unchanged; a branch is its parent's curve with every heat scaled by its
+fraction, so it keeps its parent's shift.
+
+**Per pair on the real scale.** What works on real temperatures uses the
+pair's own value. A pair's required approach is
+:math:`\mathrm{shift}_h - \mathrm{shift}_c` -- equal to :math:`c_h + c_c` up
+to round-off, and to ``T_min_app`` exactly without contributions. The exact
+approach verification and the repair described below enforce it, each
+``HXprocess`` gets it less 1e-6 K as its ``dT``, and
+``synthesis_info['min_approach_margin']`` reports the smallest margin of any
+exchanger's exact approach over its own pair's requirement (no less than
+-1e-6 K, the check's rounding guard), next to ``'min_approach'``, the
+smallest approach itself. Wherever this page says that a match keeps
+``T_min_app``, read its pair's required approach.
+
+**Per-stream pinch temperatures.** The pinch of the problem table, and the
+``'pinch_T'`` of ``synthesis_info['plan_targets']``, stay on the shifted
+scale. Stream :math:`j`'s own pinch temperature is that pinch plus
+:math:`\mathrm{shift}_j` -- ``T_min_app`` above it for a hot stream and at
+it for a cold one by default -- and that is what the facility's ``pinch_Ts``
+reports. The real composite curves no longer keep one fixed distance: they
+can come as close as the smallest hot plus the smallest cold contribution,
+and only the shifted curves carry the pinch.
+
+**Utilities are not affected.** The contributions apply to the process
+matches only: each stream's utility exchanger gets its agent from BioSTEAM's
+own rule (``HeatUtility.dT`` plus the agent's ``dT``), whatever the stream's
+contribution.
+
+**Keys in the facility.** :class:`~hensmith.HeatExchangerNetwork` takes a
+mapping or a callable, since the order of its streams is internal. A mapping's
+keys name units: a unit object (matched by identity, or by its owner's ID
+and its own), the ID of a unit without an owner (``'D1'``), or
+``(owner.ID, unit.ID)`` for an auxiliary unit (``('D1', 'condenser')``; a
+bare auxiliary ID such as ``'condenser'`` names nothing). A heat utility
+takes the value of
+the key nearest to its unit along the unit's chain of owners, so ``'D1'``
+covers a column's condenser and reboiler and ``('D1', 'condenser')``
+overrides it for the condenser. A None or nan value is an explicit default
+that wins at its level like any value, and two keys of the same level for a
+unit must agree. ID keys are the robust form: a unit that rebuilds its
+auxiliary units at every simulation (``biosteam.HXutilities``, for one)
+leaves a key holding an old auxiliary object to be matched by its owner's ID
+and its own. Heat utilities cannot be keys, because BioSTEAM replaces them
+at every simulation; a value per heat utility is given by a callable
+``f(hu)`` instead, which is called once per heat utility at every simulation
+and should therefore be pure. The keys and values are checked against every
+unit available to the network and its auxiliary units before any heat
+utility is filtered out: a key that names none of them, a bad value or two
+conflicting keys raise a ``ValueError`` even while their unit is idle, but a
+valid key whose unit holds no heat utility in a simulation (no duty,
+``ignored``, ``hxn_ok=False``) has no effect, so that a Monte Carlo sample in
+which a unit falls idle does not fail.
+
+**The cache.** With ``cache_network=True``, a cached network is reused only
+while the explicit contributions resolve to the same value for every stream
+(see *Reusing a network* below). Without explicit contributions the reuse
+test is the one described there, so changing ``T_min_app`` alone still keeps
+a cached network.
+
+**Additive requirements only.** A requirement that belongs to a pair but is
+not the sum of two stream terms cannot be written as one shift per stream,
+so it has no problem table and is not supported.
+
 Targets: MER, pinch, composite and grand composite curves
 ---------------------------------------------------------
 
@@ -190,7 +314,9 @@ overlap horizontally, heat can pass from hot to cold: that overlap is the heat
 recovered by process exchange. The overhang of the cold curve at its warm end
 is the hot utility, and the overhang of the hot curve at its cold end is the
 cold utility. The place where the curves come closest vertically is the pinch,
-and by construction they approach no closer than ``T_min_app``.
+and by construction they approach no closer than ``T_min_app`` (with approach
+contributions, no closer than the smallest hot plus the smallest cold
+contribution; the shifted curves carry the pinch).
 
 .. figure:: /_static/images/examples/tutorial_02_composite_curves.png
    :class: white-bg
@@ -537,7 +663,8 @@ own utilities. If no process match was made at all, the facility reports zero
 capital and no utilities.
 
 **Reusing a network.** With ``cache_network=True`` a later simulation checks
-whether the set of units behind the heat utilities is unchanged; if it is, the
+whether the set of units behind the heat utilities, and the explicit approach
+contributions they resolve to, are unchanged; if they are, the
 same network configuration is reused instead of being synthesized again. Each
 life cycle's first inlet is copied from the current stream, and each process
 exchanger keeps, as the enthalpy limit of its *must* stream (the hot stream
@@ -588,8 +715,10 @@ checked the same way, against the quenched outlet enthalpy and temperature.
 **The approach inside every exchanger.** The synthesis verifies every process
 exchanger on the exact states of its streams (see *Exact approach
 verification* above) and records the smallest approach it found in
-``synthesis_info['min_approach']``; the tests re-check it with temperatures
-computed independently of the code under test.
+``synthesis_info['min_approach']``, and the smallest margin of an
+exchanger's approach over its pair's required approach in
+``synthesis_info['min_approach_margin']``; the tests re-check both with
+temperatures computed independently of the code under test.
 
 **MER identification and achievement.** ``tests/test_hxn_mer.py`` synthesizes
 a corpus of 78 problems through the public facility. For 40 of them -- 24
@@ -619,14 +748,35 @@ systems of increasing complexity -- all with phase-changing streams from the
 third on -- and for each one requires that the synthesized network (i) closes
 its energy balance without raising ``RuntimeWarning``, (ii) never uses less
 hot or cold utility than the MER targets computed on the same streams, and
-reports ``'mer'`` exactly when it reaches them, (iii) keeps ``T_min_app``
-inside every process exchanger on exact states, (iv) is planned on the
+reports ``'mer'`` exactly when it reaches them, (iii) keeps each pair's
+required approach inside every process exchanger on exact states, (iv) is planned on the
 problem table's own cascade, and (v) recovers at least as much heat as a load
 recorded in the test file. A network that improves leaves slack in (v); those
 recorded numbers are lowered deliberately by a maintainer, never raised to
 make a failing test pass. Every case is synthesized again with
 ``stream_splitting=True`` and held to the same checks, and the three cases
 that need stream splits for MER must then reach their targets.
+
+**Approach contributions.** ``tests/test_hxn_contributions.py`` checks the
+contributions against references that do not use them. Without
+contributions -- and with every contribution unspecified or equal to
+``T_min_app / 2`` -- plans, problem tables and facility networks must equal
+the default ones bit for bit, compared in-process. Every stream at
+:math:`x` must plan the network of ``T_min_app`` :math:`= 2x`, and on
+real-thermodynamics cases all hot streams at :math:`a` and all cold ones at
+:math:`b` must give the default targets at ``T_min_app`` :math:`= a + b`.
+With mixed contributions, the targets of 40 random problems, of the 24
+constant heat capacity no-split problems of the MER corpus and of five split
+ones (which must reach MER with ``stream_splitting=True``) must equal a
+closed-form constant heat capacity cascade with the classic symmetric shifts,
+and every planned match must keep its pair's requirement on recomputed
+temperatures. The facility, with and without splits, on constant heat
+capacity and real-thermodynamics cases, must reach the contribution-aware
+targets, keep each pair's requirement on exact states recomputed
+independently and give each exchanger its pair's ``dT``; the exact check and
+the repair must act on each pair's own requirement. The key rules, the
+validation of keys and values (for idle units too, and before any stream is
+flashed) and the ``cache_network`` rule are tested as well.
 
 **Doctests.** The examples in the docstrings are executed as part of the test
 suite, so the numbers printed in the API reference are numbers the code
@@ -640,9 +790,10 @@ What the synthesized network is guaranteed to be:
 - **Never better than MER.** Its utilities are never below the targets of the
   problem table, and ``'mer'`` is reported only if the realized network
   reaches them.
-- **Feasible everywhere inside.** Every process exchanger keeps
-  ``T_min_app - 1e-6`` K on the exact stream states at its ends and at every
-  checked position inside it, and the heat balance closes on every stream.
+- **Feasible everywhere inside.** Every process exchanger keeps its pair's
+  required approach (``T_min_app``, or ``c_h + c_c``) minus 1e-6 K on the
+  exact stream states at its ends and at every checked position inside it,
+  and the heat balance closes on every stream.
 - **Deterministic.** The search is budgeted in work units, not seconds, so
   the same streams give the same network however fast the machine is.
 
@@ -685,11 +836,12 @@ What it is not:
   utilities flagged as not usable for HXN integration (``hxn_ok=False``) or
   with non-positive flow, and streams excluded with ``ignored``, are removed
   from the analysis entirely.
-- **One approach temperature for everything.** A single ``T_min_app`` shifts
-  the problem table and constrains every synthesized exchanger. There is no
-  per-stream or per-match approach temperature, so a match whose exchange is
-  cheap and one whose exchange is expensive are held to the same driving-force
-  floor.
+- **Additive approach temperatures only.** Per-stream approach temperature
+  contributions are supported, so a match's requirement is ``T_min_app`` or
+  the sum of its two streams' contributions; a requirement that belongs to a
+  pair and is not such a sum is not (see
+  `Approach temperature contributions`_). The utility exchangers use
+  BioSTEAM's approach rule whatever a stream's contribution.
 
 References
 ----------
