@@ -1,0 +1,8 @@
+<Supertargets: 74 points, T_min_app 11-60 K, optimum 21.59 K (TAC 9.164e+04 USD/yr)>
+Q_hot                    4.17333e+06
+area                     719.848
+N_units                  3
+installed_cost           439986
+annualized_capital_cost  71605.6
+operating_cost           20032
+TAC                      91637.6

@@ -13,13 +13,19 @@ reports the utility loads and capital cost that result. The original units,
 streams and heat exchangers are left untouched: the stream copies and
 synthesized exchangers live in a separate flowsheet named ``<sys>_HXN``. See
 :doc:`../tutorial/index` for a worked example and :doc:`../concepts` for the
-method.
+method. :meth:`~HeatExchangerNetwork.targets` returns the targets of the
+facility's streams (a :class:`PinchTargets`: utilities, area, units, capital
+and total annualized cost) without synthesizing anything, and
+:func:`network_report` compares the synthesized network with them
+(:doc:`targeting`).
 
 .. autoclass:: HeatExchangerNetwork
    :no-members:
    :show-inheritance:
 
 .. automethod:: HeatExchangerNetwork.plot_pinch_diagram
+
+.. automethod:: HeatExchangerNetwork.targets
 
 Constructor options
 -------------------

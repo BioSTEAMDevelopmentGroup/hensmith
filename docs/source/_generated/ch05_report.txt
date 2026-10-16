@@ -1,0 +1,15 @@
+                        network     target
+utility cost [USD/hr]   1839.61     1839.61
+units                   7           6
+area [m2]               7462        5946
+area, biosteam [m2]     5536
+installed cost [USD]    2.184e+06   2.282e+06
+TAC [USD/yr]            15072295    15088200
+exchanger    area   biosteam [m2]
+HX_1_2_hs    466    495
+HX_0_2_hs    3097   3101
+HX_1_4_hs    1      1
+HX_1_3_hs    460    459
+Util_2_cs    101    103
+Util_0_hs    356    177
+Util_1_hs    2983   1200

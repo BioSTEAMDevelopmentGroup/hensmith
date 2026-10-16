@@ -128,8 +128,9 @@ makes the split instead.
    part of the cost curve: 2.977e+08 kJ/hr of heating, 1.936e+06 kJ/hr of
    cooling and 1.112e+06 USD of added installed cost. Choosing ``T_min_app`` is
    choosing a point on these two curves; the economically sensible one depends
-   on utility prices and on the cost of exchanger area, neither of which the
-   network optimizes for you.
+   on utility prices and on the cost of exchanger area; synthesis does not
+   optimize them, but :doc:`05_targeting` targets both and finds the
+   ``T_min_app`` that minimizes their sum.
 
 Splitting streams
 -----------------
@@ -443,6 +444,9 @@ the real streams.
 Where to next
 -------------
 
+- :doc:`05_targeting` -- targeting the area, units and cost that this
+  chapter's sweep traded against the utilities, and the ``T_min_app`` that
+  minimizes the total annualized cost.
 - :doc:`../concepts` -- the pinch concepts, the MER planner and the
   validation behind everything shown in this tutorial.
 - :doc:`../API/api` -- the full API reference, including a table of every

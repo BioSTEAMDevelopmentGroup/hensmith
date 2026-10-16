@@ -5,13 +5,15 @@ Key Concepts
 
 This page collects the ideas hensmith implements: what a minimum approach
 temperature is, how the problem table turns a set of process streams into
-utility targets and a pinch, how :func:`~hensmith.synthesize_network` turns
-those targets into a network of exchangers, and what the result is and is not
+utility targets and a pinch, how those targets extend to several utilities,
+area, units and cost, how :func:`~hensmith.synthesize_network` turns the
+targets into a network of exchangers, and what the result is and is not
 guaranteed to be. Everything below describes the behavior of the code in
-``hensmith/hxn_synthesis.py`` and ``hensmith/_heat_exchanger_network.py``, and
-of their two private helpers, ``hensmith/_curves.py`` (the stream curves) and
-``hensmith/_planner.py`` (the network planner); the :doc:`tutorial/index`
-shows the same concepts on a running system.
+``hensmith/hxn_synthesis.py``, ``hensmith/_heat_exchanger_network.py`` and
+``hensmith/targeting.py``, and of two private helpers,
+``hensmith/_curves.py`` (the stream curves) and ``hensmith/_planner.py`` (the
+network planner); the :doc:`tutorial/index` shows the same concepts on a
+running system.
 
 Heat integration and the minimum approach temperature
 -----------------------------------------------------
@@ -329,7 +331,8 @@ contribution; the shifted curves carry the pinch).
    utility of 1.936e+06 kJ/hr. The curves come closest at the cold end, where
    the pinch of this system lies -- 298.15 K on the shifted scale.
    :doc:`tutorial/02_pinch_analysis` builds this figure from a
-   :class:`~hensmith.ProblemTable`.
+   :class:`~hensmith.ProblemTable`; :doc:`tutorial/05_targeting` draws it
+   with the library.
 
 The **grand composite curve** plots the same cascade differently: the heat
 carried through each shifted grid temperature once the minimum hot utility is
@@ -339,10 +342,164 @@ curve's minimum may be strictly positive and the pinch is placed at the top of
 the grid, ``Ts[0]``, by convention. Its shape shows where in the temperature
 range utility has to be added or removed.
 
+Both curves are library functions: :class:`~hensmith.PinchTargets` returns
+them (:meth:`~hensmith.PinchTargets.composite_curves`, on the real or the
+shifted scale, and :meth:`~hensmith.PinchTargets.grand_composite_curve`), on
+the knots of the table's own grid, so they reproduce the table to rounding;
+:func:`~hensmith.plot_composite_curves` and
+:func:`~hensmith.plot_grand_composite_curve` draw them.
+
 Both pictures express the three rules of pinch design: **no heat may cross the
 pinch**, **no cold utility may be used above it**, and **no hot utility below
 it**. Violating any one of them makes the network use more of both utilities
 than the targets require, by the amount transferred across the pinch.
+
+Multiple utilities on the grand composite curve
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The MER targets say how much heat the utilities must supply and remove, not
+which utilities. :meth:`~hensmith.PinchTargets.utility_targets` places
+BioSTEAM's heating and cooling agents on the grand composite curve, heating
+and cooling separately, and prices each one with BioSTEAM.
+
+**Levels.** BioSTEAM lets a heating agent serve a stream only below
+``agent.T - agent.dT - dT``, and a cooling agent only above ``agent.T +
+agent.dT + dT``, where ``dT`` is ``bst.HeatUtility.dT``, read at call time.
+On the shifted scale that limit is the agent's **level**: the limit itself for
+a heating agent and the limit less ``T_min_app`` for a cooling agent, which is
+BioSTEAM's rule exactly. With approach contributions the streams have
+different shifts, and an agent's level is the highest single shifted
+temperature (the lowest, for cooling) at which it serves no stream beyond that
+stream's own real limit; streams with slack are then served conservatively.
+
+**List order and fuel.** Non-fuel agents are placed in the order of
+BioSTEAM's lists, BioSTEAM's own "first feasible agent" rule: for the default
+lists, the lowest pressure steam first, and the warmest coolant first. Each
+takes as much of the remaining duty as the curve above its level (below it,
+for cooling) allows, given the agents already placed. What remains of the
+heating goes to the first fuel agent, a furnace at the top of the curve; if
+there is none, or if some cooling remains, it is left unserved, with a
+``RuntimeWarning`` and a nan cost. A level equal to a grid temperature
+serves that temperature's point loads; BioSTEAM's own rule is strict, and the
+two differ only at exact equality.
+
+**Served intervals and pricing.** Each agent is priced as one BioSTEAM heat
+utility over the stretch it serves: from its level to the next zero of the
+**balanced grand composite curve** (the cascade net of the utilities), which
+is the pinch or a *utility pinch* where a lower agent is used to its limit.
+The process temperatures of that stretch are its shifted temperatures plus the
+largest shift of the cold streams in it (heating) or the smallest shift of the
+hot streams (cooling) -- exactly the streams' own temperatures without
+approach contributions, an approximation with them. A sensible agent's outlet
+therefore follows the temperatures it actually serves. BioSTEAM divides each
+duty by the agent's heat transfer efficiency, so a target's ``utility_duty``
+is utility side while its ``duty``, like the MER targets, is process side.
+Each pricing uses fresh utility streams in a temporary flowsheet: the costs
+are deterministic, and the user's flowsheet, the agents and their later costs
+are untouched.
+
+Supertargeting: area, units, capital and total cost
+---------------------------------------------------
+
+Energy is one part of the cost of a network; its exchangers are the other.
+Supertargeting targets the exchangers too -- their area, their number and
+their capital cost -- before design, like the MER targets, and with them the
+total annualized cost, which a sweep of ``T_min_app`` then minimizes
+(Linnhoff & Ahmad, 1990; Ahmad, Linnhoff & Smith, 1990).
+:meth:`~hensmith.PinchTargets.summary` returns every target at one
+``T_min_app`` and :func:`~hensmith.supertarget` sweeps it.
+
+**Balanced composite curves.** Adding the utility targets to the composite
+curves -- the heating utilities to the hot curve, the cooling ones to the cold
+curve -- gives two curves that span the same heat
+(:meth:`~hensmith.PinchTargets.balanced_composite_curves`): a latent agent is a
+flat at its temperature, a sensible one a line between its inlet and outlet
+temperatures, and fuel a furnace that takes no area. If some utility is
+unserved, the curves cannot balance, and the area, capital and total cost
+targets are nan.
+
+**Area.** The area target is Bath's formula (Townsend & Linnhoff, 1984) on
+the balanced composite curves: heat is transferred vertically, from the hot
+curve to the cold curve below it, in counter-current (a correction factor of
+1). Split the heat axis at every breakpoint of either curve into intervals
+:math:`i`; in each, stream or utility :math:`j` carries heat :math:`q_{ij}`,
+and
+
+.. math::
+
+   A = \sum_i \frac{1}{\Delta T_{LM,i}} \sum_j \frac{q_{ij}}{h_j},
+
+where :math:`\Delta T_{LM,i}` is the log-mean temperature difference of
+interval :math:`i` on the real scale and :math:`h_j` the film coefficient of
+:math:`j`. Every curve and every stream's share of it is linear in the heat
+inside an interval, so the sum is exact. hensmith takes :math:`h_j` = 1
+kW/m²/K for every stream and utility by default, which gives any pair
+BioSTEAM's heuristic overall coefficient of 0.5 kW/m²/K (condensing against
+boiling, where BioSTEAM takes 1.0, is not reproduced); ``h=`` and
+``h_utilities=`` set others. A zero driving force anywhere makes the area
+infinite, with a ``RuntimeWarning``, as at ``T_min_app = 0``.
+
+**Units.** A network of :math:`S` streams and utilities that forms one
+connected component needs at least :math:`S - 1` units (Euler's rule). The
+units target applies it to each region between the zeros of the balanced
+grand composite curve -- the process pinch and every utility pinch --,
+:math:`S` counting the streams with heat in the region and the utilities
+acting in it. It is an estimate, **S - 1 per region, assuming one component**:
+a subset of streams that balances on its own needs fewer units.
+
+**Capital.** The area is divided into as many shells of equal area as the
+units target, :math:`N`, less one furnace for all the fuel, and every shell is
+costed with BioSTEAM's own correlations, :math:`N \cdot C(A / N)`; the furnace
+is costed on the fuel's utility duty. BioSTEAM's specifics carry over: a
+double pipe exchanger below 150 ft², whose cost jumps at 150 ft² to that of a
+shell and tube (the floating head correlation is not monotone below about
+126 ft², which the double pipe hides), and no largest shell area. All shells
+are costed at one pressure, ``P``, whereas BioSTEAM takes each exchanger's
+highest inlet pressure; for high pressure steam heaters its pressure factor is
+up to about 12 % higher.
+
+**Total annualized cost.** With a capital recovery factor over :math:`n`
+years at interest :math:`i`,
+
+.. math::
+
+   \mathrm{TAC} = \mathrm{CRF} \, C_{installed} + t_{op} \, C_{utility},
+   \qquad \mathrm{CRF} = \frac{i (1 + i)^n}{(1 + i)^n - 1},
+
+with :math:`i` = 10 %, :math:`n` = 10 years and :math:`t_{op}` = 8000 h/yr
+by default, or taken from a BioSTEAM TEA (``tea=``). It counts the bare module
+cost of the exchangers only: no Lang factor and no working capital.
+
+**The sweep.** :func:`~hensmith.supertarget` evaluates the targets over a grid
+of ``T_min_app`` values, reusing the streams' curves (nothing is flashed
+again), and then refines the grid around the least total annualized cost. The
+cost is not smooth -- the units target jumps, the double pipe switches to a
+shell and tube, the pinch moves -- so the refinement only narrows a bracket,
+and ``at_bound`` flags an optimum at an end of the sweep. With approach
+contributions, only the unspecified streams follow ``T_min_app``;
+``scale_contributions=True`` scales the specified ones with it, the
+contribution scaling of Ahmad, Linnhoff & Smith (1990).
+
+**A network against its targets.** :func:`~hensmith.network_report` compares a
+synthesized network with its targets: utility cost, units, area, capital and
+total annualized cost. Its ``'area'`` re-sizes the network's exchangers like
+the target sizes them (the same film coefficients, a correction factor of 1,
+the integrated driving force along the exact stream profiles and the process
+side duty), so it is comparable with the target; ``'area_biosteam'`` is
+BioSTEAM's own sizing, which includes its correction factor, the terminal
+log-mean temperature difference and the utility side duty. The comparison has
+limits:
+
+- the Bath target bounds the area only with equal film coefficients and the
+  same utilities;
+- the network gives each stream one agent at its outlet, BioSTEAM's list
+  rule, while the target allocates the agents on the grand composite curve,
+  so the network can use costlier agents than the target (on the four-stream
+  problem of Linnhoff & Hindmarsh at 10 K, the target is low pressure steam
+  and cooling water, the network medium pressure steam and chilled water);
+- the units target is an estimate in both directions: a balanced subset of
+  streams, or one agent per stream where the target counts each utility as a
+  stream, needs fewer units; repeated matches and splits need more.
 
 From targets to a network: the pinch-outward MER planner
 --------------------------------------------------------
@@ -778,6 +935,24 @@ the repair must act on each pair's own requirement. The key rules, the
 validation of keys and values (for idle units too, and before any stream is
 flashed) and the ``cache_network`` rule are tested as well.
 
+**Targeting.** ``tests/test_targeting.py`` checks ``hensmith.targeting``
+against references computed independently of it: the composite curves of
+the four-stream problem of Linnhoff & Hindmarsh in closed form, and the
+composite and grand composite curves of constant heat capacity and
+real-thermodynamics cases against their problem tables; the multiple-utility
+allocations and served intervals against duties computed from the agents'
+own attributes, each priced again in isolation; the area target against a
+midpoint integration of hand-built composite curves (with approach
+contributions and per-stream film coefficients too) and against closed
+forms; the units target on eight reference problems, utility pinches and
+balanced subsets among them; the exchanger costs against BioSTEAM's own; the
+capital recovery factor against BioSTEAM's; and the swept optimum against
+the closed-form total annualized cost of a two-stream problem. The
+facility's targets must equal the synthesis's bit for bit, with and without
+approach contributions; the network report's areas must equal independent
+log-mean areas; and targeting must leave the flowsheet's streams, the
+agents, later utility costs and a later synthesis unchanged.
+
 **Doctests.** The examples in the docstrings are executed as part of the test
 suite, so the numbers printed in the API reference are numbers the code
 currently produces.
@@ -820,7 +995,11 @@ What it is not:
 - **Energy first, then units; no cost optimization.** MER always takes
   precedence over the number of exchangers, and an unsplit MER network can
   need many of them. The branch and bound reduces the number of exchangers
-  among MER plans, but nothing optimizes area, capital or total cost.
+  among MER plans, but the synthesis does not optimize area, capital or total
+  cost; ``hensmith.targeting`` targets them, finds the ``T_min_app`` of the
+  least targeted total annualized cost (see `Supertargeting: area, units,
+  capital and total cost`_), and :func:`~hensmith.network_report` compares a
+  network with the targets.
 - **Some networks cannot be represented.** Networks whose match order is
   cyclic are outside the planner's model. A side that needs a split without a
   pinch-rule proof spends its whole MER search budget before the best-effort
@@ -842,6 +1021,13 @@ What it is not:
   pair and is not such a sum is not (see
   `Approach temperature contributions`_). The utility exchangers use
   BioSTEAM's approach rule whatever a stream's contribution.
+- **Targets are estimates.** Beyond the MER targets, the targets of
+  ``hensmith.targeting`` are estimates: the area target bounds a network's
+  area only with equal film coefficients and the same utilities, the units
+  target can be wrong in both directions, the capital target assumes shells
+  of equal area at one pressure, and with approach contributions the utility
+  levels are conservative and their pricing temperatures approximate. The
+  optimum ``T_min_app`` is the optimum of these estimates.
 
 References
 ----------
@@ -855,6 +1041,14 @@ References
 - Seider, W. D., Lewin, D. R., Seader, J. D., Widagdo, S., Gani, R., & Ng,
   M. K. (2017). *Product and Process Design Principles*. Wiley. Heat Exchanger
   Networks (Chapter 9).
+- Townsend, D. W., & Linnhoff, B. (1984). Surface area targets for heat
+  exchanger networks. *IChemE 11th Annual Research Meeting*, Bath, UK.
+- Linnhoff, B., & Ahmad, S. (1990). Cost optimum heat exchanger networks - 1.
+  Minimum energy and capital using simple models for capital cost.
+  *Computers & Chemical Engineering*, 14(7), 729-750.
+- Ahmad, S., Linnhoff, B., & Smith, R. (1990). Cost optimum heat exchanger
+  networks - 2. Targets and design for detailed capital cost models.
+  *Computers & Chemical Engineering*, 14(7), 751-767.
 - Cortes-Pena, Y., Kumar, D., Singh, V., & Guest, J. S. (2020). BioSTEAM: A
   fast and flexible platform for the design, simulation, and techno-economic
   analysis of biorefineries under uncertainty. *ACS Sustainable Chemistry &

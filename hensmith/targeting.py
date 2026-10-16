@@ -2170,20 +2170,28 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                             **text_kwargs)
                 continue
             T, H = (hot_T, hot_H) if u.heating else (cold_T, cold_H)
-            if u.agent.T_limit is None: # beside the agent's flat
+            if u.agent.T_limit is None:
+                # above a heating flat, ending at its warm end (left of it the
+                # hot curve is below the flat), or below a cooling flat from
+                # its cold end (right of it both curves are above the flat)
                 T_u = u.agent.T
-                if u.heating: i = np.searchsorted(T, T_u - 1e-6)
-                else: i = np.searchsorted(T, T_u + 1e-6) - 1
+                if u.heating:
+                    i = np.searchsorted(T, T_u + 1e-6) - 1
+                    offset, ha, va = (-2, 2), 'right', 'bottom'
+                else:
+                    i = np.searchsorted(T, T_u - 1e-6)
+                    offset, ha, va = (2, -2), 'left', 'top'
                 x = H[min(max(i, 0), H.size - 1)]
-            else:
+            else: # beside the middle of a sensible agent's line
                 T_u = 0.5 * (u.T_utility_in + u.T_utility_out)
                 x = np.interp(T_u, T, H)
-            ax.annotate(label, xy=(x, T_u - 273.15),
-                        xytext=(-6 if u.heating else 6, 0),
-                        textcoords='offset points',
-                        ha='right' if u.heating else 'left', va='center',
+                offset = (-6, 0) if u.heating else (6, 0)
+                ha, va = 'right' if u.heating else 'left', 'center'
+            ax.annotate(label, xy=(x, T_u - 273.15), xytext=offset,
+                        textcoords='offset points', ha=ha, va=va,
                         color=hot_color if u.heating else cold_color,
                         gid='Utility:' + u.ID, **text_kwargs)
+        ax.margins(y=0.1) # headroom for a label above the top flat
         ax.set_ylabel('T [°C]')
     else:
         shifted = kind == 'shifted'

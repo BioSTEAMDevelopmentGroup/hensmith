@@ -1,0 +1,7 @@
+agent               duty        utility duty  level   process T [K]     cost
+                    [kJ/hr]     [kJ/hr]       [K]     in -> out         [USD/hr]
+low_pressure_steam  2.828e+08   2.977e+08     407.19  298.15 -> 372.60  1829.93
+chilled_water       1.936e+06   1.936e+06     282.37  303.15 -> 300.00  9.68
+utility cost target: 1839.61 USD/hr
+low_pressure_steam: 7695 kmol/hr, from 412.19 to 412.19 K
+chilled_water: 1443 kmol/hr, from 280.37 to 298.15 K

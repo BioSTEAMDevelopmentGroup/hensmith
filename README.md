@@ -20,7 +20,11 @@ see the documentation for the limits with real thermodynamics). Each stream
 can also carry its own approach temperature contribution
 (`HeatExchangerNetwork(..., approach_contributions={unit: dT})`): a match
 must then keep the sum of its two streams' contributions instead of
-`T_min_app`.
+`T_min_app`. `hensmith.targeting` targets what any network of the streams
+can achieve before one is synthesized (several utilities priced by BioSTEAM,
+area, units, capital and total annualized cost: `HXN.targets()`), finds the
+`T_min_app` of the least targeted total annualized cost (`supertarget`), and
+compares a synthesized network with its targets (`network_report`).
 
 ```python
 import biosteam as bst  # hensmith units plug into BioSTEAM systems

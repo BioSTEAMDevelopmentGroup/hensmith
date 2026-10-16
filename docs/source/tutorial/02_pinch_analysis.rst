@@ -149,11 +149,13 @@ designs, and the dashed line drawn on the pinch diagram of chapter 1.
 Composite curves
 ----------------
 
-hensmith itself ships one plot, the pinch diagram of a synthesized network. The
-two curves below are not library functions: they are computed in this
-tutorial's script from the fields of the :class:`~hensmith.ProblemTable`, and
-they are shown here because they are the standard way to read what the table
-says before any network exists.
+The two curves below are computed in this tutorial's script from the fields
+of the :class:`~hensmith.ProblemTable`, to show how they follow from the
+table; they are the standard way to read what the table says before any
+network exists. The library returns the same curves
+(:class:`~hensmith.PinchTargets`) and draws them
+(:func:`~hensmith.plot_composite_curves`,
+:func:`~hensmith.plot_grand_composite_curve`), as :doc:`05_targeting` shows.
 
 .. literalinclude:: /../_demo_src/examples/ch02_pinch_analysis.py
    :language: python
@@ -306,4 +308,6 @@ Where to next
   temperatures behind the diagram, unit by unit.
 - :doc:`04_configuring` -- what changing ``T_min_app`` does to the targets and
   to the cost of reaching them.
+- :doc:`05_targeting` -- the composite and grand composite curves drawn by the
+  library, several utilities on them, and area, units and cost targets.
 - :doc:`../concepts` -- the pinch concepts and terminology used throughout.

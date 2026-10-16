@@ -3,10 +3,13 @@ API Reference
 
 .. currentmodule:: hensmith
 
-hensmith exports six names. :class:`HeatExchangerNetwork` is the BioSTEAM
-facility most users need; the functions and classes of
+hensmith exports thirteen names. :class:`HeatExchangerNetwork` is the
+BioSTEAM facility most users need; the functions and classes of
 ``hensmith.hxn_synthesis`` are the pinch analysis and synthesis machinery
-behind it, usable on their own.
+behind it, usable on their own; and those of ``hensmith.targeting`` target
+utilities, area, units, capital and total annualized cost, find the
+``T_min_app`` of the least targeted total annualized cost, and compare a
+network with its targets.
 
 .. autosummary::
 
@@ -16,12 +19,20 @@ behind it, usable on their own.
    synthesize_network
    StreamLifeCycle
    plot_pinch_diagram
+   PinchTargets
+   supertarget
+   Supertargets
+   network_report
+   plot_composite_curves
+   plot_grand_composite_curve
+   plot_supertargets
 
 .. toctree::
    :maxdepth: 2
 
    heat_exchanger_network
    hxn_synthesis
+   targeting
 
 .. note::
 
