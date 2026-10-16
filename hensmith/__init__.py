@@ -23,13 +23,16 @@ __version__ = '0.1.2'
 
 from ._heat_exchanger_network import *
 from .hxn_synthesis import *
+from .targeting import *
 
 from . import _heat_exchanger_network
 from . import hxn_synthesis
+from . import targeting
 
 __all__ = (
     *_heat_exchanger_network.__all__,
     *hxn_synthesis.__all__,
+    *targeting.__all__,
 )
 
 # %% Register with biosteam

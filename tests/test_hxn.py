@@ -1270,9 +1270,9 @@ def test_docstring_references_are_cited():
     # the documentation build fails on a reference ('.. [label]') that its
     # docstring never cites ('[label]_')
     import inspect, re
-    import hensmith._curves, hensmith._planner
+    import hensmith._curves, hensmith._planner, hensmith.targeting
     modules = (hensmith._heat_exchanger_network, hensmith.hxn_synthesis,
-               hensmith._planner, hensmith._curves)
+               hensmith._planner, hensmith._curves, hensmith.targeting)
     def docstrings(obj, seen):
         if id(obj) in seen: return
         seen.add(id(obj))

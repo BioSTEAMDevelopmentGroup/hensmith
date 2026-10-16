@@ -904,6 +904,37 @@ def _explicit_contributions(hus, approach_contributions, T_min_app,
     _approach_contributions(len(values), T_min_app, values) # checks T_min_app
     return values
 
+def _arrange_heat_utilities(hus, sort_hus_by_T):
+    """
+    The heat utilities of `hus` in stream order, ``(hus_rearranged,
+    N_heating)``: the heating ones (``hu.duty > 0``, cold streams), then the
+    cooling ones; zero-duty ones are dropped. With `sort_hus_by_T`, heating
+    utilities are sorted by descending and cooling ones by ascending inlet
+    temperature of their unit.
+    """
+    hus_heating = [hu for hu in hus if hu.duty > 0]
+    hus_cooling = [hu for hu in hus if hu.duty < 0]
+    if sort_hus_by_T:
+        hus_heating.sort(key=lambda i: i.unit.ins[0].T, reverse=True)
+        hus_cooling.sort(key=lambda i: i.unit.ins[0].T)
+    return hus_heating + hus_cooling, len(hus_heating)
+
+def _process_streams(hxs, force_ideal_thermo):
+    """
+    The process streams of the exchangers `hxs`, ``(streams_inlet,
+    streams_quenched)``: unregistered copies (see `hensmith._curves._copy`)
+    of each inlet and of each outlet re-flashed at its own enthalpy and
+    pressure, with ideal thermodynamics if `force_ideal_thermo`.
+    """
+    if force_ideal_thermo:
+        streams_inlet = [_copy(hx.ins[0], hx.ins[0].thermo.ideal()) for hx in hxs]
+        streams_quenched = [_copy(hx.outs[0], hx.outs[0].thermo.ideal()) for hx in hxs]
+    else:
+        streams_inlet = [_copy(hx.ins[0]) for hx in hxs]
+        streams_quenched = [_copy(hx.outs[0]) for hx in hxs]
+    for i in streams_quenched: i.vle(H=i.H, P=i.P)
+    return streams_inlet, streams_quenched
+
 def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
                     sort_hus_by_T=False, approach_contributions=None):
     """
@@ -916,28 +947,15 @@ def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
     first, before any stream is copied or flashed.
     """
     values = _explicit_contributions(hus, approach_contributions, T_min_app)
-    hx_utils = hus
-    hus_heating = [hu for hu in hx_utils if hu.duty > 0]
-    hus_cooling = [hu for hu in hx_utils if hu.duty < 0]
-    if sort_hus_by_T:
-        hus_heating.sort(key=lambda i: i.unit.ins[0].T, reverse=True)
-        hus_cooling.sort(key=lambda i: i.unit.ins[0].T)
-    hx_utils_rearranged = hus_heating + hus_cooling
+    hx_utils_rearranged, N_heating = _arrange_heat_utilities(hus, sort_hus_by_T)
     hxs = [hu.unit for hu in hx_utils_rearranged]
-    # unregistered copies (see `hensmith._curves._copy`); the inlets are
-    # registered under their own IDs below
-    if force_ideal_thermo:
-        streams_inlet = [_copy(hx.ins[0], hx.ins[0].thermo.ideal()) for hx in hxs]
-        streams_quenched = [_copy(hx.outs[0], hx.outs[0].thermo.ideal()) for hx in hxs]
-    else:
-        streams_inlet = [_copy(hx.ins[0]) for hx in hxs]
-        streams_quenched = [_copy(hx.outs[0]) for hx in hxs]
-    for i in streams_quenched: i.vle(H=i.H, P=i.P)
+    # unregistered copies; the inlets are registered under their own IDs
+    # below
+    streams_inlet, streams_quenched = _process_streams(hxs, force_ideal_thermo)
     for i in range(len(streams_inlet)):
         stream = streams_inlet[i]
         ID = 'Util_%s'%i
         stream.ID = 's_%s__%s'%(i,ID)
-    N_heating = len(hus_heating)
     cold_indices = list(range(N_heating))
     hot_indices = list(range(N_heating, len(hxs)))
     indices = cold_indices + hot_indices
