@@ -844,12 +844,48 @@ def _owner_chains(units):
             unit = getattr(unit, '_owner', None)
     return list(found.values())
 
+def _names_unbuilt_auxiliary(key, universe, live):
+    """
+    Whether the key `key` (of a valid type, see `_check_contribution_key`),
+    which names no unit of `universe` (see `_names_unit`; `live` holds the
+    ids of `universe`), names an auxiliary unit that a unit of `universe`
+    may build but does not hold now, as a `biosteam.HXutilities` builds one
+    exchanger per agent it needs: an old auxiliary object whose top owner is
+    in `universe` (rebuilt with fewer auxiliaries), or ``(owner.ID, ID)``
+    for the ID that biosteam gives an auxiliary, ``name`` or ``name[k]``,
+    with `name` one of the `auxiliary_unit_names` of a unit of `universe`
+    under that top owner (e.g. ``('X1', 'heat_exchangers[2]')``). Such a key
+    is valid but names nothing.
+    """
+    if isinstance(key, bst.Unit):
+        top = key.owner
+        return top is not key and id(top) in live
+    if not isinstance(key, tuple): return False
+    owner_ID, ID = key
+    match = re.fullmatch(r'(.+)\[\d+\]', ID)
+    names = {ID, match[1]} if match else {ID}
+    return any(unit.owner.ID == owner_ID
+               and not names.isdisjoint(getattr(unit, 'auxiliary_unit_names',
+                                                ()))
+               for unit in universe)
+
+def _unknown_keys(keys, universe):
+    """The keys of `keys` (units, str or pairs of str) that name neither a
+    unit of `universe` (see `_names_unit`) nor an auxiliary unit that one of
+    them may build (see `_names_unbuilt_auxiliary`)."""
+    live = {id(u) for u in universe}
+    return [key for key in keys
+            if not any(_names_unit(key, u, live) for u in universe)
+            and not _names_unbuilt_auxiliary(key, universe, live)]
+
 def _mapping_contributions(hus, mapping, units):
     """
     `_stream_contributions` of a mapping from keys naming units to
     contributions: checks the types of keys and values, then that every key
     names a unit of the universe (the owner chains of the units of `hus`
-    and of `units`, the units at hand of `_names_unit`), then that no two
+    and of `units`, the units at hand of `_names_unit`) or an auxiliary
+    unit that one of them may build but does not hold now (see
+    `_names_unbuilt_auxiliary`: such a key names nothing), then that no two
     keys of the same level for a unit of the universe give it different
     values (None and nan are equal); then each heat utility takes the value
     of the key of the lowest level on its unit's owner chain (None without
@@ -861,8 +897,7 @@ def _mapping_contributions(hus, mapping, units):
         items.append((key, _contribution_value(value, f'key {key!r}')))
     universe = _owner_chains([hu.unit for hu in hus] + list(units or ()))
     live = {id(u) for u in universe}
-    unknown = [key for key, _ in items
-               if not any(_names_unit(key, u, live) for u in universe)]
+    unknown = _unknown_keys([key for key, _ in items], universe)
     if unknown:
         raise ValueError('approach_contributions keys that name no unit: '
                          f"{', '.join(map(repr, unknown))} (a key is a unit, "
@@ -2087,7 +2122,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         - a mapping ``{key: value}`` whose keys name units: a unit (that
           very object; a stale auxiliary that its owner rebuilt, no longer
           among the units of `hus` and their owners, names the one of the
-          same ID under owners of the same IDs instead),
+          same ID under owners of the same IDs instead, if any),
           ``(owner.ID, unit.ID)`` with the top owner (the unit's own ID
           twice for a unit without an owner; it names every auxiliary of
           that ID under that owner, at any depth, so the heaters of two
@@ -2102,8 +2137,13 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
           A None or nan value wins at its level like any other. Heat
           utility keys are rejected (BioSTEAM replaces them at every
           simulation). A key that names neither the unit of a heat utility
-          of `hus` nor one of its owners, or two keys of the same level for
-          a unit with different values, raise a ValueError;
+          of `hus` nor one of its owners, nor an auxiliary that one of them
+          may build but does not hold now (such a key has no effect: e.g.
+          ``('X1', 'heat_exchangers[2]')``, biosteam's ID of the third
+          exchanger of a `biosteam.HXutilities` X1, while X1 needs fewer,
+          or an old exchanger of X1 that none took the place of), or two
+          keys of the same level for a unit with different values, raise a
+          ValueError;
         - a sequence (or `numpy.ndarray`; not a str or bytes) with one
           value per heat utility, aligned with `hus` as given (before the
           heating utilities are placed first; zero-duty utilities

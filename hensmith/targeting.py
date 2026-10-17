@@ -23,14 +23,14 @@ from collections import namedtuple
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from numbers import Integral, Real
-from warnings import warn
+from warnings import catch_warnings, filterwarnings, warn
 import numpy as np
 import biosteam as bst
 from ._curves import _T_EQ, _copy
 from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
-    _contribution_key_level, _names_unit, _owner_chains,
+    _contribution_key_level, _owner_chains, _unknown_keys,
     _unit_message_name)
 
 __all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
@@ -682,6 +682,12 @@ class PinchTargets:
     units : list[Unit] or None
         The unit of each stream (``hu.unit``), in stream order; None when
         built from streams.
+    key_units : list[Unit] or None
+        Further units that keys of `h` may name (with their owners) without
+        a stream of theirs, a key that names only such units then having no
+        effect: for `HeatExchangerNetwork.targets`, every unit available to
+        the network and its nested auxiliary units, which approach
+        contribution keys may name; else None (settable).
     force_ideal_thermo : bool
         Whether the stream copies use ideal thermodynamics (False when built
         from streams).
@@ -1000,6 +1006,7 @@ class PinchTargets:
         self.cut = _pinch_cut(table)
         self.heat_utilities = None
         self.units = None
+        self.key_units = None
         self.force_ideal_thermo = False
         self.system = None
         #: Grid index of the pinch.
@@ -1119,8 +1126,8 @@ class PinchTargets:
         Returns
         -------
         PinchTargets
-            With the same streams, curves, labels, units, heat utilities and
-            system.
+            With the same streams, curves, labels, units, key units, heat
+            utilities and system.
 
         """
         c = self.approach_contributions
@@ -1132,6 +1139,7 @@ class PinchTargets:
                          self.is_hot, T_min_app, c, self.labels, self.curves)
         new.heat_utilities = self.heat_utilities
         new.units = self.units
+        new.key_units = self.key_units
         new.force_ideal_thermo = self.force_ideal_thermo
         new.system = self.system
         return new
@@ -1512,14 +1520,34 @@ class PinchTargets:
 
     # %% Balanced curves
 
+    def _check_utilities(self, utilities):
+        """Raise a ValueError unless the heating duties of `utilities`
+        (unserved ones included) add up to `Q_hot` and the cooling ones to
+        `Q_cold`, as those of `utility_targets` do (to the remainders of at
+        most `_tol` that it leaves out, and round-off)."""
+        for heating, Q, name in ((True, self.Q_hot, 'Q_hot'),
+                                 (False, self.Q_cold, 'Q_cold')):
+            total = math.fsum([u.duty for u in utilities
+                               if bool(u.heating) == heating])
+            if not abs(total - Q) <= 2. * self._tol + 1e-9 * abs(Q):
+                kind = 'heating' if heating else 'cooling'
+                raise ValueError(
+                    f'the {kind} duties of utilities add up to {total:.6g} '
+                    f'kJ/hr, not {name} = {Q:.6g} kJ/hr: give the '
+                    'utility_targets() of these targets (those of other '
+                    'targets, e.g. of another T_min_app, or a part of them '
+                    'do not balance their curves)')
+
     def _balanced_segments(self, utilities, inv_h=None, inv_h_utilities=None):
         """
         The hot and cold segments (`_composite`) of the balanced composite
         curves on real temperatures: the streams plus the served utilities,
         fuel as a last hot segment at infinite temperature (a weight of 0,
         no area). `inv_h` weighs the streams (N) and `inv_h_utilities` the
-        `utilities` (1 by default).
+        `utilities` (1 by default). The `utilities` are checked
+        (`_check_utilities`).
         """
+        self._check_utilities(utilities)
         if inv_h is None: inv_h = np.ones(self.is_hot.size)
         if inv_h_utilities is None: inv_h_utilities = [1.] * len(utilities)
         sides = []
@@ -1549,7 +1577,12 @@ class PinchTargets:
         Parameters
         ----------
         utilities : list[UtilityTarget], optional
-            Defaults to `utility_targets` with the default agents.
+            `utility_targets` of these targets, with any agents: a
+            ValueError is raised unless the heating duties (unserved ones
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`
+            (the utilities of other targets, e.g. of another `T_min_app`,
+            or a part of them do not balance the curves). Defaults to
+            `utility_targets` with the default agents.
 
         Returns
         -------
@@ -1574,7 +1607,9 @@ class PinchTargets:
 
     def _balanced_positions(self, utilities):
         """The constraint positions with the levels of every allocated
-        finite level of `utilities`, and the balanced heat flow at each."""
+        finite level of `utilities` (checked, see `_check_utilities`), and
+        the balanced heat flow at each."""
+        self._check_utilities(utilities)
         Ts, arr, lea = self._gcc()
         positions = _positions(Ts, arr, lea, [u.level for u in utilities
                                               if math.isfinite(u.level)])
@@ -1591,7 +1626,12 @@ class PinchTargets:
         Parameters
         ----------
         utilities : list[UtilityTarget], optional
-            Defaults to `utility_targets` with the default agents.
+            `utility_targets` of these targets, with any agents: a
+            ValueError is raised unless the heating duties (unserved ones
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`
+            (the utilities of other targets, e.g. of another `T_min_app`,
+            or a part of them do not balance the curves). Defaults to
+            `utility_targets` with the default agents.
 
         Returns
         -------
@@ -1634,11 +1674,14 @@ class PinchTargets:
         `hensmith.hxn_synthesis._mapping_contributions`): the key of the
         lowest level on the owner chain of a stream's unit wins, and a stream
         index is below its unit. Keys of the same level for a unit must give
-        it the same value.
+        it the same value. Unit keys may also name `key_units` (and their
+        owners) and the auxiliaries that units may build but do not hold
+        now, as approach contribution keys of the facility may, and then
+        have no effect.
         """
         N = self.is_hot.size
         units = self.units or ()
-        universe = _owner_chains(units)
+        universe = _owner_chains([*units, *(self.key_units or ())])
         live = {id(u) for u in universe}
         items = []
         unknown = []
@@ -1657,7 +1700,7 @@ class PinchTargets:
                 raise TypeError('h keys must be stream indices (int), units, '
                                 'unit IDs (str) or (owner.ID, unit.ID) tuples, '
                                 f'not {type(key).__name__!r} ({key!r})')
-            elif not any(_names_unit(key, u, live) for u in universe):
+            elif _unknown_keys([key], universe):
                 unknown.append(key)
             items.append((key, _film_value(value, f'h of key {key!r}')))
         if unknown:
@@ -1694,6 +1737,7 @@ class PinchTargets:
     def _area(self, utilities, h, h_utilities):
         """`area_target` with resolved film coefficients (`h`, an (N,)
         array; `h_utilities`, one per utility)."""
+        self._check_utilities(utilities)
         if any(u.agent is None for u in utilities): return math.nan
         hot, cold = self._balanced_segments(
             utilities, 1. / h, [1. / x for x in h_utilities])
@@ -1707,7 +1751,12 @@ class PinchTargets:
         Parameters
         ----------
         utilities : list[UtilityTarget], optional
-            Defaults to `utility_targets` with the default agents.
+            `utility_targets` of these targets, with any agents: a
+            ValueError is raised unless the heating duties (unserved ones
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`
+            (the utilities of other targets, e.g. of another `T_min_app`,
+            or a part of them do not balance the curves). Defaults to
+            `utility_targets` with the default agents.
         h : float, Sequence[float] or Mapping, optional
             Film coefficient of the streams [kW/m²/K]: one for all, one per
             stream in stream order, or a mapping from stream indices (int)
@@ -1716,7 +1765,13 @@ class PinchTargets:
             an owner, or ``(owner.ID, unit.ID)``; an auxiliary unit takes the
             value of its owner's key unless a key names it). The nearest key
             wins, a stream index first; streams left out take 1. Labels are
-            not keys. Defaults to 1 for every stream.
+            not keys. A key that names no stream raises a ValueError, unless
+            it names one of `key_units` (for `HeatExchangerNetwork.targets`,
+            any unit available to the network, as for its approach
+            contribution keys) or an auxiliary that a unit may build but
+            does not hold now: it then has no effect, so that a key of a
+            unit idle in a Monte Carlo sample does not fail. Defaults to 1
+            for every stream.
         h_utilities : float or Mapping, optional
             Film coefficient of the utilities [kW/m²/K]: one for all, or a
             mapping from agent IDs or agents (the others take 1). Defaults
@@ -1743,7 +1798,12 @@ class PinchTargets:
         Parameters
         ----------
         utilities : list[UtilityTarget], optional
-            Defaults to `utility_targets` with the default agents.
+            `utility_targets` of these targets, with any agents: a
+            ValueError is raised unless the heating duties (unserved ones
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`
+            (the utilities of other targets, e.g. of another `T_min_app`,
+            or a part of them do not balance the curves). Defaults to
+            `utility_targets` with the default agents.
 
         Returns
         -------
@@ -1827,7 +1887,12 @@ class PinchTargets:
         Parameters
         ----------
         utilities : list[UtilityTarget], optional
-            Defaults to `utility_targets` with the default agents.
+            `utility_targets` of these targets, with any agents: a
+            ValueError is raised unless the heating duties (unserved ones
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`
+            (the utilities of other targets, e.g. of another `T_min_app`,
+            or a part of them do not balance the curves). Defaults to
+            `utility_targets` with the default agents.
         h, h_utilities : optional
             Film coefficients, as `area_target` takes them.
         P : float, optional
@@ -1987,6 +2052,11 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     Warns
     -----
     RuntimeWarning
+        Once for the sweep, if some minimum approach temperatures leave part
+        of a utility target unserved (no agent given can serve it: their
+        TAC is nan), instead of the warning of
+        `PinchTargets.utility_targets` at each.
+    RuntimeWarning
         If no minimum approach temperature of the sweep has a finite TAC
         (each has an unserved utility or an infinite area): the sweep is
         then not refined, and its optimum is the smallest one, meaningless.
@@ -1999,7 +2069,12 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     temperature (``T_min_app / 2`` each), unless `scale_contributions`
     scales the specified ones by ``T_min_app / targets.T_min_app`` too, the
     contribution scaling of [Ahmad90]_; with every stream specified, the
-    sweep needs it.
+    sweep needs it. The streams' curves are reused, but each point builds
+    its own problem table (about that of a synthesis, which reads every
+    stream's enthalpy on its grid), so on a system of many streams with
+    rigorous thermodynamics the default sweep (40 temperatures and three
+    refinements) can take longer than a synthesis: a coarser `T_min_apps`
+    or a smaller `refine` keeps it short.
 
     The TAC is not smooth (the units target jumps, so do biosteam's
     correlations at 150 ft², and the pinch can move), so the sweep is a
@@ -2112,7 +2187,10 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
                          'scale_contributions=True to scale them with it')
     options = targets._check_options(options)
     def evaluate(T_min_app):
-        return targets.at(T_min_app, scale_contributions).summary(**options)
+        with catch_warnings(): # counted once for the sweep instead
+            filterwarnings('ignore', r'no (heating|cooling) agent can serve',
+                           RuntimeWarning)
+            return targets.at(T_min_app, scale_contributions).summary(**options)
     records = [evaluate(float(x)) for x in np.unique(T)]
     for _ in range(refine):
         if not any(math.isfinite(r['TAC']) for r in records):
@@ -2127,6 +2205,11 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
             if np.abs(evaluated - x).min() > 1e-12:
                 records.append(evaluate(float(x)))
     sweep = Supertargets(targets, records, options, scale_contributions)
+    unserved = int(np.isnan(sweep['utility_cost']).sum())
+    if unserved:
+        warn(f'{unserved} of the {len(records)} minimum approach temperatures '
+             'evaluated leave part of a utility target unserved (no agent '
+             'given can serve it), so their TAC is nan', RuntimeWarning)
     if not np.isfinite(sweep['TAC']).any():
         warn('no minimum approach temperature of the sweep has a finite TAC '
              '(each has an unserved utility or an infinite area), so it is '
@@ -2592,8 +2675,10 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         (shifted ones with the pinch marked), or 'balanced' for
         `PinchTargets.balanced_composite_curves` with each utility labeled.
     utilities : list[UtilityTarget], optional
-        Utilities of the balanced curves. Defaults to
-        `PinchTargets.utility_targets` with the default agents.
+        Utilities of the balanced curves, as
+        `PinchTargets.balanced_composite_curves` takes them (those of
+        `targets`). Defaults to `PinchTargets.utility_targets` with the
+        default agents.
     ax : matplotlib.axes.Axes, optional
         Axes to draw on; a new figure (with a constrained layout, which
         keeps the axis labels in it) is created if not given.

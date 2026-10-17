@@ -294,15 +294,22 @@ class HeatExchangerNetwork(bst.Facility):
     agree. ID keys are the robust form: a unit that rebuilds its auxiliary
     units at every simulation (e.g. `biosteam.HXutilities`) leaves a key
     holding an old auxiliary, which then names the auxiliary that took its
-    place (the one of the same ID under owners of the same IDs; heat
-    utility keys are rejected, since BioSTEAM replaces them at every
+    place (the one of the same ID under owners of the same IDs), if any
+    (heat utility keys are rejected, since BioSTEAM replaces them at every
     simulation). The keys and values are checked against every unit
     available to the network and its nested auxiliary units before the
     heat utilities are taken: a key that names none of them, a bad value
     or two conflicting keys raise a ValueError, even while their unit is
     idle, but a valid key whose unit holds no heat utility in a simulation
     (no duty, `ignored`, or not available to a heat exchanger network) has
-    no effect, so that, e.g., Monte Carlo samples do not fail. A callable is
+    no effect, so that, e.g., Monte Carlo samples do not fail. A key of an
+    auxiliary that a unit may build but does not hold in a simulation is
+    valid too, and has no effect: an old auxiliary object of the unit that
+    none took the place of, or ``(owner.ID, name)`` or ``(owner.ID,
+    'name[k]')``, the IDs biosteam gives auxiliaries, for a name of the
+    `auxiliary_unit_names` of the owner or of one of its auxiliaries (e.g.
+    ``('X1', 'heat_exchangers[2]')`` while a `biosteam.HXutilities` X1,
+    which builds one exchanger per agent it needs, needs fewer). A callable is
     called once per heat utility at every simulation (also to check a
     cached network, and again if a failed cache synthesizes anew), in the
     order of the facility's heat utilities: it should be pure. After a
@@ -985,7 +992,11 @@ class HeatExchangerNetwork(bst.Facility):
             `force_ideal_thermo`, and its `system`, whose operating hours
             (if it has them, a TEA's for instance) `PinchTargets.summary`
             and `hensmith.targeting.supertarget` then use by default, as
-            `hensmith.targeting.network_report` does.
+            `hensmith.targeting.network_report` does. Their `key_units` are
+            the units that the facility's approach contribution keys may
+            name, so that a film coefficient key (``h=``) of a unit without
+            a stream in a simulation has no effect, as such an approach
+            contribution key has none.
 
         Raises
         ------
@@ -1074,6 +1085,7 @@ class HeatExchangerNetwork(bst.Facility):
                 dH = hx.outs[0].H - hx.ins[0].H
                 is_hot.append(dH < 0. if dH else i not in cold)
             x = self.approach_contributions
+            units = list(self._get_units())
             if x is not None and not isinstance(x, Mapping) and callable(x):
                 # Never called again: with replace_unit_heat_utilities, the
                 # heat utilities it would read now hold the network's
@@ -1083,10 +1095,11 @@ class HeatExchangerNetwork(bst.Facility):
                 contributions = getattr(self, '_resolved_contributions', None)
             else:
                 # by unit only, which the network never changes
-                contributions = self._network_contributions(hus)
+                contributions = self._network_contributions(hus, units)
             targets = PinchTargets._from_exchangers(
                 hxs, is_hot, T_min_app, contributions, self.force_ideal_thermo,
                 None, hus)
+            targets.key_units = self._candidate_units(units)
             targets.system = self.system
             return targets
         if self.system is None and not self.units:
@@ -1098,6 +1111,7 @@ class HeatExchangerNetwork(bst.Facility):
         targets = PinchTargets.from_heat_utilities(
             hx_utils, T_min_app, self._network_contributions(hx_utils, units),
             self.force_ideal_thermo, self.sort_hus_by_T)
+        targets.key_units = self._candidate_units(units)
         targets.system = self.system
         return targets
 

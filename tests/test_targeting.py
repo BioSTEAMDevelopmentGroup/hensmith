@@ -1018,6 +1018,38 @@ def test_bath_balanced_pair(quickstart):
     with pytest.raises(ValueError, match='name no stream'):
         quickstart.area_target(utilities, h={'reboiler': 2.})
 
+def test_utilities_must_be_of_the_targets(quickstart):
+    # utilities that do not add up to the targets' own utility targets (of
+    # another T_min_app, none, or a part) raise wherever they are balanced;
+    # the targets' own, with any agents, are accepted; the grand composite
+    # plot draws any
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    t = quickstart
+    t20 = t.at(20.)
+    own = t20.utility_targets()
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning) # unserved cooling
+        partial = t20.utility_targets(cooling_agents=['cooling_water'])
+    assert any(u.agent is None for u in partial)
+    mismatched = t.utility_targets()
+    assert t.Q_hot != t20.Q_hot
+    calls = [t20.area_target, t20.units_target, t20.capital_cost_target,
+             t20.balanced_composite_curves, t20.balanced_grand_composite_curve,
+             lambda u: plot_composite_curves(t20, kind='balanced', utilities=u)]
+    for utilities in (mismatched, [], own[:1], own[1:], own + own[:1]):
+        for call in calls:
+            with pytest.raises(ValueError, match='duties of utilities add up to'):
+                call(utilities)
+    for utilities in (own, partial):
+        assert t20.units_target(utilities)['total'] > 0
+        t20.balanced_composite_curves(utilities)
+        t20.balanced_grand_composite_curve(utilities)
+    assert t20.area_target(own) > 0. and math.isnan(t20.area_target(partial))
+    fig, ax = plot_grand_composite_curve(t20, utilities=mismatched[:1])
+    plt.close(fig)
+
 def test_bath_independent_integration(quickstart):
     # reference A: the streams plus the four utilities
     t = targets('test_targeting_integration_A', REF_A, 10.)
@@ -1558,11 +1590,23 @@ def test_sweep(monkeypatch):
             supertarget(t, **kwargs)
     # no finite TAC anywhere (the cooling is unserved): the optimum is
     # meaningless, and the sweep says so
-    with pytest.warns(RuntimeWarning, match='no minimum approach temperature of the '
-                      'sweep has a finite TAC'):
+    # (the unserved points are counted in one warning, not one per point)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
         unserved = supertarget(t, [5., 10.], refine=1, cooling_agents=[])
+    assert [str(w.message) for w in caught] == [
+        '2 of the 2 minimum approach temperatures evaluated leave part of a '
+        'utility target unserved (no agent given can serve it), so their TAC '
+        'is nan',
+        'no minimum approach temperature of the sweep has a finite TAC (each '
+        'has an unserved utility or an infinite area), so it is not refined '
+        'and its optimum, the smallest, is meaningless']
+    assert all(w.category is RuntimeWarning for w in caught)
     assert np.all(np.isnan(unserved['TAC'])) and unserved.T_min_app == 5.
     assert len(unserved.records) == 2 # not refined around nan
+    # outside a sweep, each evaluation warns as before
+    with pytest.warns(RuntimeWarning, match='no cooling agent can serve'):
+        t.at(5.).summary(cooling_agents=[])
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
         supertarget(t, [5., 10.], refine=0)
@@ -1727,6 +1771,42 @@ def test_facility_targets_operating_hours(kemp_hxn):
         assert t.summary()['operating_cost'] == 8000. * s['utility_cost']
     finally:
         sys.operating_hours = previous
+
+def test_facility_targets_keys_of_idle_units():
+    # film coefficient keys of a unit without a stream in a simulation (no
+    # duty, as in a Monte Carlo sample, or ignored) have no effect, as the
+    # facility's approach contribution keys have none; unknown keys still
+    # raise, and targets made from heat utilities know no other units
+    sys, HXN, (H1, H2, C1, H3) = liquids('test_targeting_idle_keys')
+    h, busy_h = {'H3': .5, 'H1': 2.}, {'H1': 2.}
+    HXN.approach_contributions = {'H3': 2.}
+    simulate_strictly(sys)
+    t = HXN.targets()
+    assert H3 in t.units and t.area_target(h=h) != t.area_target(h=busy_h)
+    H3.T = H3.ins[0].T # no duty
+    for ignored in (None, [H2]):
+        HXN.ignored = ignored
+        simulate_strictly(sys)
+        assert HXN._resolved_contributions is None # the key of H3 is idle
+        t = HXN.targets()
+        assert H3 not in t.units and H3 in t.key_units
+        assert t.at(20.).key_units is t.key_units
+        for keys in (h, h | {'H2': 3.}):
+            assert t.area_target(h=keys) == t.area_target(h=busy_h | {
+                k: v for k, v in keys.items() if k == 'H2' and not ignored})
+        assert t.summary(h=h) == t.summary(h=busy_h)
+        assert network_report(HXN, h=h) == network_report(HXN, h=busy_h)
+        assert supertarget(t, [5., 10.], refine=0, h=h).records == (
+            supertarget(t, [5., 10.], refine=0, h=busy_h).records)
+        for keys in ({'H9': 1.}, {('H3', 'heat_exchanger'): 1.}):
+            with pytest.raises(ValueError, match='h keys that name no stream'):
+                t.area_target(h=keys)
+        with pytest.raises(ValueError, match='different values at the same level'):
+            t.area_target(h={'H3': 2., H3: 3.})
+        direct = PinchTargets.from_heat_utilities(t.heat_utilities)
+        assert direct.key_units is None
+        with pytest.raises(ValueError, match="h keys that name no stream: 'H3'"):
+            direct.area_target(h=h)
 
 #: Keys of `network_report`.
 REPORT_KEYS = ['T_min_app', 'targets_T_min_app', 'status', 'applied', 'Q_hot', 'Q_cold',

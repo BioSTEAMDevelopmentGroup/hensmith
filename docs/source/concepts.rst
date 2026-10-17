@@ -284,7 +284,7 @@ of the same level for a unit must agree. ID keys are the robust form: a
 unit that rebuilds its auxiliary units at every simulation
 (``biosteam.HXutilities``, for one) leaves a key holding an old auxiliary
 object, which then names the auxiliary that took its place: the one of the
-same ID under owners of the same IDs. Heat utilities cannot be keys,
+same ID under owners of the same IDs, if any. Heat utilities cannot be keys,
 because BioSTEAM replaces them at every simulation; a value per heat
 utility is given by a callable
 ``f(hu)`` instead, which is called once per heat utility at every simulation
@@ -297,7 +297,15 @@ names none of them, a bad value or two
 conflicting keys raise a ``ValueError`` even while their unit is idle, but a
 valid key whose unit holds no heat utility in a simulation (no duty,
 ``ignored``, ``hxn_ok=False``) has no effect, so that a Monte Carlo sample in
-which a unit falls idle does not fail.
+which a unit falls idle does not fail. The same holds for an auxiliary that a
+unit may build but does not hold in a sample: ``biosteam.HXutilities``, for
+one, builds one exchanger per agent it needs, so a lower outlet temperature
+drops ``('X1', 'heat_exchangers[2]')``. A key of the ID that BioSTEAM gives an
+auxiliary, ``(owner.ID, name)`` or ``(owner.ID, 'name[k]')`` for a name of the
+``auxiliary_unit_names`` of the owner or of one of its auxiliaries, is valid
+whether or not that auxiliary is built, as is an old auxiliary object of a unit
+at hand that none took the place of; while the auxiliary is missing, the key
+has no effect.
 
 **The cache.** With ``cache_network=True``, a cached network is reused only
 while the explicit contributions resolve to the same value for every stream
@@ -534,7 +542,8 @@ bare module cost of the exchangers only: no Lang factor and no working capital.
 
 **The sweep.** :func:`~hensmith.supertarget` evaluates the targets over a grid
 of ``T_min_app`` values, reusing the streams' curves (nothing is flashed
-again), and then refines the grid around the least total annualized cost. The
+again, though each point builds its own problem table, about the table of a
+synthesis), and then refines the grid around the least total annualized cost. The
 cost is not smooth -- the units target jumps, the double pipe switches to a
 shell and tube, the pinch moves -- so the refinement only narrows a bracket,
 and ``at_bound`` flags an optimum at an end of the sweep. The capital target

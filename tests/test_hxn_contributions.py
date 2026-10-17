@@ -1001,6 +1001,67 @@ def test_invalid_contributions_in_the_facility():
         assert network_record(HXN) == reference
         assert HXN._resolved_contributions is None
 
+def test_keys_of_auxiliaries_a_unit_does_not_build():
+    # biosteam.HXutilities builds one exchanger per steam level it needs, so
+    # a lower outlet temperature drops 'heat_exchangers[2]' (and [1]): a key
+    # of it, the tuple or the old object, is valid but has no effect while
+    # it is missing, and names the exchanger again once it is built; keys
+    # of IDs the unit never gives an auxiliary still raise
+    bst.main_flowsheet.set_flowsheet('contributions_unbuilt')
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    feed = bst.Stream('feed', Water=500., units='kmol/hr', T=300., P=20e5)
+    X1 = bst.HXutilities('X1', ins=feed, T=480., rigorous=False)
+    hot = bst.Stream('hot', Water=800., Ethanol=50., units='kmol/hr', T=460.,
+                     P=20e5)
+    X2 = bst.HXutility('X2', ins=hot, T=320., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=10.)
+    sys = bst.System.from_units('contributions_unbuilt', units=[X1, X2, HXN])
+
+    def run(T, x):
+        X1.T = T
+        HXN.approach_contributions = x
+        simulate_strictly(sys)
+        return network_record(HXN)
+
+    tuple_key = {('X1', 'heat_exchangers[2]'): 3.}
+    run(480., tuple_key)
+    old = X1.heat_exchangers[2]
+    assert [hx.ID for hx in X1.heat_exchangers] == [
+        'heat_exchangers[0]', 'heat_exchangers[1]', 'heat_exchangers[2]']
+    assert HXN.synthesis_info['approach_contributions'].tolist() == [
+        3. if hx is old else 5. for hx in HXN.original_heat_exchangers]
+    for T, N in ((440., 2), (400., 1)):
+        reference = run(T, None)
+        assert len(X1.heat_exchangers) == N
+        for x in (tuple_key, {old: 3.}, {('X1', 'heat_exchangers'): 3.}):
+            assert run(T, x) == reference
+            assert HXN._resolved_contributions is None
+        # film coefficient keys of the facility's targets alike
+        targets = HXN.targets()
+        area = targets.area_target()
+        assert targets.area_target(h={old: 2.}) == area
+        assert targets.area_target(h={('X1', 'heat_exchangers[2]'): 2.}) == area
+    # built again: the old object names the exchanger that took its place
+    run(480., {old: 3.})
+    new = X1.heat_exchangers[2]
+    assert new is not old
+    assert HXN.synthesis_info['approach_contributions'].tolist() == [
+        3. if hx is new else 5. for hx in HXN.original_heat_exchangers]
+    run(400., None)
+    targets = HXN.targets()
+    for key in (('X1', 'heat_exchanger[2]'), ('X1', 'heat_exchangers[x]'),
+                ('X1', 'heat_exchangers[2'), ('X2', 'heat_exchangers[2]'),
+                ('X9', 'heat_exchangers[2]')):
+        with pytest.raises(ValueError, match='h keys that name no stream'):
+            targets.area_target(h={key: 2.})
+        HXN.approach_contributions = {key: 3.}
+        with pytest.raises(ValueError, match='name no unit'):
+            sys.simulate()
+    # outside the facility, the universe is that of the heat utilities
+    hus = bst.process_tools.heat_exchanger_utilities_from_units([X1, X2])
+    assert hxn_synthesis._stream_contributions(hus, tuple_key) == [None, None]
+    assert hxn_synthesis._stream_contributions(hus, {old: 3.}) == [None, None]
+
 def test_contribution_keys_with_the_units_option():
     # keys may name the units of the units option and their auxiliary units,
     # idle or not, but no other unit; a callable option is called once per

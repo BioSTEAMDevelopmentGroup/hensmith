@@ -179,7 +179,11 @@ Area, units, capital and total cost
 -----------------------------------
 
 On the balanced composite curves, :meth:`~hensmith.PinchTargets.summary`
-targets the rest of the cost of a network.
+targets the rest of the cost of a network. The methods that take
+``utilities`` need those of the same targets: a list from targets at another
+``T_min_app`` (``targets.at(20.)``, say) or a part of one would not balance
+the curves, so its duties are checked against ``Q_hot`` and ``Q_cold`` and a
+mismatch raises a ``ValueError``.
 
 .. literalinclude:: /../_demo_src/examples/ch05_targeting.py
    :language: python
@@ -225,7 +229,11 @@ Supertargeting: the least total annualized cost
 Chapter 4 swept ``T_min_app`` by synthesizing a network at each value.
 :func:`~hensmith.supertarget` sweeps the targets instead: it reuses the
 streams' curves, so no stream is flashed again, and evaluates the summary at
-each ``T_min_app``, then refines the grid around the least TAC.
+each ``T_min_app``, then refines the grid around the least TAC. Each point
+still builds its own problem table, which reads every stream's enthalpy on the
+grid; on a system of many streams with rigorous thermodynamics, a sweep of the
+default 40 points and three refinements can take longer than a synthesis, and
+a coarser ``T_min_apps`` or a smaller ``refine`` keeps it short.
 
 .. literalinclude:: /../_demo_src/examples/ch05_targeting.py
    :language: python
