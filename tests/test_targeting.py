@@ -15,8 +15,9 @@ A. Composite and grand composite curves: closed-form knots of Linnhoff &
 B. Utility targets: the multiple-utility allocation on the grand composite
    curve with biosteam's agents (levels recomputed from the agents'
    attributes, list order, biosteam's dT, unserved remainders, served
-   stretches), priced against an independent isolated pricing, and the
-   balanced curves.
+   stretches), priced against an independent isolated pricing, a sensible
+   agent's line against an independent cascade of each served stream at its
+   own shift, and the balanced curves.
 C. Supertargets: the area target against closed forms and an independent
    integration, the units target on references with process and utility
    pinches, the capital costs against biosteam's own costing, the
@@ -665,6 +666,40 @@ def test_sensible_line_condenser(T_sat):
     for T_min_app in (2., 20.):
         assert 0. < t.at(T_min_app).area_target() < math.inf
 
+def test_sensible_line_point_load_alone():
+    # a pure condenser, a point load alone at the cold end of cooling water's
+    # stretch, is present there: the line keeps dT below its condensing
+    # temperature (taken for absent, cooling water would leave at its limit
+    # and the balanced composites would cross by 4.5 K)
+    test_hxn_targets.setup('test_targeting_line_point_load', ['Water'])
+    P = bst.settings.chemicals.Water.Psat(318.)
+    vapour = bst.Stream(None, Water=40., T=318., P=P, phase='g')
+    vapour.vle(V=1., P=P)
+    liquid = vapour.copy()
+    liquid.vle(V=0., P=P)
+    hot_in = bst.Stream(None, Water=200., T=345., P=3e5)
+    hot_out = hot_in.copy()
+    hot_out.T = 330.
+    t = PinchTargets([vapour, hot_in], [liquid, hot_out], [True, True], 10.,
+                     labels=['COND', 'H'])
+    Ts = t.grid['Ts']
+    assert t.grid['k_lo'][0] == t.grid['k_hi'][0] == Ts.size - 1
+    T_c = Ts[-1] + t.shift[0]
+    dT, CW = bst.HeatUtility.dT, agent('cooling_water')
+    assert Ts[-1] > CW.T + CW.dT + dT - t.shift[0] # the stretch ends at the grid's end
+    (u,) = t.utility_targets()
+    assert u.ID == CW.ID and u.duty == pytest.approx(t.Q_cold, rel=1e-12)
+    assert (u.T_in, u.T_out) == (pytest.approx(345., abs=1e-9), T_c)
+    # the line has taken the condensation's heat when it reaches T_c - dT
+    T_out = CW.T + (T_c - dT - CW.T) * u.duty / (vapour.H - liquid.H)
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
+    assert T_out < CW.T_limit - 10.
+    assert u.cost == pytest.approx(fresh_price(-u.duty, T_out + dT, u.T_out, CW)[0],
+                                   rel=1e-9)
+    curves = t.balanced_composite_curves([u])
+    assert min_vertical_gap(*curves) == pytest.approx(dT, abs=1e-6)
+    assert min_driving_force(*curves) >= dT - 1e-6
+
 def test_sensible_line_constant_cp():
     dT = bst.HeatUtility.dT
     # cooling water: 40 of its 64 kW are below 316 K
@@ -760,6 +795,94 @@ def test_sensible_line_process_in_stretch():
         assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
         assert u.cost == pytest.approx(fresh_price(u.duty, T_out - dT, u.T_out, oil)[0],
                                        rel=1e-12)
+
+def line_gaps(t, rows, u):
+    """
+    ``{ID: smallest gap [K]}`` between the line of the sensible utility `u`
+    (linear in its heat, from `T_utility_in` at its level to `T_utility_out`)
+    and each constant-CP stream of `rows` (as in `targets`), each at its own
+    shift, every stream on the level's served side being served by `u`: an
+    independent cascade over the shifted stretch below `u.level` (above it,
+    for cooling), positive where the line is hotter than a cold stream
+    (colder than a hot one).
+    """
+    shift = dict(zip(t.labels, t.shift))
+    ends = {}
+    for ID, T_a, T_b, CP in rows:
+        lo, hi = min(T_a, T_b) - shift[ID], max(T_a, T_b) - shift[ID]
+        if u.heating: hi = min(hi, u.level)
+        else: lo = max(lo, u.level)
+        if lo < hi: ends[ID] = (lo, hi, CP * kW)
+    knots = np.ravel([(lo, hi) for lo, hi, _ in ends.values()])
+    P = np.unique(np.concatenate([knots, np.linspace(knots.min(), knots.max(), 2001)]))
+    def given(p): # the heat `u` has exchanged beyond the shifted positions p
+        if u.heating:
+            return sum(CP * np.clip(hi - np.maximum(lo, p), 0., None)
+                       for lo, hi, CP in ends.values())
+        return sum(CP * np.clip(np.minimum(hi, p) - lo, 0., None)
+                   for lo, hi, CP in ends.values())
+    assert u.duty == pytest.approx(given(-math.inf if u.heating else math.inf),
+                                   rel=1e-12)
+    gaps = {}
+    for ID, (lo, hi, _) in ends.items():
+        p = P[(lo <= P) & (P <= hi)]
+        T_line = u.T_utility_in + (u.T_utility_out - u.T_utility_in) * given(p) / u.duty
+        gap = T_line - (p + shift[ID])
+        gaps[ID] = float(np.min(gap if u.heating else -gap))
+    return gaps
+
+def test_sensible_line_streams_of_other_shifts():
+    # with approach contributions the streams at a position of a sensible
+    # agent's stretch are at different real temperatures: its line must keep
+    # dT from the hottest cold stream there (the coldest hot one, for
+    # cooling). A hot oil (480 K, dT 0) serves C1 (390 -> 470 K, shift 4 K)
+    # and C2 (400 -> 475 of 478 K, shift -4 K): where C1 ends (shifted 466
+    # K) it has given only C2's 13 kW above it, and C1 is 8 K hotter than C2
+    # there. Bounded by C2 there, it would leave at 395.1 K and pass 3 K
+    # below C1 at shifted 404 K.
+    dT, water = bst.HeatUtility.dT, bst.HeatUtility.thermo_water
+    rows = [('C1', 390., 470., 1.), ('C2', 400., 478., 1.)]
+    t = targets('test_targeting_line_shifts_heat', rows, 10.,
+                approach_contributions={'C1': 1., 'C2': 9.})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['C1'], shift['C2']) == (4., -4.)
+    oil = bst.UtilityAgent('test_targeting_hot_oil_shifts', Water=1, T=480., P=5e6,
+                           phase='l', thermo=water, T_limit=300.,
+                           heat_transfer_price=1e-6)
+    NG = agent('natural_gas')
+    u, gas = t.utility_targets([oil, NG], [])
+    assert (u.ID, gas.ID) == (oil.ID, NG.ID)
+    assert (u.T_in, u.T_out) == (pytest.approx(390., abs=1e-9), 475.)
+    q = 155. * kW
+    assert u.duty == pytest.approx(q, rel=1e-12)
+    T_out = oil.T - (oil.T - dT - 470.) * q / (13. * kW)
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
+    assert u.cost == pytest.approx(fresh_price(u.duty, T_out - dT, u.T_out, oil)[0],
+                                   rel=1e-12)
+    # both keep dT: C2 at the level (its limit), C1 where it ends
+    assert line_gaps(t, rows, u) == pytest.approx({'C1': dT, 'C2': dT}, abs=1e-9)
+    # its mirror: a coolant (300 K, dT 0) serves H1 (390 -> 310 K, shift 6
+    # K) and H2 (380 -> 305 of 302 K, shift 14 K): where H1 ends (shifted
+    # 304 K) it has taken only H2's 13 kW below it, and H1 is 8 K colder
+    # than H2 there
+    rows = [('H1', 390., 310., 1.), ('H2', 380., 302., 1.)]
+    t = targets('test_targeting_line_shifts_cool', rows, 10.,
+                approach_contributions={'H1': 1., 'H2': 9.})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['H1'], shift['H2']) == (6., 14.)
+    coolant = bst.UtilityAgent('test_targeting_coolant_shifts', Water=1, T=300.,
+                               P=101325., phase='l', thermo=water, T_limit=370.,
+                               heat_transfer_price=1e-6)
+    CHW = agent('chilled_water')
+    u, chilled = t.utility_targets([], [coolant, CHW])
+    assert (u.ID, chilled.ID) == (coolant.ID, CHW.ID)
+    assert (u.T_in, u.T_out) == (pytest.approx(390., abs=1e-9), 305.)
+    assert u.duty == pytest.approx(q, rel=1e-12)
+    T_out = coolant.T + (310. - dT - coolant.T) * q / (13. * kW)
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
+    assert u.cost == pytest.approx(fresh_price(-u.duty, T_out + dT, u.T_out, coolant)[0],
+                                   rel=1e-12)
+    assert line_gaps(t, rows, u) == pytest.approx({'H1': dT, 'H2': dT}, abs=1e-9)
 
 def test_pricing_temperatures():
     dT = bst.HeatUtility.dT
@@ -961,6 +1084,35 @@ def test_levels_of_streams_beyond_reach():
     assert (MP.T_in, MP.T_out) == (pytest.approx(level, abs=1e-8),
                                    pytest.approx(B.outs[0].T, abs=1e-9))
     assert u.duty + MP.duty == pytest.approx(t.Q_hot, rel=1e-12)
+    # its mirror: a condenser wholly beyond cooling water's limit, above the
+    # limit of the stream it serves (and above CW.T + dT, where a sensible
+    # agent's line would have no driving force left, which also keeps a
+    # level short of a point load): the level stays just short of it
+    test_hxn_targets.setup('test_targeting_beyond_condenser', ['Water'])
+    P = bst.settings.chemicals.Water.Psat(311.)
+    vapour = bst.Stream(None, Water=10., T=311., P=P, phase='g')
+    vapour.vle(V=1., P=P)
+    liquid = vapour.copy()
+    liquid.vle(V=0., P=P)
+    hot_in = bst.Stream(None, Water=100., T=340., P=3e5)
+    hot_out = hot_in.copy()
+    hot_out.T = 300.
+    t = PinchTargets([vapour, hot_in], [liquid, hot_out], [True, True], 10.,
+                     [1., 9.], labels=['COND', 'H'])
+    level = liquid.T - t.shift[0] # where COND condenses, shifted: 305 K
+    CW, CHW = agent('cooling_water'), agent('chilled_water')
+    assert CW.T + dT < liquid.T < CW.T + CW.dT + dT
+    u, chilled = t.utility_targets()
+    assert (u.ID, chilled.ID) == (CW.ID, CHW.ID)
+    assert level < u.level < level + 1e-8
+    assert u.T_out == u.level + t.shift[1] and u.T_out - dT > CW.T + CW.dT
+    # cooling water serves H above its outlet; chilled water serves the
+    # condenser and H below it
+    cooled = hot_in.copy()
+    cooled.T = u.T_out
+    assert u.duty == pytest.approx(hot_in.H - cooled.H, rel=1e-12)
+    assert chilled.duty == pytest.approx(vapour.H - liquid.H + cooled.H - hot_out.H,
+                                         rel=1e-12)
 
 def test_levels_of_streams_past_a_zero():
     # the heat of a level reaches only the next zero of the balanced curve

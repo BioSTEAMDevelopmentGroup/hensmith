@@ -1269,7 +1269,8 @@ class PinchTargets:
 
     def _side_heat(self):
         """Each stream's heat above and below the pinch [kJ/hr] (all below
-        for a threshold problem)."""
+        for a threshold problem, whose pinch is at the grid's top with the
+        cut 'below')."""
         table = self.table
         k = self._k_pinch
         interval_H = np.abs(table.interval_H)
@@ -1278,7 +1279,6 @@ class PinchTargets:
         below = interval_H[:, k:].sum(axis=1) + point_H[:, k+1:].sum(axis=1)
         if self.cut == 'above': above = above + point_H[:, k]
         else: below = below + point_H[:, k]
-        if self.Q_hot == 0.: above, below = 0. * above, below + above
         return above, below
 
     def _level(self, agent, heating, j, reach):
