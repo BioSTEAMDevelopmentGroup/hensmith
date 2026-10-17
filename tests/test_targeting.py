@@ -28,11 +28,14 @@ D. The facility and the report: the facility's targets equal the
    independent integration on the network's own streams (branches of a
    split, phase changes), an infinite area where biosteam's utility
    crosses its stream inside the exchanger, the report at the units'
-   current states only (a cached network re-simulated, stale states
-   detected, also with ideal thermodynamics), and no side effects on the
-   flowsheet, the agents' stream dumps or a later synthesis.
-E. Plots: stable gids whose data equal the curves, and readable labels
-   and markers.
+   current states only (a cached network re-simulated, also split, with
+   replaced heat utilities and approach contributions; stale states
+   detected, also with ideal thermodynamics, and a stream that changes
+   temperature by a micro-kelvin not taken for stale), and no side
+   effects on the flowsheet, the agents' stream dumps or a later
+   synthesis.
+E. Plots: stable gids whose data equal the curves, and readable labels,
+   markers and legends.
 
 Reference A: H1 400 -> 300 K and C1 330 -> 440 K, both 1 kW/K, at
 T_min_app = 10 K: 50 kW hot and 40 kW cold utility, shifted pinch 390 K.
@@ -2301,6 +2304,67 @@ def test_network_report_current_states():
     with pytest.raises(ValueError, match='targets are not of the current states of H1'):
         network_report(HXN, targets)
 
+@pytest.mark.parametrize('contributions', [None, {'H1': 3., 'C1': 2.}])
+def test_network_report_cached_split_network(contributions):
+    # A split network the facility reuses (cache_network) with its
+    # utilities written over the units' (replace_unit_heat_utilities), with
+    # and without approach contributions: the report's targets are the
+    # facility's, at the synthesis and at changed feeds after the network
+    # is re-simulated, and each area agrees with an independent integration
+    name = f'test_targeting_report_cached_split_{contributions is None}'
+    sys, HXN, units = liquids(name, stream_splitting=True, cache_network=True,
+                              replace_unit_heat_utilities=True,
+                              approach_contributions=contributions)
+    network = HXN.HXN_sys
+    report = network_report(HXN)
+    targets = HXN.targets()
+    expected = dict.fromkeys(['H1', 'H2', 'C1', 'H3'], None) | (contributions or {})
+    assert dict(zip(targets.labels, targets.approach_contributions
+                    or [None] * 4)) == expected
+    assert report['targets'] == targets.summary()
+    for key in ('Q_hot', 'Q_cold'):
+        assert report['targets'][key] == pytest.approx(
+            HXN.synthesis_info[key + '_target'], rel=1e-6), key
+    assert any(st.fraction != 1. for lc in HXN.stream_life_cycles
+               for st in lc.life_cycle)
+    units[2].ins[0].F_mass *= 1.05
+    simulate_strictly(sys)
+    assert HXN.HXN_sys is network
+    changed = network_report(HXN)
+    assert changed['targets'] == HXN.targets().summary()
+    assert changed['targets']['Q_hot'] > report['targets']['Q_hot'] * (1 + 1e-3)
+    exchangers = {hx.ID: hx for hx in HXN.new_HXs + HXN.new_HX_utils}
+    for ID, (area, _) in changed['exchanger_areas'].items():
+        assert area == pytest.approx(independent_area(exchangers[ID]), rel=1e-4), ID
+
+def test_network_report_micro_kelvin_stream():
+    # A large stream that changes temperature by a micro-kelvin still has
+    # duty (above the facility's Qmin); the network's rigorous utility
+    # exchanger reaches its outlet only to the flash tolerance, which is
+    # more than 1e-6 of that duty: the network is of the current states
+    bst.main_flowsheet.set_flowsheet('test_targeting_report_micro_kelvin')
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    def process_stream(ID, T_in, T_out, P, **kmol_hr):
+        inlet = bst.Stream(ID + '_in', T=T_in, P=P, phase='l',
+                           units='kmol/hr', **kmol_hr)
+        return bst.HXutility(ID, ins=inlet, T=T_out, rigorous=False)
+    units = [process_stream('H1', 420., 320., 5e5, Water=60.),
+             process_stream('C1', 310., 380., 5e5, Water=50.),
+             process_stream('H2', 305.150001, 305.15, 101325., Water=20000.)]
+    sys, HXN = simulate_HXN(units, 10.)
+    H2 = units[2]
+    assert -2. < H2.heat_utilities[0].duty < -1. # (above Qmin)
+    report = network_report(HXN)
+    assert report['targets'] == HXN.targets().summary()
+    # a set point changed by 0.1 mK is a change of states
+    H2.T -= 1e-4
+    H2.simulate()
+    with pytest.raises(ValueError, match='not of the current states of H2.*simulate the system'):
+        network_report(HXN)
+    H2.T += 1e-4
+    simulate_strictly(sys)
+    assert network_report(HXN)['targets'] == report['targets']
+
 def test_no_side_effects(kemp_hxn):
     units, HXN = kemp_hxn
     # the furnace case of test_capital_target_formula: the network heats C1
@@ -2496,10 +2560,11 @@ def test_plot_readability(quickstart):
                 bst.HeatUtility.dT, abs=1e-6)
         finally:
             plt.close(fig)
-    def readable(fig, ax, labels, curves):
-        """Every one of the `labels` inside the axes and off the `curves`,
-        and the axis labels inside the figure: whether or not it is saved
-        with a tight bounding box (or shown in a window)."""
+    def readable(fig, ax, labels, curves, legend=True):
+        """Every one of the `labels` and the legend (if `legend`) inside the
+        axes and off the `curves` (and the legend off the labels), and the
+        axis labels inside the figure: whether or not it is saved with a
+        tight bounding box (or shown in a window)."""
         fig.canvas.draw()
         renderer = fig.canvas.get_renderer()
         within = lambda box, frame: (frame.x0 <= box.x0 and box.x1 <= frame.x1
@@ -2511,12 +2576,22 @@ def test_plot_readability(quickstart):
             points += [np.linspace(a, b, 500) for a, b in zip(xy, xy[1:])]
         points = np.concatenate(points)
         assert labels
-        for label in labels:
-            box = label.get_window_extent(renderer)
-            assert within(box, frame), label.get_text()
+        named = [(label.get_text(), label) for label in labels]
+        artists = list(named)
+        if legend:
+            legend = ax.get_legend()
+            assert legend is not None
+            artists.append(('legend', legend))
+        for name, artist in artists:
+            box = artist.get_window_extent(renderer)
+            assert within(box, frame), name
             inside = ((points[:, 0] >= box.x0) & (points[:, 0] <= box.x1)
                       & (points[:, 1] >= box.y0) & (points[:, 1] <= box.y1))
-            assert not inside.any(), label.get_text()
+            assert not inside.any(), name
+        if legend:
+            box = legend.get_window_extent(renderer)
+            for name, label in named:
+                assert not label.get_window_extent(renderer).overlaps(box), name
         for label in (ax.xaxis.label, ax.yaxis.label, ax.xaxis.get_offset_text()):
             assert within(label.get_window_extent(renderer), fig.bbox), label.get_text()
     # every utility label inside the axes and off both balanced composites:
@@ -2546,9 +2621,14 @@ def test_plot_readability(quickstart):
             plt.close(fig)
     # the utility labels of the real and shifted composites inside the axes
     # and off the curves, also where the hot curve's hot end is the top of
-    # the plot, at the right of it (KEMP, hot streams only)
+    # the plot, at the right of it (KEMP, hot streams only); the legend off
+    # them too, also where the cold composite of a threshold problem that
+    # needs only cooling runs into the lower right corner
     kemp = targets_of(cp_units('test_targeting_plot_kemp', KEMP, K), 10.)
-    for t in (kemp, hot, threshold, quickstart):
+    cooling = targets('test_targeting_plot_cooling', [('H1', 420., 330., 3.),
+                                                      ('C1', 300., 340., 1.)], 10.)
+    assert cooling.Q_hot == 0. and cooling.Q_cold > 0.
+    for t in (kemp, hot, threshold, cooling, quickstart):
         for kind in ('real', 'shifted'):
             fig, ax = plot_composite_curves(t, kind=kind)
             try:
@@ -2582,7 +2662,7 @@ def test_plot_readability(quickstart):
             heating = {u.ID: u.heating for u in t.utility_targets()}
             labels = _gid_artists(ax, 'Label:')
             assert len(labels) == len(heating)
-            readable(fig, ax, labels, _gid_artists(ax, 'GCC'))
+            readable(fig, ax, labels, _gid_artists(ax, 'GCC'), legend=False)
             lo, hi = ax.get_xlim()
             for label in labels:
                 (x, _), (dx, dy) = label.xy, label.xyann

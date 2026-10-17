@@ -2429,14 +2429,18 @@ def _flows(stream):
 
 def _same_ends(curve, s_in, s_out):
     """Whether the streams `s_in` and `s_out` are at the end states of
-    `curve` (on the curve's thermodynamic basis): the same enthalpies (to
-    1e-6 of its duty at the outlet, which flashes reach), and the same
-    pressure and flows at the inlet (an inlet at the enthalpy reference
-    has the same enthalpy at any flow)."""
+    `curve` (on the curve's thermodynamic basis): the same enthalpies, at
+    the outlet to the larger of 1e-6 of the duty and the heat of a
+    micro-kelvin of the outlet stream (a flash reaches the outlet only to
+    its tolerance, which is more than 1e-6 of the duty of a stream that
+    changes temperature by micro-kelvins); and the same pressure and flows
+    at the inlet (an inlet at the enthalpy reference has the same enthalpy
+    at any flow)."""
     span = abs(curve.H_out - curve.H_in)
     a, b = _flows(curve.stream_in), _flows(s_in)
+    dH_out = abs(curve.H_out - s_out.H)
     return (abs(curve.H_in - s_in.H) <= 1e-9 * (abs(curve.H_in) + span)
-            and abs(curve.H_out - s_out.H) <= 1e-6 * span
+            and (dH_out <= 1e-6 * span or dH_out <= 1e-6 * abs(s_out.C))
             and abs(curve.P - s_in.P) <= 1e-9 * curve.P
             and a.shape == b.shape
             and np.abs(a - b).max(initial=0.) <= 1e-9 * np.abs(a).max(initial=0.))
@@ -2836,7 +2840,9 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     composite starts at the unserved cooling, and the hot one ends short of
     the cold one by the unserved heating. A label of a sensible agent sits
     off the middle of its line, above left for heating and below right for
-    cooling.
+    cooling. The legend goes where it covers the least of the curves, the
+    band and the labels (matplotlib's 'best' location: no fixed corner is
+    clear of the composites of every problem).
 
     Examples
     --------
@@ -2981,7 +2987,7 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         ax.set_ylabel('shifted T [°C]' if shifted else 'T [°C]')
     _sci_ticks(ax.xaxis)
     ax.set_xlabel('H [kJ·h$^{-1}$]')
-    ax.legend(loc='lower right', fontsize=8)
+    ax.legend(loc='best', fontsize=8)
     ax.grid(alpha=0.3)
     if file: fig.savefig(file, dpi=dpi, bbox_inches='tight')
     return fig, ax
