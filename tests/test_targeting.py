@@ -963,6 +963,40 @@ def test_facility_targets_bitwise(kemp_hxn, kemp_hxn_replaced):
     with pytest.raises(RuntimeError, match='before targeting'):
         HeatExchangerNetwork('test_targeting_alone').targets()
 
+def test_facility_targets_replaced_callable():
+    # replace_unit_heat_utilities overwrites the heat utilities a callable
+    # reads (the network's utility, or none for H2 and C3, which the process
+    # exchangers serve): after a simulation the targets take the values that
+    # simulation resolved, without calling it again
+    # (H4 ends on chilled water)
+    cases = [(lambda hu: hu.duty < 0, (None, None, 2., 2.)),
+             (lambda hu: hu.agent.ID == 'cooling_water', (None, None, 2., None))]
+    for k, (read, expected) in enumerate(cases):
+        calls = []
+        def f(hu):
+            calls.append(hu)
+            return 2. if read(hu) else None
+        units = cp_units(f'test_targeting_replaced_callable_{k}', KEMP, K)
+        sys, HXN = simulate_HXN(units, 10., replace_unit_heat_utilities=True,
+                                approach_contributions=f)
+        assert sorted(u.ID for u in units if not u.heat_utilities[0].duty) == ['C3', 'H2']
+        info = HXN.synthesis_info
+        assert info['status'] == 'mer'
+        N_calls = len(calls)
+        t = HXN.targets()
+        assert len(calls) == N_calls
+        assert t.approach_contributions == HXN._resolved_contributions == expected
+        assert (t.Q_hot, t.Q_cold) == (info['Q_hot_target'], info['Q_cold_target'])
+        assert HXN.targets(20.).Q_hot == t.at(20.).Q_hot
+        report = network_report(HXN)
+        assert report['targets']['Q_hot'] == report['Q_hot'] == info['Q_hot_target']
+    # a callable set since applies from the next simulation; a mapping
+    # (resolved by unit) at once
+    HXN.approach_contributions = lambda hu: 3.
+    assert HXN.targets().approach_contributions == (None, None, 2., None)
+    HXN.approach_contributions = {'H2': 3.}
+    assert HXN.targets().approach_contributions == (None, None, 3., None)
+
 #: Keys of `network_report`.
 REPORT_KEYS = ['T_min_app', 'targets_T_min_app', 'status', 'applied', 'Q_hot', 'Q_cold',
                'utilities', 'utility_cost', 'N_units', 'N_process_units', 'N_utility_units',

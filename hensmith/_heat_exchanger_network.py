@@ -300,7 +300,9 @@ class HeatExchangerNetwork(bst.Facility):
     no effect, so that, e.g., Monte Carlo samples do not fail. A callable is
     called once per heat utility at every simulation (also to check a
     cached network, and again if a failed cache synthesizes anew), in the
-    order of the facility's heat utilities: it should be pure.
+    order of the facility's heat utilities: it should be pure. After a
+    simulation, `targets` takes the values that simulation resolved instead
+    of calling it again.
     ``synthesis_info`` reports the contributions as used by stream
     ('approach_contributions', in the order of `original_heat_exchangers`)
     and the smallest margin over each exchanger's required approach
@@ -984,12 +986,16 @@ class HeatExchangerNetwork(bst.Facility):
         `original_heat_exchangers`, in the network's stream order, at the
         units' current states: right after a synthesis, the energy targets
         at the facility's `T_min_app` equal ``synthesis_info['Q_hot_target']``
-        and ``synthesis_info['Q_cold_target']`` bit for bit. The approach
-        contributions are resolved against `original_heat_utils` (the
-        original heat utilities, kept even where
-        `replace_unit_heat_utilities` overwrote them). Before any
-        simulation, the streams are those of the heat utilities the next
-        simulation would take, prepared as the synthesis prepares them.
+        and ``synthesis_info['Q_cold_target']`` bit for bit. A mapping of
+        approach contributions is resolved again by the units of
+        `original_heat_utils`, so a mapping changed since applies; a
+        callable is not called again (with `replace_unit_heat_utilities`, the
+        heat utilities it would read hold the network's utilities by then):
+        its values are those the last simulation resolved, and a callable set
+        since takes effect at the next simulation. Before any simulation,
+        the streams are those of the heat utilities the next simulation
+        would take, prepared as the synthesis prepares them, and a callable
+        is called once per heat utility.
         Nothing is stored: with `cache_network`, the targets follow the
         units' current states, not those of the network's synthesis.
 
@@ -1039,10 +1045,20 @@ class HeatExchangerNetwork(bst.Facility):
             hxs = self.original_heat_exchangers
             hus = self.original_heat_utils # in stream order
             cold = set(self.cold_indices)
+            x = self.approach_contributions
+            if x is not None and not isinstance(x, Mapping) and callable(x):
+                # Never called again: with replace_unit_heat_utilities, the
+                # heat utilities it would read now hold the network's
+                # utilities (or nothing, for a stream the process exchangers
+                # serve). Its values, as the last simulation resolved them,
+                # are in stream order.
+                contributions = getattr(self, '_resolved_contributions', None)
+            else:
+                # by unit only, which the network never changes
+                contributions = self._network_contributions(hus)
             return PinchTargets._from_exchangers(
                 hxs, [i not in cold for i in range(len(hxs))], T_min_app,
-                self._network_contributions(hus), self.force_ideal_thermo,
-                None, hus)
+                contributions, self.force_ideal_thermo, None, hus)
         if self.system is None and not self.units:
             raise RuntimeError('simulate the system (or give the facility its '
                                'units) before targeting')

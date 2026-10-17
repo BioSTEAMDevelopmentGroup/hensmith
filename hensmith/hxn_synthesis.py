@@ -799,8 +799,9 @@ def _check_contribution_key(key):
         raise TypeError('a heat utility cannot be an approach_contributions '
                         'key (biosteam replaces the heat utilities of a unit '
                         'at every simulation): use its unit (hu.unit), the '
-                        "unit's ID or (owner.ID, unit.ID), a sequence, or a "
-                        'callable')
+                        "unit's ID or (owner.ID, unit.ID), or a callable (or, "
+                        'outside a HeatExchangerNetwork, a sequence aligned '
+                        'with the heat utilities)')
     if isinstance(key, (bst.Unit, str)): return
     if (isinstance(key, tuple) and len(key) == 2
             and all(isinstance(i, str) for i in key)): return

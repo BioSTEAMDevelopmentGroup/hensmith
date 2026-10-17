@@ -283,9 +283,12 @@ leaves a key holding an old auxiliary object to be matched by its owner's ID
 and its own. Heat utilities cannot be keys, because BioSTEAM replaces them
 at every simulation; a value per heat utility is given by a callable
 ``f(hu)`` instead, which is called once per heat utility at every simulation
-and should therefore be pure. The keys and values are checked against every
-unit available to the network and its auxiliary units before any heat
-utility is filtered out: a key that names none of them, a bad value or two
+and should therefore be pure (after a simulation, ``HXN.targets()`` takes the
+values that simulation resolved instead of calling it again, since
+``replace_unit_heat_utilities`` overwrites the heat utilities by then). The
+keys and values are checked against every unit available to the network
+and its auxiliary units before any heat utility is filtered out: a key that
+names none of them, a bad value or two
 conflicting keys raise a ``ValueError`` even while their unit is idle, but a
 valid key whose unit holds no heat utility in a simulation (no duty,
 ``ignored``, ``hxn_ok=False``) has no effect, so that a Monte Carlo sample in
@@ -293,9 +296,11 @@ which a unit falls idle does not fail.
 
 **The cache.** With ``cache_network=True``, a cached network is reused only
 while the explicit contributions resolve to the same value for every stream
-(see *Reusing a network* below). Without explicit contributions the reuse
-test is the one described there, so changing ``T_min_app`` alone still keeps
-a cached network.
+(see *Reusing a network* below). ``T_min_app`` is never part of the reuse
+test, with or without explicit contributions, so changing it alone keeps a
+cached network, and a reused network keeps the streams without a
+contribution at the ``T_min_app / 2`` it was synthesized with (as does
+``synthesis_info['approach_contributions']``).
 
 **Additive requirements only.** A requirement that belongs to a pair but is
 not the sum of two stream terms cannot be written as one shift per stream,
