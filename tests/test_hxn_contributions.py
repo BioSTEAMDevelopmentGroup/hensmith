@@ -15,7 +15,8 @@ A. Default unchanged: unspecified contributions (None, nan, an empty
    mapping, a callable returning None, or every stream at
    ``T_min_app / 2``) give the default plans, problem tables and facility
    networks bit for bit, compared in-process with ``float.hex`` and
-   ``tobytes``.
+   ``tobytes``; a numpy float32 ``T_min_app`` keeps its own float32
+   arithmetic in every exchanger's guard.
 B. Uniform contributions: every stream at ``x`` plans the network of
    ``T_min_app = 2x`` on a shifted scale offset by a constant, and on
    real-thermo cases all hot streams at ``a`` and all cold ones at ``b``
@@ -339,6 +340,32 @@ def test_default_networks_bit_for_bit(name):
         assert (float(info['min_approach_margin']).hex()
                 == float(info['min_approach'] - T).hex())
     if splitting: assert HXN.new_splitters
+
+@pytest.mark.parametrize('name', ['r002', 'case_05_boiling_cold',
+                                  'smith2005_ex18_2_split'])
+def test_default_float32_T_min_app_keeps_its_own_arithmetic(name):
+    # the default path uses a numpy float32 T_min_app as given (as before
+    # approach contributions existed), not promoted to float64 through the
+    # per-stream shifts: every exchanger's guard is HXprocess.dT = T_min_app
+    # - _APPROACH_TOL in float32, with contributions unspecified in any form
+    units, T, splitting = default_network_units(name)
+    T = np.float32(T)
+    guard = float(T - hxn_synthesis._APPROACH_TOL).hex()
+    # the float32 guard differs from the float64 one, so this discriminates
+    assert guard != (float(T) - hxn_synthesis._APPROACH_TOL).hex()
+    sys, HXN = simulate_HXN(units, T, f'contributions_f32_{name}',
+                            stream_splitting=splitting)
+    assert HXN.new_HXs
+    assert all(float(u.dT).hex() == guard for u in HXN.new_HXs)
+    reference = network_record(HXN)
+    for contributions in ({}, {u: NAN for u in units}, lambda hu: None,
+                          None):
+        HXN.approach_contributions = contributions
+        simulate_strictly(sys)
+        assert HXN._resolved_contributions is None
+        assert network_record(HXN) == reference
+        assert (float(HXN.synthesis_info['min_approach_margin']).hex()
+                == float(HXN.synthesis_info['min_approach'] - T).hex())
 
 # ---------------------------------------------------------------------------
 # B. Uniform contributions

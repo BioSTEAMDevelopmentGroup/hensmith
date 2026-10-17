@@ -2479,10 +2479,13 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         hx_utils_rearranged, streams_quenched, table, curves, grid = \
         _pinch_analysis(hus, T_min_app, force_ideal_thermo, sort_hus_by_T,
                         values)
-    # every pair's required approach is shift[h] - shift[c] (T_min_app by
-    # default, to the bit); the planner gets the contributions only if any
-    # is given, so the default call is unchanged
-    shift = grid['shift']
+    # every pair's required approach is shift[h] - shift[c]; by default it
+    # is the scalar T_min_app itself, passed as given (not the shift vector,
+    # whose float() pair difference in `_required_approach` would promote a
+    # numpy float32 T_min_app to float64 and change the guards), so the
+    # default checks, repair and realization are unchanged to the bit; the
+    # planner gets the contributions only if any is given, likewise
+    shift = T_min_app if values is None else grid['shift']
     contributions = None if values is None else grid['contributions']
     N = len(hxs)
     is_hot = [False] * N
