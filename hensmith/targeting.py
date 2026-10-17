@@ -2575,6 +2575,15 @@ def _check_targets(HXN, targets):
                              '(simulated since?): make '
                              'them again with HXN.targets()')
 
+def _rebuilt_label(hxs, labels, units):
+    """The label (of `labels`, aligned with `hxs`) of the first of the
+    exchangers `hxs` that is not one of `units` (a facility's units and
+    their nested auxiliaries: a unit has rebuilt it since), or None."""
+    at_hand = {id(unit) for unit in units}
+    for hx, label in zip(hxs, labels):
+        if id(hx) not in at_hand: return label
+    return None
+
 def _check_network(HXN, targets):
     """Raise a ValueError unless every stream of `HXN`'s network is that of
     an original exchanger still among the facility's units and their
@@ -2586,14 +2595,14 @@ def _check_network(HXN, targets):
     copy of the real inlet where it enters the network, and the outlet of
     its last stage (the network's copies share the curves' thermodynamic
     basis)."""
-    at_hand = {id(unit) for unit in HXN._candidate_units()}
-    for hx, label in zip(HXN.original_heat_exchangers, targets.labels):
-        if id(hx) not in at_hand:
-            raise ValueError(f'the network of {HXN.ID} is of {label}, which is '
-                             "no longer one of the facility's units nor an "
-                             'auxiliary of one (rebuilt since the '
-                             "facility's last simulation?): simulate the "
-                             'system')
+    label = _rebuilt_label(HXN.original_heat_exchangers, targets.labels,
+                           HXN._candidate_units())
+    if label is not None:
+        raise ValueError(f'the network of {HXN.ID} is of {label}, which is '
+                         "no longer one of the facility's units nor an "
+                         'auxiliary of one (rebuilt since the '
+                         "facility's last simulation?): simulate the "
+                         'system')
     for life_cycle, c, label in zip(HXN.stream_life_cycles, targets.curves,
                                     targets.labels):
         entry = life_cycle.entry
@@ -2861,7 +2870,8 @@ def network_report(HXN, targets=None, **options):
     if not hasattr(HXN, 'new_HXs_hot_side'):
         raise RuntimeError('simulate the heat exchanger network before '
                            'reporting on it')
-    if targets is None: targets = HXN.targets()
+    # (without the warning of stages rebuilt since: _check_network raises)
+    if targets is None: targets = HXN._pinch_targets()[0]
     else: _check_targets(HXN, targets)
     _check_network(HXN, targets)
     options = dict(options)
@@ -3288,8 +3298,8 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     utilities : list[UtilityTarget], optional
         Utilities of the balanced curves, as
         `PinchTargets.balanced_composite_curves` takes them (those of
-        `targets`). Defaults to `PinchTargets.utility_targets` with the
-        default agents.
+        `targets`), with kind 'balanced' only. Defaults to
+        `PinchTargets.utility_targets` with the default agents.
     ax : matplotlib.axes.Axes, optional
         Axes to draw on; a new figure (with a constrained layout, which
         keeps the axis labels and a note under the x axis in it) is created
@@ -3303,6 +3313,14 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     -------
     fig : matplotlib.figure.Figure
     ax : matplotlib.axes.Axes
+
+    Raises
+    ------
+    ValueError
+        For another `kind`, for `utilities` with kind 'real' or 'shifted'
+        (whose curves take none), or for ``utilities=False`` (the balanced
+        curves are those of their utilities: kind 'real' draws the
+        composites without them).
 
     Notes
     -----
@@ -3334,8 +3352,11 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     labels go in rows instead, each beside its flat and moved sideways past
     the labels of the levels beyond its own; or, if those would not keep
     the order inside the axes, those that would run past the edge are moved
-    sideways past the label in their way. A label left more than 1.5 times
-    its height away from its anchor gets a thin leader from it
+    sideways past the label in their way. Labels can then still overlap,
+    on axes too small for them all (many agents on small axes without a
+    layout engine, say): a larger figure, or one with
+    ``layout='constrained'``, gives them room. A label left more than 1.5
+    times its height away from its anchor gets a thin leader from it
     ('Leader:<agent ID>', an empty path otherwise), and each label a halo,
     so that a leader passing behind it strikes none of its letters. The
     legend goes where it covers the least of the curves, the band and the
@@ -3370,6 +3391,13 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     if kind not in ('real', 'shifted', 'balanced'):
         raise ValueError("kind must be 'real', 'shifted' or 'balanced', not "
                          f'{kind!r}')
+    if utilities is not None and kind != 'balanced':
+        raise ValueError(f'the {kind} composite curves take no utilities '
+                         "(those of kind='balanced')")
+    if utilities is False:
+        raise ValueError('the balanced composite curves are those of their '
+                         "utilities, not False (kind='real' draws the "
+                         'composites without them)')
     if ax is None:
         fig, ax = plt.subplots(figsize=(7.5, 4.2), layout='constrained')
     else:

@@ -2594,20 +2594,33 @@ def test_network_report_rebuilt_stages():
     K1.pr = 3.
     K1.simulate()
     assert not set(K1.hxs) & set(former)
-    targets = HXN.targets() # still of the former stages, labeled by K1
+    # the facility's targets are still of the former stages (labeled by
+    # K1), at their former states, and say so
+    rebuilt = (r"the targets of HXN are of the former state of K1 - K1_H\d, "
+               r"which is no longer one of the facility's units nor an "
+               r"auxiliary of one \(rebuilt .*\): simulate the system")
+    with pytest.warns(RuntimeWarning, match=rebuilt):
+        targets = HXN.targets()
     assert set(targets.units) == {C1, *former}
+    assert targets.summary() == report['targets']
     message = (r"the network of HXN is of K1 - K1_H\d, which is no longer one "
                r"of the facility's units nor an auxiliary of one \(rebuilt "
                r".*\): simulate the system")
-    with pytest.raises(ValueError, match=message):
-        network_report(HXN)
-    with pytest.raises(ValueError, match=message):
-        network_report(HXN, targets)
+    for args in ((HXN,), (HXN, targets)): # it raises, without the warning
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            with pytest.raises(ValueError, match=message):
+                network_report(*args)
+        assert not [w for w in caught if 'former state' in str(w.message)]
     # simulated again: the network and the report are of the new stages
-    # (hotter, whose heat now covers the cold stream's)
+    # (hotter, whose heat now covers the cold stream's), and the targets
+    # warn no more
     simulate_strictly(sys)
     assert set(HXN.original_heat_exchangers) == {C1, *K1.hxs}
-    report = network_report(HXN)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        report = network_report(HXN)
+        HXN.targets()
     assert report['targets'] == HXN.targets().summary()
     assert report['targets']['Q_hot'] == 0. and report['targets']['Q_cold'] > 0.
 
@@ -2790,6 +2803,17 @@ def test_plot_composite_curves_gids(tmp_path):
             plt.close(fig)
     with pytest.raises(ValueError, match="kind must be"):
         plot_composite_curves(t, kind='hot')
+    # utilities are those of the balanced curves only, which need them (no
+    # figure is made before the error)
+    figures = plt.get_fignums()
+    for kind in ('real', 'shifted'):
+        with pytest.raises(ValueError, match=f'the {kind} composite curves '
+                           r"take no utilities \(those of kind='balanced'\)"):
+            plot_composite_curves(t, kind=kind, utilities=t.utility_targets())
+    with pytest.raises(ValueError, match='the balanced composite curves are '
+                       'those of their utilities, not False'):
+        plot_composite_curves(t, kind='balanced', utilities=False)
+    assert plt.get_fignums() == figures
     # fuel is labeled, not drawn
     furnace = targets('test_targeting_plots_fuel', [('C1', 330., 520., 1.),
                                                     ('H1', 400., 300., 1.)], 10.)

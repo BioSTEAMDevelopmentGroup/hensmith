@@ -1365,13 +1365,15 @@ def test_targets_keep_the_holders_of_stages_rebuilt_since():
         assert all(getattr(hx, '_owner', None) is None for hx in hxs)
         assert results(targets) == first
     # K1 simulated alone rebuilds its stages: the facility's targets keep
-    # the contributions the network was synthesized with
+    # the contributions the network was synthesized with (and warn that
+    # their streams are of the former stages)
     info = HXN.synthesis_info['approach_contributions'].tolist()
     old = list(K1.hxs)
     K1.pr = 2.5
     K1.simulate()
     assert not any(hx in old for hx in K1.hxs)
-    targets = HXN.targets()
+    with pytest.warns(RuntimeWarning, match='former state of K1 - K1_H'):
+        targets = HXN.targets()
     assert [2.5 if c is None else c
             for c in targets.approach_contributions] == info == [
         2.5, 2., 2., 2.]
