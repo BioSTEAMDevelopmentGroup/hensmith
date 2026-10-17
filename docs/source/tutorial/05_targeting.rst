@@ -256,14 +256,14 @@ cost, so the TAC follows the utility cost and falls as ``T_min_app`` does. Below
 about 1.85 K the system is a threshold problem: it needs no cold utility at
 all, so the hot utility, its steam and the balanced composite curves no longer
 change with ``T_min_app``, and neither does any target. The TACs at 1 and at
-1.848 K differ by less than 7 USD/yr, 4e-7 of the TAC, which is no physical
+1.849 K differ by less than 7 USD/yr, 4e-7 of the TAC, which is no physical
 effect: the problem table's grid moves with ``T_min_app`` over the curved
 (vapor-liquid) profiles of the streams, and the area follows it, too little
 to show in the table (6836 m² at both). Every ``T_min_app`` of that flat
 stretch is an optimum but for these few USD/yr. The area, and with it the TAC,
 falls steadily across the stretch as the grid moves, so the least TAC is always
-the warmest point evaluated below the threshold, here 1.848 K (inside the
-sweep, not at its bound), 0.005 K short of the step. That step comes at the
+the warmest point evaluated below the threshold, here 1.849 K (inside the
+sweep, not at its bound), 0.004 K short of the step. That step comes at the
 next point, 1.853 K: the cold utility appears and needs a unit of its own (6
 units), which adds about 12000 USD/yr to the TAC. Between 10 and 15 K, where
 chapter 4's sweep saw the pinch move to the column condenser's vapor inlet,
@@ -276,7 +276,7 @@ the units target jumps to 9.
 
    The sweep of the quickstart system. The total annualized cost (black) is
    the operating cost (red) plus the annualized capital cost (blue); the
-   circle and the dashed line mark the least TAC, 1.494e+07 USD/yr at 1.848 K.
+   circle and the dashed line mark the least TAC, 1.494e+07 USD/yr at 1.849 K.
    Capital is a small fraction of the TAC, so the optimum has the least
    utility: it is on the flat stretch below 1.85 K, where no cold utility (and
    no unit for it) is needed, and any point of that stretch would do.
@@ -299,8 +299,8 @@ of the sweep.
 .. literalinclude:: /_generated/ch05_trade_off.txt
    :language: text
 
-Here the annualized capital cost (71605.6 USD/yr at the optimum) falls as
-``T_min_app`` grows and the operating cost (20032 USD/yr) rises with it, and
+Here the annualized capital cost (71606.7 USD/yr at the optimum) falls as
+``T_min_app`` grows and the operating cost (20031 USD/yr) rises with it, and
 the least TAC, 91637.6 USD/yr, is at 21.59 K, well inside the sweep: the
 classic supertargeting curve.
 

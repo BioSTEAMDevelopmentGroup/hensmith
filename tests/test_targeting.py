@@ -1823,6 +1823,35 @@ def test_sweep(monkeypatch):
         supertarget(partial, [0., 5.])
     assert np.ptp(supertarget(partial, [5., 20.], refine=0)['Q_hot']) > 0.
 
+def test_sweep_refinement():
+    # each round evaluates n_refine new temperatures, on both sides of the
+    # least TAC and never on it: on an evenly spaced grid the bracket is
+    # symmetric, and an odd n_refine once put one on the optimum itself, so
+    # n_refine=1 refined nothing
+    t = targets('test_targeting_sweep_refinement', REF_A, 10.)
+    grid = np.arange(1., 41.)
+    coarse = supertarget(t, grid, refine=0)
+    x = coarse.T_min_app
+    assert x == 8. and not coarse.at_bound
+    for n in (1, 2, 3, 8, 9):
+        new = np.setdiff1d(supertarget(t, grid, refine=1, n_refine=n)['T_min_app'], grid)
+        assert new.size == n and x not in new
+        below, above = new[new < x], new[new > x]
+        # the n + 2 gaps of the bracket shared by its sides (the odd one below)
+        assert below.size == n - n // 2 and above.size == n // 2
+        assert_allclose(np.diff([x - 1., *below, x]), 1. / (below.size + 1), rtol=1e-12)
+        assert_allclose(np.diff([x, *above, x + 1.]), 1. / (above.size + 1), rtol=1e-12)
+        assert len(supertarget(t, grid, refine=3, n_refine=n).records) == grid.size + 3 * n
+    one = supertarget(t, grid, refine=1, n_refine=1)
+    assert len(one.records) == grid.size + 1 and 7.5 in one['T_min_app']
+    # a lopsided bracket: the gaps in proportion to the widths of its sides
+    assert_allclose(np.setdiff1d(supertarget(t, [5., 10., 20.], refine=1, n_refine=3)['T_min_app'],
+                                 [5., 10., 20.]), [7.5, 40. / 3., 50. / 3.], rtol=1e-12)
+    # at a bound of the sweep, all on its one side, as evenly spaced as before
+    assert supertarget(t, [10., 20., 30.], refine=0).at_bound
+    at_bound = supertarget(t, [10., 20., 30.], refine=1, n_refine=3)
+    assert list(at_bound['T_min_app']) == [10., 12.5, 15., 17.5, 20., 30.]
+
 # %% Facility and report
 
 def terminal_area(hx):

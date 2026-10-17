@@ -851,16 +851,17 @@ class PinchTargets:
     no area (each costed as biosteam costs a vanishing double pipe, about
     1,305 USD installed). This is the least change to the equal division
     that never falls when a unit is added (or some area, except where
-    biosteam's correlations do: for shells beyond about 20,000 ft², whose
-    cost rises faster than their area, and for the 'Double pipe'
-    `heat_exchanger_type`, cheaper at 150 ft² than below). Where it departs
-    from the equal division it tends to be high, as networks keep only part
-    of their area in shell and tubes (the equal division tends to be low
-    there): an estimate, not a bound. The furnace is costed on the fuel's
-    utility duty. `summary` adds the total annualized cost,
-    the installed (bare module) cost times the capital recovery factor plus
-    the utility cost times the operating hours: no Lang factor and no
-    working capital.
+    biosteam's correlations do: for shells whose cost rises faster than
+    their area, beyond about 35,000 ft² (3,300 m²) for the default floating
+    head of carbon steel and from about 15,000 ft² by type and material,
+    and for the 'Double pipe' `heat_exchanger_type`, cheaper at 150 ft² than
+    below). Where it departs from the equal division it tends to be high, as
+    networks keep only part of their area in shell and tubes (the equal
+    division tends to be low there): an estimate, not a bound. The furnace
+    is costed on the fuel's utility duty. `summary` adds the total
+    annualized cost, the installed (bare module) cost times the capital
+    recovery factor plus the utility cost times the operating hours: no Lang
+    factor and no working capital.
 
     Examples
     --------
@@ -2001,8 +2002,8 @@ class PinchTargets:
             how many of them share the area equally (the others have none);
             'shell_area', the area of each of those [m²]; 'type', biosteam's
             type of each ('Double pipe' below 150 ft², None without shells
-            or with an infinite area); 'furnace_duty', the utility duty of
-            the fuel [kJ/hr];
+            or with an infinite or nan area); 'furnace_duty', the utility
+            duty of the fuel [kJ/hr];
             'purchase_cost' and 'installed_cost' (bare module) [USD]. inf
             with an infinite area, nan with an unserved utility.
 
@@ -2126,7 +2127,7 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     refine : int, optional
         Rounds of refinement around the least TAC. Defaults to 3.
     n_refine : int, optional
-        Evaluations per round of refinement. Defaults to 8.
+        New temperatures evaluated per round of refinement. Defaults to 8.
     scale_contributions : bool, optional
         Scale the specified approach contributions of `targets` with the
         minimum approach temperature (see `PinchTargets.at`). Defaults to
@@ -2167,10 +2168,14 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
 
     The TAC is not smooth (the units target jumps, so do biosteam's
     correlations at 150 ft², and the pinch can move), so the sweep is a
-    grid search: each round of refinement evaluates `n_refine` evenly spaced
-    temperatures between the neighbors of the least TAC so far, so after r
-    rounds the spacing is the grid's times (2/9)**r for the defaults. A
-    least TAC at the smallest or largest temperature evaluated is flagged
+    grid search: each round of refinement evaluates `n_refine` new
+    temperatures between the neighbors of the least TAC so far, never on
+    it: with it, they cut that bracket into ``n_refine + 2`` gaps, shared by
+    its two sides in proportion to their widths, each side evenly spaced
+    (all on its one side at a bound of the sweep). On an evenly spaced grid,
+    after r rounds the spacing near the optimum is then about the grid's
+    times ``(2 / (n_refine + 2))**r``, (1/5)**r for the defaults. A least
+    TAC at the smallest or largest temperature evaluated is flagged
     (`Supertargets.at_bound`).
 
     The capital target drops by about a shell and tube wherever the
@@ -2235,11 +2240,11 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
 
     >>> sweep = supertarget(targets, grid)
     >>> sweep
-    <Supertargets: 29 points, T_min_app 5-30 K, optimum 14.94 K (TAC 4.930e+03 USD/yr)>
+    <Supertargets: 30 points, T_min_app 5-30 K, optimum 14.96 K (TAC 4.936e+03 USD/yr)>
     >>> i = sweep.records.index(sweep.optimum)
     >>> [(r['shell_type'], round(r['area'], 2), round(r['TAC']))
     ...  for r in sweep.records[i - 1:i + 1]]
-    [('Floating head', 13.95, 12572), ('Double pipe', 13.93, 4930)]
+    [('Floating head', 13.95, 12573), ('Double pipe', 13.91, 4936)]
 
     References
     ----------
@@ -2289,10 +2294,21 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
         lo = records[max(i - 1, 0)]['T_min_app']
         hi = records[min(i + 1, len(records) - 1)]['T_min_app']
         if hi - lo <= 1e-6: break
+        # the new temperatures go on both sides of the least TAC, never on
+        # it (a bracket's midpoint can be it): with it they cut the bracket
+        # into n_refine + 2 gaps, shared by its sides in proportion to their
+        # widths (all on its one side at a bound of the sweep), so each side
+        # is spaced evenly and the two about alike
+        x = records[i]['T_min_app']
+        k = math.floor((n_refine + 2) * (x - lo) / (hi - lo) + 0.5) - 1
+        k = min(max(k, 0), n_refine) # how many go below it
+        candidates = np.concatenate((
+            np.linspace(lo, x, k + 2)[1:-1],
+            np.linspace(x, hi, n_refine - k + 2)[1:-1]))
         evaluated = np.array([r['T_min_app'] for r in records])
-        for x in np.linspace(lo, hi, n_refine + 2)[1:-1]:
-            if np.abs(evaluated - x).min() > 1e-12:
-                records.append(evaluate(float(x)))
+        for T_new in candidates:
+            if np.abs(evaluated - T_new).min() > 1e-12:
+                records.append(evaluate(float(T_new)))
     sweep = Supertargets(targets, records, options, scale_contributions)
     unserved = int(np.isnan(sweep['utility_cost']).sum())
     if unserved:
@@ -3151,7 +3167,7 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     ...     [H1.heat_utilities[0], C1.heat_utilities[0]], T_min_app=10.)
     >>> sweep = supertarget(targets)
     >>> sweep
-    <Supertargets: 63 points, T_min_app 1-40 K, optimum 7.823 K (TAC 2.490e+04 USD/yr)>
+    <Supertargets: 64 points, T_min_app 1-40 K, optimum 7.816 K (TAC 2.490e+04 USD/yr)>
     >>> fig, ax = plot_supertargets(sweep)
     >>> [line.get_gid() for line in ax.get_lines() if line.get_gid()]
     ['TAC', 'Capital', 'Operating', 'Optimum']

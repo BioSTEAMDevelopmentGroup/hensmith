@@ -522,8 +522,11 @@ equal division puts the shells below 150 ft² and the area fills
 :math:`k` equal shell and tubes with :math:`N - k` shells of no area (each
 costed as BioSTEAM costs a vanishing double pipe, about 1,300 USD installed).
 This is the least change to the equal division that never falls when a unit
-is added; where it departs from it, it tends to be high (networks keep only
-part of their area in shell and tubes) as the equal division tends to be low.
+is added, except for shells beyond about 35,000 ft² (3,300 m²) with the
+default floating head of carbon steel (from about 15,000 ft² by type and
+material), whose cost rises faster than their area; where it departs from it,
+it tends to be high (networks keep only part of their area in shell and tubes)
+as the equal division tends to be low.
 The summary's ``'N_area_shells'``, ``'shell_area'`` and ``'shell_type'`` say
 which shells carry the area. BioSTEAM's other specifics carry over: the
 floating head correlation is not monotone below about 126 ft², which the

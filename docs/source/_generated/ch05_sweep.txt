@@ -1,9 +1,9 @@
-<Supertargets: 54 points, T_min_app 1-30 K, optimum 1.848 K (TAC 1.494e+07 USD/yr)>
+<Supertargets: 54 points, T_min_app 1-30 K, optimum 1.849 K (TAC 1.494e+07 USD/yr)>
 T_min_app  Q_hot      Q_cold     area    units  installed  capital    operating  TAC
 [K]        [kJ/hr]    [kJ/hr]    [m2]           [USD]      [USD/yr]   [USD/yr]   [USD/yr]
 1          2.808e+08  0          6836    5      2.482e+06  4.04e+05   1.454e+07  14943217
-1.848      2.808e+08  0          6836    5      2.482e+06  4.04e+05   1.454e+07  14943211
-1.853      2.808e+08  1981       6835    6      2.555e+06  4.158e+05  1.454e+07  14955185
+1.849      2.808e+08  0          6836    5      2.482e+06  4.04e+05   1.454e+07  14943211
+1.853      2.808e+08  2049       6835    6      2.555e+06  4.158e+05  1.454e+07  14955188
 2          2.809e+08  9.219e+04  6759    6      2.532e+06  4.12e+05   1.455e+07  14959665
 5          2.828e+08  1.936e+06  5946    6      2.282e+06  3.713e+05  1.472e+07  15088200
 10         2.859e+08  5.009e+06  5440    6      2.127e+06  3.461e+05  1.5e+07    15344973
@@ -11,4 +11,4 @@ T_min_app  Q_hot      Q_cold     area    units  installed  capital    operating 
 20         2.975e+08  1.662e+07  5073    9      2.243e+06  3.651e+05  1.573e+07  16093036
 25         3.049e+08  2.41e+07   5042    9      2.234e+06  3.635e+05  1.613e+07  16498447
 30         3.124e+08  3.157e+07  5042    9      2.234e+06  3.635e+05  1.654e+07  16904956
-optimum 1.848 K, at the bound of the sweep: False
+optimum 1.849 K, at the bound of the sweep: False
