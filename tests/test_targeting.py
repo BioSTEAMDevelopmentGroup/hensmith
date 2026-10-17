@@ -116,7 +116,10 @@ def min_vertical_gap(hot_T, hot_H, cold_T, cold_H):
 def min_driving_force(hot_T, hot_H, cold_T, cold_H):
     """Smallest T_hot - T_cold over every stretch of positive heat between
     the breakpoints of two piecewise-linear curves (a vertical run carries
-    no heat: each stretch is evaluated inside the segments it lies in)."""
+    no heat: each stretch is evaluated inside the segments it lies in; a
+    sliver of rounding, where the two curves' vertical runs end at heats
+    that differ only by rounding, would pair one curve's run with the
+    other's, and is skipped, as `_bath` skips slivers)."""
     end = min(hot_H[-1], cold_H[-1])
     X = np.unique(np.concatenate([hot_H, cold_H]))
     X = X[(X >= 0) & (X <= end)]
@@ -124,6 +127,7 @@ def min_driving_force(hot_T, hot_H, cold_T, cold_H):
         return T[i] + (T[i + 1] - T[i]) * (x - H[i]) / (H[i + 1] - H[i])
     gaps = []
     for x, y in zip(X[:-1], X[1:]):
+        if y - x <= 1e-9 * end: continue
         m = 0.5 * (x + y)
         i = np.searchsorted(hot_H, m, 'right') - 1
         j = np.searchsorted(cold_H, m, 'right') - 1
@@ -375,14 +379,17 @@ def test_contributions():
     bottom = np.array([min(s['T_in'], s['T_out']) for s in streams]) - shift
     dT = bst.HeatUtility.dT
     LP, CW = agent('low_pressure_steam'), agent('cooling_water')
+    # a stream reaching beyond its limit caps the level at the limit, one
+    # wholly beyond it at its own end (constant-CP streams: no point loads),
+    # all within the served streams' limits
     R = LP.T - LP.dT - dT
     above = [j for j in range(N) if not hot[j] and top[j] > pinch]
-    reached = [R - shift[j] for j in above if top[j] > R - shift[j]]
-    L_LP = min(reached) if reached else R - min(shift[j] for j in above)
+    L_LP = min([max(R - shift[j] for j in above)]
+               + [max(R - shift[j], bottom[j]) for j in above if top[j] > R - shift[j]])
     R = CW.T + CW.dT + dT
     below = [j for j in range(N) if hot[j] and bottom[j] < pinch]
-    reached = [R - shift[j] for j in below if bottom[j] < R - shift[j]]
-    L_CW = max(reached) if reached else R - max(shift[j] for j in below)
+    L_CW = max([min(R - shift[j] for j in below)]
+               + [min(R - shift[j], top[j]) for j in below if bottom[j] < R - shift[j]])
     utilities = by_ID(tc.utility_targets())
     assert set(utilities) == {'low_pressure_steam', 'cooling_water'}
     assert utilities['low_pressure_steam'].level == L_LP
@@ -777,6 +784,112 @@ def test_pricing_temperatures():
                 assert u.T_in >= u.T_out and u.T_out - dT >= a.T + a.dT - 1e-6
                 if a.T_limit: assert u.T_utility_out <= u.T_in - dT + 1e-6
 
+def water_boiler(ID, T_sat, kmol_hr):
+    """Saturated liquid water boiled to saturated vapour at `T_sat` [K]: a
+    point load alone (water thermo and flowsheet set by the caller)."""
+    P = bst.settings.chemicals.Water.Psat(T_sat)
+    liquid = bst.Stream(ID + '_liquid', Water=kmol_hr, T=T_sat, P=P, phase='l')
+    boiler = bst.HXutility(ID, ins=liquid, V=1., rigorous=True)
+    boiler.simulate()
+    return boiler
+
+def test_point_loads_at_stretch_ends():
+    # a stream served only at a point load at an end of a stretch (a boiler
+    # at the pinch with the cut 'above', a condenser at it with the cut
+    # 'below') is served there: the targets give its temperature, not a
+    # stretch end (shifted, with approach contributions), and a sensible
+    # agent keeps dT from it, as biosteam requires and the balanced
+    # composites need
+    dT = bst.HeatUtility.dT
+    # the reference case: C1 leaves boiled at the pinch, not at H1's inlet
+    units, T_min_app = test_hxn_targets.case_two_stream()
+    t = targets_of(units, T_min_app)
+    T_sat = units[1].outs[0].T
+    LP = by_ID(t.utility_targets())['low_pressure_steam']
+    assert t.cut == 'above'
+    assert (LP.T_in, LP.T_out) == (pytest.approx(T_sat, abs=1e-9),) * 2
+    # a hot oil serving a boiler at the pinch leaves dT above it
+    test_hxn_targets.setup('test_targeting_boiler', ['Water'])
+    H1 = test_hxn_targets.utility_hx('H1', 395., 5e5, 'l', 300., Water=100.)
+    C1 = water_boiler('C1', bst.settings.chemicals.Water.Tb, 10.)
+    T_b = C1.outs[0].T
+    oil = bst.UtilityAgent('test_targeting_boiler_oil', Water=1, T=480., P=5e6,
+                           phase='l', thermo=bst.HeatUtility.thermo_water,
+                           T_limit=300., heat_transfer_price=1e-6)
+    for c in ({}, {'C1': 3.}, {'C1': 3., 'H1': 1.}):
+        t = targets_of([H1, C1], 10., approach_contributions=c)
+        assert t.cut == 'above'
+        utilities = t.utility_targets([oil], None)
+        u = utilities[0]
+        assert u.ID == oil.ID and u.duty == pytest.approx(t.Q_hot, rel=1e-12)
+        assert (u.T_in, u.T_out) == (pytest.approx(T_b, abs=1e-9),) * 2
+        assert u.T_utility_out == pytest.approx(T_b + dT, abs=1e-9)
+        assert u.cost == pytest.approx(fresh_price(u.duty, T_b, T_b, oil)[0], rel=1e-9)
+        gap = c.get('H1', 5.) + c.get('C1', 5.)
+        curves = t.balanced_composite_curves(utilities)
+        assert min_driving_force(*curves) >= min(gap, dT) - 1e-9
+    # cooling water serving a condenser at the pinch leaves dT below it
+    test_hxn_targets.setup('test_targeting_condenser', ['Water'])
+    P = bst.settings.chemicals.Water.Psat(320.)
+    vapour = bst.Stream('test_targeting_condenser_vapour', Water=10., T=335., P=P,
+                        phase='g')
+    COND = bst.HXutility('COND', ins=vapour, V=0., rigorous=True)
+    liquid = bst.Stream('test_targeting_condenser_liquid', Water=100., T=300., P=3e5)
+    C2 = bst.HXutility('C2', ins=liquid, T=330., rigorous=False)
+    COND.simulate(); C2.simulate()
+    T_c, CW = COND.outs[0].T, agent('cooling_water')
+    for c in ({}, {'COND': 1.}, {'COND': 1., 'C2': 1.}):
+        t = targets_of([COND, C2], 10., approach_contributions=c)
+        assert t.cut == 'below'
+        utilities = t.utility_targets()
+        u = by_ID(utilities)['cooling_water']
+        assert u.duty == pytest.approx(t.Q_cold, rel=1e-12)
+        assert (u.T_in, u.T_out) == (pytest.approx(T_c, abs=1e-9),) * 2
+        assert u.T_utility_out == pytest.approx(T_c - dT, abs=1e-9)
+        assert u.cost == pytest.approx(fresh_price(-u.duty, T_c, T_c, CW)[0], rel=1e-9)
+        gap = c.get('COND', 5.) + c.get('C2', 5.)
+        curves = t.balanced_composite_curves(utilities)
+        assert min_driving_force(*curves) >= min(gap, dT) - 1e-9
+    # no stream with heat in a stretch is an internal error, never a
+    # stretch end taken for a temperature
+    with pytest.raises(RuntimeError, match='no stream has heat in the stretch'):
+        t._ends(np.zeros((2, 3)), 0, 2, 300., 310., True)
+
+def test_levels_of_streams_beyond_reach():
+    # a level serves only what lies below it (above it, for cooling): a
+    # stream lying wholly beyond an agent's limit bounds the level only at
+    # its own end, so its contribution moves no level (it moved duty to a
+    # dearer agent). B lies above low pressure steam's limit, then below
+    # cooling water's.
+    cases = [[('A', 330., 406., 1.), ('B', 420., 430., 1.), ('H1', 380., 300., 1.)],
+             [('A', 340., 313., 1.), ('B', 300., 290., 1.), ('C1', 350., 420., 1.)]]
+    for n, rows in enumerate(cases):
+        base = targets(f'test_targeting_beyond_{n}', rows, 10.).utility_targets()
+        for c in (1., 2.5, 4.9):
+            t = targets(f'test_targeting_beyond_{n}_{c}', rows, 10.,
+                        approach_contributions={'B': c})
+            utilities = t.utility_targets()
+            assert [(u.ID, u.level) for u in utilities] == [(u.ID, u.level) for u in base]
+            assert_allclose([u.duty for u in utilities], [u.duty for u in base], rtol=1e-12)
+            assert_allclose([u.cost for u in utilities], [u.cost for u in base], rtol=1e-9)
+    # a boiler wholly beyond low pressure steam's limit, below the limit of
+    # the stream it serves: the level stays just short of the boiler (a
+    # level at a grid temperature serves its point loads)
+    test_hxn_targets.setup('test_targeting_beyond_boiler', ['Water'])
+    A = test_hxn_targets.utility_hx('A', 330., 6e5, 'l', 406., Water=50.)
+    B = water_boiler('B', 409., 5.)
+    H = test_hxn_targets.utility_hx('H', 380., 6e5, 'l', 300., Water=50.)
+    t = targets_of([A, B, H], 10., approach_contributions={'B': 1.})
+    level = B.ins[0].T - t.shift[t.labels.index('B')] # where B boils, shifted: 405 K
+    dT, LP = bst.HeatUtility.dT, agent('low_pressure_steam')
+    utilities = by_ID(t.utility_targets())
+    u, MP = utilities['low_pressure_steam'], utilities['medium_pressure_steam']
+    assert level - 1e-8 < u.level < level < LP.T - LP.dT - dT
+    assert u.T_out == u.level and u.T_out + dT <= LP.T - LP.dT
+    assert (MP.T_in, MP.T_out) == (pytest.approx(level, abs=1e-8),
+                                   pytest.approx(B.outs[0].T, abs=1e-9))
+    assert u.duty + MP.duty == pytest.approx(t.Q_hot, rel=1e-12)
+
 # %% Area, units, capital and total annualized cost
 
 def test_bath_balanced_pair(quickstart):
@@ -1109,6 +1222,18 @@ def test_agents_by_ID():
         t.summary(cooling_agents=['steam'])
     with pytest.raises(TypeError, match='heating_agents must be a sequence'):
         t.utility_targets('low_pressure_steam')
+    # an agent of the other kind (steam as a coolant would be priced as a
+    # negative cost), or a fuel as a coolant
+    LP, CW, gas = agent('low_pressure_steam'), agent('cooling_water'), agent('natural_gas')
+    with pytest.raises(ValueError, match="'low_pressure_steam' is not a cooling agent; "
+                                         'pass it in heating_agents'):
+        t.utility_targets(None, [LP, CW])
+    with pytest.raises(ValueError, match="'cooling_water' is not a heating agent"):
+        t.summary(heating_agents=[CW])
+    with pytest.raises(ValueError, match="'natural_gas' is not a cooling agent"):
+        t.utility_targets(None, [gas])
+    assert [u.ID for u in t.utility_targets([LP, gas], [CW, 'chilled_water'])] == [
+        'low_pressure_steam', 'natural_gas', 'cooling_water', 'chilled_water']
 
 def test_optimum_T_min_app_closed_form():
     from biosteam.units.heat_exchange import (compute_double_pipe_purchase_cost,

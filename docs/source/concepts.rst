@@ -380,8 +380,11 @@ On the shifted scale that limit is the agent's **level**: the limit itself for
 a heating agent and the limit less ``T_min_app`` for a cooling agent, which is
 BioSTEAM's rule exactly. With approach contributions the streams have
 different shifts, and an agent's level is the highest single shifted
-temperature (the lowest, for cooling) at which it serves no stream beyond that
-stream's own real limit; streams with slack are then served conservatively.
+temperature (the lowest, for cooling), up to the highest of the streams' own
+limits, at which it serves no stream beyond that stream's own real limit. A
+level serves only what lies below it (above it, for cooling), so a stream
+lying wholly beyond its limit bounds the level only at the stream's own end;
+streams with slack are then served conservatively.
 
 **List order and fuel.** Non-fuel agents are placed in the order of
 BioSTEAM's lists, BioSTEAM's own "first feasible agent" rule: for the default
@@ -401,9 +404,12 @@ curve** (the cascade net of the utilities), which is the pinch or a *utility
 pinch* where a lower agent is used to its limit.
 A target's ``T_in`` and ``T_out`` are the real temperatures of the streams it
 serves in that stretch: the coldest and the hottest for heating, the hottest
-and the coldest for cooling. Without approach contributions they are the
-stretch's ends where streams reach them, and in every case ``T_out`` is within
-the agent's limit. BioSTEAM prices a latent agent and fuel from them.
+and the coldest for cooling. A point load at an end of the stretch counts
+where the stretch holds it: a boiler at the pinch, whose latent heat the cut
+puts above it, is served at its boiling temperature. Without approach contributions
+``T_in`` and ``T_out`` are the stretch's ends where streams reach them, and in
+every case ``T_out`` is within the agent's limit. BioSTEAM prices a latent
+agent and fuel from them.
 
 A **sensible** agent, such as cooling water, warms (or cools) along a line as
 it takes its duty, and BioSTEAM checks that line only at the process inlet: a

@@ -43,6 +43,11 @@ __all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
 #: just below a utility level strictly between two grid temperatures.
 _ARRIVING, _LEAVING, _ABOVE, _BELOW = 0, 1, 2, 3
 
+#: How far short of a grid temperature a utility level is placed to serve
+#: none of that temperature's point loads [K]: beyond `_T_EQ`, so that the
+#: level is not snapped back onto it.
+_T_SHORT = 2 * _T_EQ
+
 #: Square feet per square meter, biosteam's own factor in `HX._design`.
 _FT2_PER_M2 = 10.763
 
@@ -514,9 +519,11 @@ def _check_T_min_app(T_min_app):
 def _agents(agents, heating):
     """`agents` as a list (None stays None: biosteam's lists, read when
     used), each ID resolved among ``bst.HeatUtility.heating_agents`` (or
-    ``cooling_agents``) as they are now; a ValueError for an unknown ID."""
+    ``cooling_agents``) as they are now; a ValueError for an unknown ID or
+    an agent of the other kind (a heating agent is ``isheating_agent`` or
+    ``isfuel``, a cooling one ``iscooling_agent`` and not ``isfuel``)."""
     if agents is None: return None
-    kind = 'heating' if heating else 'cooling'
+    kind, other = ('heating', 'cooling') if heating else ('cooling', 'heating')
     if isinstance(agents, (str, bst.UtilityAgent)):
         raise TypeError(f'{kind}_agents must be a sequence of agents (or '
                         f'their IDs), not {type(agents).__name__!r}')
@@ -531,6 +538,11 @@ def _agents(agents, heating):
                     f"agents ({', '.join(a.ID for a in known)}); pass the "
                     'UtilityAgent itself for another one')
             agent = match[0]
+        if heating: right = agent.isfuel or agent.isheating_agent
+        else: right = agent.iscooling_agent and not agent.isfuel
+        if not right:
+            raise ValueError(f'{agent.ID!r} is not a {kind} agent; pass it in '
+                             f'{other}_agents')
         resolved.append(agent)
     return resolved
 
@@ -663,10 +675,15 @@ class PinchTargets:
     dT`` and a cooling agent real temperatures above ``R = agent.T +
     agent.dT + dT`` (``dT = bst.HeatUtility.dT``, read at call time). On the
     shifted scale a stream with shift s may take an agent's heat only up to
-    ``R - s``; the agent's level is the highest single level that serves no
-    stream above its own limit (lowest for cooling): ``R`` for heating and
-    ``R - T_min_app`` for cooling without approach contributions, which is
-    biosteam's rule; with contributions it can be conservative for streams
+    ``R - s`` (down to it, for cooling); the agent's level is the highest
+    single level, up to the highest of these limits, that serves no stream
+    above its own limit (the lowest, down to the lowest limit, for
+    cooling): ``R`` for heating and ``R - T_min_app`` for cooling without
+    approach contributions, which is biosteam's rule. A level serves only
+    what lies below it (above it, for cooling), so a stream reaching beyond
+    its limit bounds the level at that limit, but one lying wholly beyond
+    it only at its own end (just short of it, if it has a point load
+    there). With contributions the level can be conservative for streams
     with slack. Non-fuel agents are placed in list order (biosteam's first
     feasible agent: for the default lists the lowest steam and the warmest
     coolant first), each as much as the curve above its level (below it, for
@@ -678,12 +695,16 @@ class PinchTargets:
 
     Each agent is priced as one biosteam heat utility over the stretch it
     serves, from its level (or the end of the grid, if that is nearer) to
-    the next zero of the balanced curve (the pinch, or a utility pinch). Its `T_in` and `T_out` are the real
-    temperatures of the streams it serves there (the cold streams with heat
-    above the pinch, or the hot streams with heat below it): the coldest and
-    the hottest for heating, the hottest and the coldest for cooling. They
-    are the stretch's ends without approach contributions (where a stream
-    reaches them), and `T_out` is within the agent's limit. biosteam prices
+    the next zero of the balanced curve (the pinch, or a utility pinch). Its
+    `T_in` and `T_out` are the real temperatures of the streams with heat
+    in that stretch (the cold streams for heating, the hot ones for
+    cooling): the coldest and the hottest for heating, the hottest and the
+    coldest for cooling. A point load at an end of the stretch counts where
+    the stretch holds it, as the balanced curve does: a boiler at the pinch
+    with the cut 'above', or a condenser at it with the cut 'below', is
+    served at its saturation temperature. They are the stretch's ends
+    without approach contributions (where a stream reaches them), and
+    `T_out` is within the agent's limit. biosteam prices
     a latent agent and fuel from them (the flue leaves at least ``dT``
     above `T_in`), but checks a sensible agent's outlet only against
     `T_in`, while its line must keep ``dT`` from the process over the whole
@@ -1096,32 +1117,37 @@ class PinchTargets:
     def _levels(self, agents, heating):
         """
         ``[(agent, level)]``: each agent's shifted level, the highest
-        (lowest for cooling) that serves no stream beyond its own real
-        limit (see Notes of the class).
+        (lowest for cooling), up to the highest of the served streams'
+        shifted limits (down to the lowest), that serves no stream beyond
+        its own real limit (see Notes of the class).
         """
         dT = bst.HeatUtility.dT
         grid = self.grid
-        Ts, s = grid['Ts'], self.shift
-        above, below = self._side_heat()
-        if heating:
-            streams = [j for j in np.flatnonzero(~self.is_hot) if above[j] > self._tol]
-            ends = Ts[grid['k_hi']]
-        else:
-            streams = [j for j in np.flatnonzero(self.is_hot) if below[j] > self._tol]
-            ends = Ts[grid['k_lo']]
+        Ts = grid['Ts']
+        j = self._served(heating)
+        s = self.shift[j]
+        top, bottom = Ts[grid['k_hi'][j]], Ts[grid['k_lo'][j]]
+        # the point load at the end a level beyond the stream would reach
+        # first: its bottom (heating) or its top (cooling)
+        k = grid['k_lo' if heating else 'k_hi'][j]
+        point = np.abs(self.table.point_H[j, k]) > self._tol
         levels = []
         for agent in agents:
+            # a stream reaching beyond its limit caps the level at the limit,
+            # or, lying wholly beyond it, at its own end (just short of it if
+            # a point load is there): a level serves only what lies below it
+            # (above it, for cooling)
             if heating:
                 R = agent.T - agent.dT - dT
-                reached = [R - s[j] for j in streams if ends[j] > R - s[j]]
-                if reached: L = min(reached)
-                elif streams: L = R - min(s[j] for j in streams)
+                limit = R - s
+                caps = np.maximum(limit, bottom - _T_SHORT * point)[top > limit]
+                if j.size: L = caps.min(initial=limit.max())
                 else: L = R
             else:
                 R = agent.T + agent.dT + dT
-                reached = [R - s[j] for j in streams if ends[j] < R - s[j]]
-                if reached: L = max(reached)
-                elif streams: L = R - max(s[j] for j in streams)
+                limit = R - s
+                caps = np.minimum(limit, top + _T_SHORT * point)[bottom < limit]
+                if j.size: L = caps.max(initial=limit.min())
                 else: L = R - self.T_min_app
             levels.append((agent, float(L)))
         return levels
@@ -1154,34 +1180,63 @@ class PinchTargets:
         return allocated, remaining
 
     def _served(self, heating):
-        """``(top, bottom, shift)`` of the streams a heating agent can serve
-        (the cold streams with heat above the pinch) or a cooling one (the
-        hot streams with heat below it): shifted temperatures [K] and shifts
-        [K]."""
-        grid = self.grid
+        """Indices of the streams a heating agent can serve (the cold streams
+        with heat above the pinch) or a cooling one (the hot streams with
+        heat below it)."""
         above, below = self._side_heat()
-        if heating: j = np.flatnonzero(~self.is_hot & (above > self._tol))
-        else: j = np.flatnonzero(self.is_hot & (below > self._tol))
-        Ts = grid['Ts']
-        return Ts[grid['k_hi'][j]], Ts[grid['k_lo'][j]], self.shift[j]
+        if heating: return np.flatnonzero(~self.is_hot & (above > self._tol))
+        return np.flatnonzero(self.is_hot & (below > self._tol))
 
-    def _ends(self, served, lo, hi, heating):
+    def _position_H(self, positions):
+        """Each stream's enthalpy [kJ/hr] at the `positions` (`_positions`),
+        between a virtual top and a virtual bottom one: (N, P + 2), position
+        p in column p + 1. The heat of a stream between two columns is the
+        heat it has between those positions, point loads included where the
+        arriving and the leaving position of their grid temperature both lie
+        between them."""
+        T, _, kind, k = positions
+        Ts, Hl, Hr = self.grid['Ts'], self.grid['Hl'], self.grid['Hr']
+        H = np.where(kind == _ARRIVING, Hr[:, k], Hl[:, k])
+        inner = np.flatnonzero((kind == _ABOVE) | (kind == _BELOW))
+        if inner.size:
+            ki = k[inner]
+            f = (T[inner] - Ts[ki + 1]) / (Ts[ki] - Ts[ki + 1])
+            H[:, inner] = Hr[:, ki + 1] + (Hl[:, ki] - Hr[:, ki + 1]) * f
+        return np.column_stack([Hr[:, 0], H, Hl[:, -1]])
+
+    def _pinch_position(self, positions):
+        """Index of the process pinch among the `positions`: the heat
+        arriving at the pinch temperature if the cut is 'below', the heat
+        leaving it if 'above'."""
+        T, _, kind, _ = positions
+        return int(np.flatnonzero(
+            (T == self.grid['Ts'][self._k_pinch])
+            & (kind == (_ARRIVING if self.cut == 'below' else _LEAVING)))[0])
+
+    def _ends(self, H, a, b, lo, hi, heating):
         """
-        ``((T_in, T_out), overlap)`` of a utility serving shifted [lo, hi]:
-        the real temperatures [K] of the `served` streams overlapping the
-        stretch (`overlap`, a mask), the coldest and the hottest (heating;
-        the hottest and the coldest for cooling); the stretch's ends plus 0
-        (heating) or `T_min_app` (cooling) if none overlaps it.
+        ``((T_in, T_out), (top, bottom, shift))`` of a utility serving the
+        heat between columns `a` and `b` of `H` (`_position_H`), shifted [lo,
+        hi]: the real temperatures [K] of the streams it serves there (the
+        cold ones with heat there above the tolerance, or the hot ones for
+        cooling; any heat if no stream has more), the coldest and the hottest
+        (heating; the hottest and the coldest for cooling), and their shifted
+        ends [K] and shifts [K]. A stream served there only at a point load
+        at an end of the stretch counts at that point load's temperature.
         """
-        top, bottom, s = served
-        overlap = (top > lo) & (bottom < hi)
-        if not overlap.any():
-            if heating: return (lo, hi), overlap
-            return (hi + self.T_min_app, lo + self.T_min_app), overlap
-        s = s[overlap]
-        cold = float(np.min(np.maximum(bottom[overlap], lo) + s))
-        hot = float(np.max(np.minimum(top[overlap], hi) + s))
-        return ((cold, hot) if heating else (hot, cold)), overlap
+        heat = np.abs(H[:, b] - H[:, a])
+        heat[self.is_hot if heating else ~self.is_hot] = 0.
+        j = np.flatnonzero(heat > self._tol)
+        if not j.size: j = np.flatnonzero(heat > 0.)
+        if not j.size:
+            raise RuntimeError(f'no stream has heat in the stretch [{lo:.6g}, '
+                               f'{hi:.6g}] K (shifted) of a utility')
+        grid = self.grid
+        Ts, s = grid['Ts'], self.shift[j]
+        top, bottom = Ts[grid['k_hi'][j]], Ts[grid['k_lo'][j]]
+        cold = float(np.min(np.maximum(bottom, lo) + s))
+        hot = float(np.max(np.minimum(top, hi) + s))
+        return ((cold, hot) if heating else (hot, cold)), (top, bottom, s)
 
     def _line_limit(self, agent, heating, q, T, B, served):
         """
@@ -1215,12 +1270,14 @@ class PinchTargets:
         Parameters
         ----------
         heating_agents : Sequence[UtilityAgent or str], optional
-            Heating agents in order of preference, or the IDs of agents of
-            ``bst.HeatUtility.heating_agents``; fuel agents (``isfuel``)
-            take the remainder, the first one only. Defaults to
-            ``bst.HeatUtility.heating_agents`` (read at call time).
+            Heating agents (``isheating_agent``) in order of preference, or
+            the IDs of agents of ``bst.HeatUtility.heating_agents``; fuel
+            agents (``isfuel``) take the remainder, the first one only.
+            Defaults to ``bst.HeatUtility.heating_agents`` (read at call
+            time).
         cooling_agents : Sequence[UtilityAgent or str], optional
-            Cooling agents in order of preference, or the IDs of agents of
+            Cooling agents (``iscooling_agent``, not fuels) in order of
+            preference, or the IDs of agents of
             ``bst.HeatUtility.cooling_agents``. Defaults to
             ``bst.HeatUtility.cooling_agents``.
 
@@ -1230,6 +1287,12 @@ class PinchTargets:
             The heating utilities in allocation order (fuel, or an unserved
             remainder, last), then the cooling ones. Agents with no duty are
             left out.
+
+        Raises
+        ------
+        ValueError
+            If an ID names no agent of biosteam's list, or an agent is not
+            of the kind of its list.
 
         Warns
         -----
@@ -1266,37 +1329,42 @@ class PinchTargets:
                      [(l, q) for l, q, _ in cool])
         zero = B <= tol
         T = positions[0]
+        # each stream's enthalpy at the positions: its heat in a stretch, the
+        # point loads of a grid temperature at its end included only where
+        # the stretch holds them (as the balanced curve does)
+        H = self._position_H(positions)
+        pinch = self._pinch_position(positions)
         dT = bst.HeatUtility.dT
         utilities = []
         with _isolated_pricing([a for *_, a in heat + cool if a is not None]):
-            served = self._served(True)
             for level, q, agent in heat:
+                # positions g to end - 1 (columns g to end of H)
                 g = _gap(positions, level)
                 z = np.flatnonzero(zero[g:])
-                end = g + z[0] + 1 if z.size else T.size
-                lo = float(T[end - 1]) if z.size else self.pinch_T
+                end = g + int(z[0]) + 1 if z.size else pinch + 1
+                lo = float(T[end - 1])
                 hi = min(level, float(Ts[0]))
-                (T_in, T_out), overlap = self._ends(served, lo, hi, True)
+                (T_in, T_out), served = self._ends(H, g, end, lo, hi, True)
                 T_priced = T_in
                 if _sensible(agent):
                     limit = self._line_limit(agent, True, q, T[g:end], B[g:end],
-                                             [x[overlap] for x in served])
+                                             served)
                     if limit is not None: T_priced = max(T_in, limit - dT)
                 utilities.append(self._utility(agent, True, level, q, T_in,
                                                T_out, T_priced))
-            served = self._served(False)
             for level, q, agent in cool:
+                # positions start to g - 1 (columns start + 1 to g + 1 of H)
                 g = _gap(positions, level)
                 z = np.flatnonzero(zero[:g])
-                start = int(z[-1]) if z.size else 0
-                hi = float(T[start]) if z.size else self.pinch_T
+                start = int(z[-1]) if z.size else pinch
+                hi = float(T[start])
                 lo = max(level, float(Ts[-1]))
-                (T_in, T_out), overlap = self._ends(served, lo, hi, False)
+                (T_in, T_out), served = self._ends(H, start + 1, g + 1, lo, hi,
+                                                   False)
                 T_priced = T_in
                 if _sensible(agent):
                     limit = self._line_limit(agent, False, q, T[start:g],
-                                             B[start:g],
-                                             [x[overlap] for x in served])
+                                             B[start:g], served)
                     if limit is not None: T_priced = min(T_in, limit + dT)
                 utilities.append(self._utility(agent, False, level, q, T_in,
                                                T_out, T_priced))
@@ -1554,24 +1622,14 @@ class PinchTargets:
         """
         if utilities is None: utilities = self.utility_targets()
         positions, B = self._balanced_positions(utilities)
-        T, _, kind, k = positions
-        P = T.size
+        P = positions[0].size
         tol = self._tol
-        Ts, Hl, Hr = self.grid['Ts'], self.grid['Hl'], self.grid['Hr']
         # each stream's cumulative enthalpy at every position, between the
         # virtual top and bottom ones
-        H = np.where(kind == _ARRIVING, Hr[:, k], Hl[:, k])
-        inner = np.flatnonzero((kind == _ABOVE) | (kind == _BELOW))
-        if inner.size:
-            ki = k[inner]
-            f = (T[inner] - Ts[ki + 1]) / (Ts[ki] - Ts[ki + 1])
-            H[:, inner] = Hr[:, ki + 1] + (Hl[:, ki] - Hr[:, ki + 1]) * f
-        H = np.column_stack([Hr[:, 0], H, Hl[:, -1]])
+        H = self._position_H(positions)
         cuts = [-1, *np.flatnonzero(B <= tol).tolist(), P]
         gaps = [_gap(positions, u.level) for u in utilities if u.duty > tol]
-        pinch = int(np.flatnonzero(
-            (T == Ts[self._k_pinch])
-            & (kind == (_ARRIVING if self.cut == 'below' else _LEAVING)))[0])
+        pinch = self._pinch_position(positions)
         # the members of each region (streams j, utilities -1 - i), grouped:
         # consecutive regions of one gap between two zeros (where the curve
         # stays zero, each piece balanced on its own) on one side of the
