@@ -26,6 +26,8 @@ from contextlib import contextmanager
 from numbers import Integral, Real
 from warnings import catch_warnings, filterwarnings, warn
 import numpy as np
+from matplotlib.patches import Patch
+from matplotlib.path import Path
 import biosteam as bst
 from ._curves import _T_EQ, _copy
 from ._planner import _approach_contributions, _given_contributions
@@ -2848,58 +2850,335 @@ def _sci_ticks(axis):
     formatter = axis.get_major_formatter()
     if type(formatter) is ScalarFormatter: formatter.set_powerlimits((-3, 4))
 
-class _Inside:
-    """
-    A `textcoords` for the annotation `label` of `ax`: `dx`, `dy` points off
-    its anchor, above left of it (right- and bottom-aligned) if `dy` > 0,
-    else below right of it (left- and top-aligned).
+def _reach(curves, a, b, top):
+    """The top of the polylines `curves` (each an (n, 2) array of display
+    points) over the stretch `a` <= x <= `b` if `top`, else their bottom;
+    None if none of them runs over it."""
+    ys = []
+    for xy in curves:
+        if len(xy) < 2: continue
+        (x0, y0), (x1, y1) = xy[:-1].T, xy[1:].T
+        left, right = np.minimum(x0, x1), np.maximum(x0, x1)
+        keep = (right >= a) & (left <= b)
+        if not keep.any(): continue
+        x0, y0, x1, y1, left, right = (v[keep] for v in (x0, y0, x1, y1, left, right))
+        dx = x1 - x0
+        steep = dx == 0. # vertical: both ends
+        slope = (y1 - y0) / np.where(steep, 1., dx)
+        ys += [np.where(steep, y0, y0 + slope * (np.clip(a, left, right) - x0)),
+               np.where(steep, y1, y0 + slope * (np.clip(b, left, right) - x0))]
+    if not ys: return None
+    ys = np.concatenate(ys)
+    return ys.max() if top else ys.min()
 
-    Where that runs past the left (right) edge of the axes, decided when
-    drawn (at the final layout of the figure, which places the axes), the
-    label is moved right (left) to keep 2 points inside them, and raised
-    (lowered) to stay `abs(dy)` points above (below) the `curves` ((H, T)
-    in data) under (over) its new span. It is then moved on, up (down),
-    past each of the labels `over` whose box it would overlap or come
-    within 2 points of. A class rather than a closure, so that the figure
-    can still be pickled.
+class _Labels:
     """
-    def __init__(self, ax, label, dx, dy, curves=(), over=()):
-        self.ax, self.label, self.dx, self.dy = ax, label, dx, dy
-        self.curves, self.over = list(curves), list(over)
+    Where the annotations of `ax` added to it go, decided when drawn: at
+    the final layout of the figure, which places the axes. All of them are
+    placed in one pass (`_place`), kept for the renderer, the box and the
+    view limits of the axes it was made for, so that drawing or measuring
+    a label (as constrained layout, a legend's 'best' location and a tight
+    bounding box each do) places none of them again. Each label's
+    `textcoords` is an `_At` of it: a class rather than a closure, as is
+    the `_Leader` of one, so that the figure can still be pickled.
+
+    The labels keep off the polylines `curves` ((x, y) in data, their
+    points that are not finite left out).
+    """
+    def __init__(self, ax, curves=()):
+        self.ax, self.labels, self.options = ax, [], []
+        self.curves = []
+        for x, y in curves:
+            xy = np.column_stack((x, y)).astype(float).reshape(-1, 2)
+            self.curves.append(xy[np.isfinite(xy).all(axis=1)])
+        self._key = self._spots = None
+
+    def __getstate__(self):
+        return {**self.__dict__, '_key': None, '_spots': None}
+
+    def add(self, label, **options):
+        """Place the annotation `label` (after those added before it)."""
+        label.set_anncoords(_At(self, len(self.labels)))
+        self.labels.append(label)
+        self.options.append(options)
+
+    def spots(self, renderer):
+        """The display (x, y) of the text of each label, and the ends of
+        its leader (or None)."""
+        ax = self.ax
+        key = (id(renderer), tuple(ax.viewLim.bounds), tuple(ax.bbox.bounds),
+               tuple([(label.get_text(), label.get_fontsize())
+                      for label in self.labels]))
+        if key != self._key:
+            self._spots, self._key = self._place(renderer), key
+        return self._spots
+
+    def _sizes(self, renderer):
+        """The display (width, height) of the text of each label (not
+        where it is, which is not placed yet)."""
+        from matplotlib.text import Text
+        boxes = [Text.get_window_extent(label, renderer) for label in self.labels]
+        return [(box.width, box.height) for box in boxes]
+
+    def _curves(self):
+        """The `curves` in display."""
+        return [self.ax.transData.transform(xy) for xy in self.curves]
+
+class _At:
+    """The `textcoords` of the label `index` of the `_Labels` `labels`."""
+    def __init__(self, labels, index):
+        self.labels, self.index = labels, index
 
     def __call__(self, renderer):
         from matplotlib.transforms import Affine2D
-        ax, label, dx, dy = self.ax, self.label, self.dx, self.dy
-        sign = 1. if dy > 0 else -1.
+        return Affine2D().translate(*self.labels.spots(renderer)[self.index][0])
+
+class _Leader(Patch):
+    """
+    A thin line from the anchor of the label `index` of the `_Labels`
+    `labels` to its text, drawn where the label sits away from its anchor
+    (its path is that of the last draw, empty without a line).
+    """
+    def __init__(self, labels, index, **kwargs):
+        from matplotlib.transforms import IdentityTransform
+        super().__init__(fill=False, transform=IdentityTransform(), **kwargs)
+        self.set_in_layout(False)
+        self.labels, self.index = labels, index
+        self._path = Path(np.zeros((0, 2)))
+
+    def get_path(self):
+        return self._path
+
+    def draw(self, renderer):
+        if not self.get_visible(): return
+        ends = self.labels.spots(renderer)[self.index][1]
+        self._path = Path(np.zeros((0, 2)) if ends is None else np.array(ends))
+        if ends is not None: super().draw(renderer)
+
+class _Stacked(_Labels):
+    """
+    Labels of the balanced composite curves (the `curves`), added by
+    `add(label, offset)` in turn: each heating agent's by ascending level,
+    then the fuel's, then each cooling agent's by descending level.
+
+    A label sits `dx`, `dy` points (the `offset`) off its anchor: above
+    left of it (right- and bottom-aligned) if `dy` > 0, a heating one, else
+    below right of it (left- and top-aligned), a cooling one. One that
+    would run past the left or right edge of the axes is moved to keep 2
+    points inside them, and each is kept `abs(dy)` points above (below)
+    the curves under its span. The labels of a side are then stacked in a
+    column: each at least as high (low) as the one before it, which keeps
+    the order of the levels, and moved on, up (down), past each label
+    placed before it whose box it would overlap or come within 2 points
+    of. Where that would run past the top (bottom) of the axes, they are
+    set in rows instead, from the other end: each where it sits, moved
+    sideways, left (right), past the labels of the levels beyond its own
+    (whose rows are beyond its own, so that its leader crosses none of
+    them), if that keeps the order and all of them inside the axes; else
+    in the column, moved sideways past the label they would run into at
+    the edge. One left more than 1.5 times its height from its anchor gets
+    a leader to it.
+    """
+    def add(self, label, offset, leader=None):
+        """Place the annotation `label` `offset` points off its anchor,
+        with a leader (a `_Leader` added to the axes, with the gid
+        `leader`) if it is away from it."""
+        super().add(label, offset=offset)
+        if leader is not None:
+            self.ax.add_patch(_Leader(self, len(self.labels) - 1,
+                                      color=label.get_color(), lw=0.6,
+                                      gid=leader))
+
+    def make_room(self, x=0.):
+        """Extend the data limits of the axes in y (at `x`), so that the
+        labels fit in their columns at the layout of the figure now
+        (where a renderer is at hand)."""
+        ax = self.ax
+        renderer = getattr(ax.figure.canvas, 'get_renderer', lambda: None)()
+        if renderer is None or not np.isfinite(ax.dataLim.intervaly).all(): return
+        for _ in range(4): # the scale changes with the limits
+            y0, y1 = ax.get_ylim() # autoscaled first
+            below, above = self._place(renderer, bound=False)
+            if below <= 0. and above <= 0.: break
+            scale = (y1 - y0) / ax.bbox.height # data per pixel
+            lo, hi = ax.dataLim.intervaly
+            ax.update_datalim([(x, lo - 1.05 * below * scale),
+                               (x, hi + 1.05 * above * scale)], updatex=False)
+            ax.autoscale_view(scalex=False)
+
+    def _place(self, renderer, bound=True):
+        """The `spots`, or how far (in pixels) the columns of labels run
+        past the bottom and the top of the axes if not `bound` by them."""
+        ax = self.ax
         pt = ax.figure.dpi / 72. # pixels per point
-        prop = label.get_fontproperties()
-        size = lambda text: renderer.get_text_width_height_descent(
-            text, prop, ismath=False)
-        w = size(label.get_text())[0]
-        h = max(size(label.get_text())[1], size('lp')[1])
-        x, y = ax.transData.transform(label.xy) + (dx * pt, dy * pt)
-        # the label's right (left) end and its bottom (top)
-        span = lambda: (x - w, x) if sign > 0 else (x, x + w)
-        a, b = span()
-        if sign > 0: shift = ax.bbox.x0 + 2. * pt - a
-        else: shift = ax.bbox.x1 - 2. * pt - b
-        if shift * sign > 0.:
-            x += shift
-            a, b = span()
-            for H, T in self.curves:
-                X, Y = ax.transData.transform(np.column_stack((H, T))).T
-                if not X.size or b < X[0] or X[-1] < a: continue
-                Y = np.concatenate((Y[(X >= a) & (X <= b)],
-                                    np.interp([max(a, X[0]), min(b, X[-1])], X, Y)))
-                if sign > 0: y = max(y, Y.max() + dy * pt)
-                else: y = min(y, Y.min() + dy * pt)
-        for box in sorted((other.get_window_extent(renderer) for other in self.over),
-                          key=lambda box: sign * box.y0):
-            near, far = (box.y0, box.y1) if sign > 0 else (box.y1, box.y0)
-            if (box.x0 < b and a < box.x1 and sign * (near - y) < h
-                    and sign * (y - far) < 2. * pt):
-                y = far + sign * 2. * pt
-        return Affine2D().translate(x, y)
+        gap = 2. * pt
+        frame = ax.bbox
+        lo, hi = frame.x0 + gap, frame.x1 - gap
+        bottom, top = frame.y0 + gap, frame.y1 - gap
+        if not bound: bottom, top = -math.inf, math.inf
+        curves = self._curves()
+        sizes = self._sizes(renderer)
+        anchors = [ax.transData.transform(label.xy) for label in self.labels]
+        offsets = [options['offset'] for options in self.options]
+        def clear(i, u, v):
+            """`v` kept abs(dy) points off the curves under the span of
+            label `i` from `u`."""
+            (w, h), dy = sizes[i], offsets[i][1]
+            reach = _reach(curves, u, u + w, dy > 0)
+            if reach is None: return v
+            if dy > 0: return max(v, reach + dy * pt)
+            return min(v, reach + dy * pt - h)
+        def leader(i, u, v):
+            """The ends of a leader from the anchor of label `i` to the
+            nearest point of its box from `u`, `v`, if that is more than
+            1.5 times its height away, else None."""
+            (w, h), (x, y) = sizes[i], anchors[i]
+            near = (min(max(x, u), u + w), min(max(y, v), v + h))
+            span = math.hypot(near[0] - x, near[1] - y)
+            if span <= 1.5 * h: return None
+            trim = 1.5 * pt / span
+            return [(x + trim * (near[0] - x), y + trim * (near[1] - y)),
+                    (near[0] - trim * (near[0] - x), near[1] - trim * (near[1] - y))]
+        def stack(order, up, column, placed):
+            """The lower left corners of the labels `order` of a side (up
+            for heating), placed past those `placed` and each other (and,
+            in rows, the leaders before them): in a column, else in rows;
+            and whether that kept them inside the axes and in order,
+            without moving any the other way."""
+            placed = list(placed)
+            corners = {}
+            last = None
+            clean = True
+            for i in order:
+                (w, h), (dx, dy) = sizes[i], offsets[i]
+                x, y = anchors[i] + (dx * pt, dy * pt)
+                u, v = (x - w, y) if up else (x, y - h)
+                u = max(min(u, hi - w), lo) # inside the axes, left to right
+                v = clear(i, u, v)
+                if column and last is not None: # in order
+                    v = max(v, last[0]) if up else min(v, last[1] - h)
+                for _ in range(2 * len(placed) + 1):
+                    hits = [box for box in placed
+                            if box[0] < u + w + gap and u < box[2] + gap
+                            and box[1] < v + h + gap and v < box[3] + gap]
+                    if not hits: break
+                    # past the nearest one, on (up or down) or sideways
+                    # (left or right)
+                    if up:
+                        on = min(hits, key=lambda box: box[1])[3] + gap
+                        side = max(hits, key=lambda box: box[0])[0] - gap - w
+                        moves = [('v', on, on + h <= top), ('u', side, side >= lo)]
+                    else:
+                        on = max(hits, key=lambda box: box[3])[1] - gap - h
+                        side = min(hits, key=lambda box: box[2])[2] + gap
+                        moves = [('v', on, on >= bottom), ('u', side, side + w <= hi)]
+                    if not column: moves.reverse()
+                    for n, (move, value, fits) in enumerate(moves):
+                        if fits: break
+                    else:
+                        clean = False
+                        break
+                    if n: clean = False
+                    if move == 'v': v = value
+                    else: u, v = value, clear(i, value, v)
+                if not bottom <= v <= top - h:
+                    clean = False
+                    v = max(min(v, top - h), bottom) # inside the axes
+                if not column and last is not None and (
+                        v > last[0] + 0.5 * h if up else v < last[0] - 0.5 * h):
+                    clean = False # out of order
+                corners[i] = (u, v)
+                placed.append((u, v, u + w, v + h))
+                ends = None if column else leader(i, u, v)
+                if ends is not None:
+                    (x0, y0), (x1, y1) = ends
+                    placed.append((min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+                last = (v, v + h)
+            return corners, clean
+        corners = {}
+        placed = []
+        for up in (True, False):
+            order = [i for i, (dx, dy) in enumerate(offsets) if (dy > 0) == up]
+            if not order: continue
+            side, clean = stack(order, up, True, placed)
+            if not clean and bound:
+                rows, clean = stack(order[::-1], up, False, placed)
+                if clean: side = rows
+            corners.update(side)
+            placed += [(u, v, u + sizes[i][0], v + sizes[i][1])
+                       for i, (u, v) in side.items()]
+        if not bound:
+            return (max([frame.y0 + gap - v for u, v in corners.values()], default=0.),
+                    max([v + sizes[i][1] - frame.y1 + gap
+                         for i, (u, v) in corners.items()], default=0.))
+        spots = []
+        for i, (w, h) in enumerate(sizes):
+            u, v = corners[i]
+            spots.append(((u + w, v) if offsets[i][1] > 0 else (u, v + h),
+                          leader(i, u, v)))
+        return spots
+
+class _Beside(_Labels):
+    """
+    Labels of the steps of the grand composite curve, added by
+    `add(label, heating)` in turn, each anchored at the end of its step.
+
+    A label sits beside the end, 3 points right or left of it and 2 points
+    above or below its level: on the side with more room in the axes,
+    first, toward the pinch (below a heating level, above a cooling one)
+    right of the end and beyond the level left of it, then the other way;
+    then likewise on the other side. It takes the first of these whose box
+    is inside the axes and crosses none of the `curves` (the grand
+    composite curve, the first, and the steps) nor a label placed before
+    it; else the nearest such box on along its level, away from the end
+    (by steps of its height); else the first of the four inside the axes
+    that keeps off the grand composite curve, else the first inside the
+    axes, else the first.
+    """
+    def add(self, label, heating):
+        """Place the annotation `label` (left- and bottom-aligned) of a
+        `heating` step or not."""
+        super().add(label, heating=heating)
+
+    def _place(self, renderer):
+        from matplotlib.transforms import Bbox
+        ax = self.ax
+        pt = ax.figure.dpi / 72.
+        frame = ax.bbox
+        gcc, *steps = [Path(xy.reshape(-1, 2)) for xy in self._curves()]
+        placed = []
+        spots = []
+        for label, options, (w, h) in zip(self.labels, self.options,
+                                          self._sizes(renderer)):
+            x, y = ax.transData.transform(label.xy)
+            toward = -1. if options['heating'] else 1. # the pinch
+            right = frame.x1 - x >= x - frame.x0
+            sides = [(side, vertical) for side in ((1., -1.) if right else (-1., 1.))
+                     for vertical in ((toward, -toward) if side > 0 else (-toward, toward))]
+            def score(side, vertical, slide=0.):
+                """Whether the box `slide` pixels on from its place beside
+                the end is outside the axes, on the curve, and on the
+                steps or a label placed before it; and the box."""
+                u = x + 3. * pt + slide if side > 0 else x - 3. * pt - w - slide
+                v = y + 2. * pt if vertical > 0 else y - 2. * pt - h
+                box = Bbox([[u, v], [u + w, v + h]])
+                inside = (frame.x0 <= u and u + w <= frame.x1
+                          and frame.y0 <= v and v + h <= frame.y1)
+                return ((not inside, gcc.intersects_bbox(box, filled=False),
+                         any(p.intersects_bbox(box, filled=False) for p in steps)
+                         or any(box.overlaps(other) for other in placed)), box)
+            candidates = [score(*side) for side in sides]
+            if all(any(flags) for flags, box in candidates):
+                # none clear beside the end: the nearest clear one on along
+                # the level, away from the end
+                slides = [score(*side, slide=k * h) for k in range(1, 41)
+                          for side in sides]
+                clear = [item for item in slides if not any(item[0])]
+                candidates = clear[:1] + candidates
+            box = min(candidates, key=lambda item: item[0])[1]
+            placed.append(box)
+            spots.append(((box.x0, box.y0), None))
+        return spots
 
 def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                           file=None, dpi=300):
@@ -2938,26 +3217,37 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     Temperatures are shown in degC. Artists carry stable gids: 'Hot
     composite' and 'Cold composite' (or 'Hot balanced composite' and 'Cold
     balanced composite'), 'Heat recovered', 'Hot utility', 'Cold utility',
-    'Pinch', 'Fuel' and 'Utility:<agent ID>'. The pinch is marked where the
-    shifted composites touch: not for a threshold problem whose composites
-    end apart, nor without streams on one side (whose empty composite stays
-    out of the legend). Fuel, at infinite temperature on the balanced
-    curves, is labeled rather than drawn, above the hot end of the cold
-    balanced composite (at the top of both), whose top its heat closes,
-    and so is an unserved remainder ('Utility:unserved', in the upper left
-    corner): the cold balanced composite starts at the unserved cooling,
-    and the hot one ends short of the cold one by the unserved heating. A
-    label of a latent agent sits by its flat, above left of the warm end of
-    a heating one and below right of the cold end of a cooling one, and a
-    sensible agent's off the middle of its line, above left for heating
-    and below right for cooling. When drawn (at the final layout of the
-    figure), a label that would run past the edge of the axes is moved just
-    inside them, and off the composite it labels; one that would run into
-    the label of a lower heating (higher cooling) agent is moved on past
-    it, up for heating and down for cooling, and the fuel's past those of
-    the heating agents. The legend goes where it covers the least of the
-    curves, the band and the labels (matplotlib's 'best' location: no fixed
-    corner is clear of the composites of every problem).
+    'Pinch', 'Fuel', 'Utility:<agent ID>' and 'Leader:<agent ID>'. The
+    pinch is marked where the shifted composites touch: not for a threshold
+    problem whose composites end apart, nor without streams on one side
+    (whose empty composite stays out of the legend). Fuel, at infinite
+    temperature on the balanced curves, is labeled rather than drawn,
+    above the hot end of the cold balanced composite (at the top of both),
+    whose top its heat closes, and so is an unserved remainder
+    ('Utility:unserved', in the upper left corner): the cold balanced
+    composite starts at the unserved cooling, and the hot one ends short of
+    the cold one by the unserved heating. A label of a latent agent sits by
+    its flat, above left of the warm end of a heating one and below right
+    of the cold end of a cooling one, and a sensible agent's off the middle
+    of its line, above left for heating and below right for cooling. When
+    drawn (at the final layout of the figure, all of them in one pass), a
+    label that would run past the left or right edge of the axes is moved
+    just inside them, and off the curves. The labels of each side keep the order of the levels: each one
+    that would run into the label of a lower heating (higher cooling) agent
+    is moved on past it, up for heating and down for cooling (the fuel's
+    past those of the heating agents), in a column for which the limits of
+    the y axis leave room (as the axes are laid out when drawn on). Where
+    the column would still run past the top (bottom) of the axes, the
+    labels go in rows instead, each beside its flat and moved sideways past
+    the labels of the levels beyond its own; or, if those would not keep
+    the order inside the axes, those that would run past the edge are moved
+    sideways past the label in their way. A label left more than 1.5 times
+    its height away from its anchor gets a thin leader from it
+    ('Leader:<agent ID>', an empty path otherwise), and each label a halo,
+    so that a leader passing behind it strikes none of its letters. The
+    legend goes where it covers the least of the curves, the band and the
+    labels (matplotlib's 'best' location: no fixed corner is clear of the
+    composites of every problem).
 
     Examples
     --------
@@ -2998,13 +3288,18 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         hot_T, hot_H, cold_T, cold_H = targets.balanced_composite_curves(utilities)
         finite = np.isfinite(hot_T)
         hot_T, hot_H = hot_T[finite], hot_H[finite]
+        # a halo, so that a leader passing behind a label strikes none of
+        # its letters
+        from matplotlib.patheffects import withStroke
+        label_kwargs = dict(text_kwargs, path_effects=[
+            withStroke(linewidth=2.5, foreground=ax.get_facecolor())])
         ax.plot(hot_H, hot_T - 273.15, color=hot_color, lw=2,
                 label=_legend('hot balanced composite', hot_H),
                 gid='Hot balanced composite')
         ax.plot(cold_H, cold_T - 273.15, color=cold_color, lw=2,
                 label=_legend('cold balanced composite', cold_H),
                 gid='Cold balanced composite')
-        labels = [] # (annotation, offset, curve) of each agent's but fuel's
+        labels = [] # (annotation, offset, ID) of each agent's but fuel's
         fuels = []
         unserved = []
         for u in utilities:
@@ -3042,20 +3337,20 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
             annotation = ax.annotate(
                 label, xy=(x, T_u - 273.15), xytext=(0, 0), ha=ha, va=va,
                 color=hot_color if u.heating else cold_color,
-                gid='Utility:' + u.ID, **text_kwargs)
-            labels.append((annotation, offset, (H, T - 273.15)))
-        # each moved inside the axes if it would run out of them (off the
-        # composite it labels), and on past the labels of the lower heating
-        # (higher cooling) agents it would run into: up for heating, down
-        # for cooling
-        placed = {True: [], False: []} # the heating and the cooling labels
-        for annotation, offset, curve in sorted(
-                labels, key=lambda item: item[0].xy[1] * np.sign(item[1][1])):
-            side = placed[offset[1] > 0]
-            annotation.set_anncoords(_Inside(ax, annotation, *offset,
-                                             curves=[curve], over=side))
-            side.append(annotation)
-        heating = placed[True]
+                gid='Utility:' + u.ID, **label_kwargs)
+            labels.append((annotation, offset, u.ID))
+        # each moved inside the axes if it would run out of them, off the
+        # curves, in the order of the levels, and on past the labels placed
+        # before it that it would run into (up for heating, down for
+        # cooling, or sideways at the edge of the axes); with a leader to
+        # its anchor if that leaves it away from it
+        placement = _Stacked(ax, [(hot_H, hot_T - 273.15), (cold_H, cold_T - 273.15)])
+        heating = sorted([item for item in labels if item[1][1] > 0],
+                         key=lambda item: item[0].xy[1])
+        cooling = sorted([item for item in labels if item[1][1] < 0],
+                         key=lambda item: -item[0].xy[1])
+        for annotation, offset, ID in heating:
+            placement.add(annotation, offset, leader='Leader:' + ID)
         # the fuel's heat closes the cold curve: above its hot end (at the
         # top of both curves), over the labels of the heating agents it
         # would overlap there, and of any fuel before it
@@ -3067,21 +3362,23 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
             T_top, span, x = targets.grid['Ts'][0], 0., 0.
         # headroom for two labels where a heating agent's is near the top
         stacked = bool(fuels) and any(T_top - 273.15 - a.xy[1] <= 0.15 * span
-                                      for a in heating)
+                                      for a, *_ in heating)
         for u in fuels:
             annotation = ax.annotate(
                 f'{u.ID} (furnace) {_format_duty(u.duty)} kJ/hr',
                 xy=(x, T_top - 273.15), xytext=(0, 0), ha='right', va='bottom',
-                color=hot_color, gid='Fuel', **text_kwargs)
-            annotation.set_anncoords(_Inside(ax, annotation, -2, 4,
-                                             over=heating))
-            heating.append(annotation)
+                color=hot_color, gid='Fuel', **label_kwargs)
+            placement.add(annotation, (-2, 4), leader='Leader:' + u.ID)
+        for annotation, offset, ID in cooling:
+            placement.add(annotation, offset, leader='Leader:' + ID)
         if unserved: # the curves end apart: say why
             ax.text(0.02, 0.97, '\n'.join(unserved), transform=ax.transAxes,
                     ha='left', va='top', color='0.45', gid='Utility:unserved',
                     **text_kwargs)
-        # headroom for the labels above the top of the curves
+        # headroom for the labels above the top of the curves, and more
+        # where they need it to stack in columns
         ax.margins(y=0.16 if stacked else 0.1)
+        placement.make_room(x)
         ax.set_ylabel('T [°C]')
     else:
         shifted = kind == 'shifted'
@@ -3160,11 +3457,16 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
     its level as long as its duty, joined by dotted verticals; cooling
     utilities likewise by descending level. Fuel is drawn dashed at the top
     of the grid and an unserved remainder in gray. Each label sits beside
-    the end of its segment, on the side with more room in the axes, off
-    the curve: right of the end, toward the pinch (below the level for
-    heating, above it for cooling), or left of the end, beyond the level
-    (above it for heating, below it for cooling), where the heat cascaded
-    is at least the end of the step. Artists carry stable gids: 'GCC',
+    the end of its segment, placed when drawn: on the side with more room
+    in the axes, right of the end toward the pinch (below the level for
+    heating, above it for cooling) or left of it beyond the level (above it
+    for heating, below it for cooling, where the heat cascaded is at least
+    the end of the step), if that keeps it inside the axes and off the
+    curve, the steps and the labels placed before it; else at the first
+    other side of the end and of the level that does (a pocket of the
+    curve, or a curve that leaves the end at a shallow angle, can run
+    toward the pinch); else on along its level, away from the end, where
+    it first does. Artists carry stable gids: 'GCC',
     'Pinch', 'Utility:<agent ID>' (the segments, 'Utility:unserved' for a
     remainder) and 'Label:<agent ID>'.
 
@@ -3218,6 +3520,7 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
         cooling = sorted((u for u in utilities if not u.heating),
                          key=lambda u: -u.level)
         ends = [] # (ID, x, y, heating, color) at the end of each step
+        segments = [] # (x, y) of the steps and the dotted lines between
         for steps, color, end in ((heating, hot_color, Ts[0]),
                                   (cooling, cold_color, Ts[-1])):
             x = 0.
@@ -3231,28 +3534,27 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
                 if previous is not None:
                     ax.plot([x, x], [previous, y], color=style['color'],
                             ls=':', lw=0.8)
+                    segments.append(([x, x], [previous, y]))
                 ax.plot([x, x + u.duty], [y, y], lw=1.5, gid='Utility:' + ID,
                         **style)
+                segments.append(([x, x + u.duty], [y, y]))
                 x += u.duty
                 previous = y
                 ends.append((ID, x, y, u.heating, style['color']))
-        # each label beside the end of its step on the side with more room
-        # in the axes, so that it stays inside them, and off the curve. Left
-        # of the end it sits beyond the level (above it for heating, below
-        # it for cooling), where the curve is never left of the end: the
-        # heat cascaded there is at least the duty of the steps up to this
-        # one. Right of the end it sits toward the pinch, which the curve
-        # leaves rising to the right above it and falling to the right
-        # below it.
-        lo, hi = ax.get_xlim()
-        for ID, x, y, heating, color in ends:
-            sign = 1 if hi - x >= x - lo else -1 # right or left of the end
-            dy = -2 * sign if heating else 2 * sign
-            ax.annotate(ID, xy=(x, y), xytext=(3 * sign, dy),
-                        textcoords='offset points',
-                        ha='left' if sign > 0 else 'right',
-                        va='top' if dy < 0 else 'bottom', fontsize=7,
-                        color=color, gid='Label:' + ID)
+        # each label beside the end of its step, placed when drawn: on the
+        # side with more room in the axes, toward the pinch right of the
+        # end, beyond the level left of it (where the curve never is: the
+        # heat cascaded there is at least the end of the step), or where
+        # else it keeps inside the axes and off the curve, the steps and
+        # the labels before it (a pocket of the curve, or a curve that
+        # leaves the end of a step at a shallow angle, can run toward the
+        # pinch)
+        placement = _Beside(ax, [(H, T - 273.15), *segments])
+        for ID, x, y, is_heating, color in ends:
+            label = ax.annotate(ID, xy=(x, y), xytext=(0, 0), ha='left',
+                                va='bottom', fontsize=7, color=color,
+                                gid='Label:' + ID)
+            placement.add(label, is_heating)
         ax.margins(y=0.08) # headroom for a label beyond the outermost level
     _sci_ticks(ax.xaxis)
     ax.set_xlabel('heat cascaded [kJ·h$^{-1}$]')

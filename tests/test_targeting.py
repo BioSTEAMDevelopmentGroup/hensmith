@@ -2880,6 +2880,88 @@ def test_plot_readability(quickstart):
         assert box.x0 - frame.x0 == pytest.approx(2. * fig.dpi / 72., abs=0.5)
     finally:
         plt.close(fig)
+    def in_order(fig, ax):
+        """The utility labels of the balanced curves of each side in the
+        order of their anchors (a heating label no lower than that of a
+        lower level, a cooling one no higher than that of a higher one),
+        and each beside its anchor (within 1.5 times its height) or with a
+        leader from its anchor to the nearest point of its box; the number
+        of leaders."""
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        pt = fig.dpi / 72.
+        leaders = {a.get_gid(): a.get_path().vertices for a in _gid_artists(ax, 'Leader:')}
+        labels = sorted(_gid_artists(ax, 'Utility:'), key=lambda label: label.xy[1])
+        labels = [label for label in labels if label.get_gid() != 'Utility:unserved']
+        heating = [label for label in labels if label.get_ha() == 'right']
+        cooling = [label for label in labels if label.get_ha() == 'left']
+        for side, up in ((heating, True), (cooling, False)):
+            boxes = [label.get_window_extent(renderer) for label in side]
+            ends = [box.y0 if up else box.y1 for box in boxes]
+            assert all(a <= b + 2. * pt for a, b in zip(ends, ends[1:])), ends
+        drawn = 0
+        for label in labels:
+            box = label.get_window_extent(renderer)
+            anchor = ax.transData.transform(label.xy)
+            near = np.clip(anchor, (box.x0, box.y0), (box.x1, box.y1))
+            ends = leaders['Leader:' + label.get_gid().split(':', 1)[1]]
+            if math.dist(anchor, near) <= 1.5 * box.height:
+                assert not len(ends), label.get_text()
+            else:
+                assert len(ends) == 2, label.get_text()
+                assert math.dist(ends[0], anchor) <= 2. * pt
+                assert math.dist(ends[1], near) <= 2. * pt
+                drawn += 1
+        return drawn
+    # labels crowding one end of the curves (refrigerants at the cold end):
+    # stacked in a column below right of their flats, in the room made for
+    # it, inside the axes and off the x tick labels
+    crowded = [targets('test_targeting_plot_crowded', [('C0', 367., 382., 2.47),
+                                                       ('H1', 877., 796., 1.7),
+                                                       ('C2', 482., 892., 2.29),
+                                                       ('H3', 651., 237., 0.83)], 10.),
+               targets('test_targeting_plot_crowded_2', [('C0', 670., 760., 0.41),
+                                                         ('H1', 828., 240., 2.72),
+                                                         ('C2', 348., 848., 1.4),
+                                                         ('H3', 578., 545., 1.2)], 10.)]
+    for t in crowded:
+        assert sum(not u.heating for u in t.utility_targets()) == 5
+        fig, ax = plot_composite_curves(t, kind='balanced')
+        try:
+            labels = _gid_artists(ax, 'Utility:') + _gid_artists(ax, 'Fuel')
+            readable(fig, ax, labels, [line for line in ax.get_lines()
+                                       if 'balanced composite' in (line.get_gid() or '')])
+            label_boxes = boxes(fig, labels)
+            assert all(not a.overlaps(b) for i, a in enumerate(label_boxes)
+                       for b in label_boxes[i + 1:])
+            ticks = boxes(fig, [x for x in ax.get_xticklabels() if x.get_text()])
+            assert all(not a.overlaps(b) for a in label_boxes for b in ticks)
+            in_order(fig, ax)
+        finally:
+            plt.close(fig)
+    # on narrower axes (of a figure of the user's, alone or beside another),
+    # where the labels of pyro moved inside the left edge rise over the
+    # curve: in the order of the levels, each with a leader from its flat
+    for size, columns in (((4.5, 4.2), 1), ((5., 4.2), 1), ((10., 4.2), 2)):
+        fig, axes = plt.subplots(1, columns, figsize=size, layout='constrained',
+                                 squeeze=False)
+        try:
+            ax = axes[0, 0]
+            plot_composite_curves(pyro, kind='balanced', ax=ax)
+            if columns > 1: plot_composite_curves(pyro, kind='real', ax=axes[0, 1])
+            labels = _gid_artists(ax, 'Utility:') + _gid_artists(ax, 'Fuel')
+            readable(fig, ax, labels, [line for line in ax.get_lines()
+                                       if 'balanced composite' in (line.get_gid() or '')])
+            assert in_order(fig, ax) >= 2
+        finally:
+            plt.close(fig)
+    # at the default size, beside their flats or a step above another
+    for t in (pyro, furnace, liquid):
+        fig, ax = plot_composite_curves(t, kind='balanced')
+        try:
+            assert in_order(fig, ax) == 0
+        finally:
+            plt.close(fig)
     # the utility labels of the real and shifted composites inside the axes
     # and off the curves, also where the hot curve's hot end is the top of
     # the plot, at the right of it (KEMP, hot streams only); the legend off
@@ -2912,26 +2994,103 @@ def test_plot_readability(quickstart):
         assert all(not a.overlaps(b) for a, b in zip(tick_boxes, tick_boxes[1:]))
     finally:
         plt.close(fig)
-    # a label for each step, inside the axes on the side of the step's end
-    # with more room (the last steps end at the largest heats: left of the
-    # end, above a heating level and below a cooling one) and off the curve,
-    # which meets the end of a step or lies beyond it (KEMP's cooling water
-    # ends short of the curve, which turns back below its level)
-    for t in (gcc_A, furnace, liquid, kemp, threshold, hot, quickstart):
+    # a label for each step beside the end of its step (3 points right or
+    # left of it, 2 points above or below its level), inside the axes and
+    # off the curve: on the side of the end with more room, toward the
+    # pinch right of it and beyond the level left of it (the last steps end
+    # at the largest heats: left of the end, above a heating level and
+    # below a cooling one), as for the first seven (KEMP's cooling water
+    # ends short of the curve, which turns back below its level); else
+    # where else it is clear, where a pocket of the curve under a heating
+    # level (pocket, twin) or a curve that leaves the end of a cooling step
+    # rising at a shallow angle (shallow) runs toward the pinch right of
+    # the end; else on along its level, where the nose of the curve runs
+    # through each place beside the end on the side with room (nose: the
+    # low pressure steam's)
+    pocket = targets('test_targeting_plot_gcc_pocket',
+                     [('C0', 401., 539., 0.49), ('H1', 430., 406., 2.87),
+                      ('C2', 358., 508., 2.13), ('H3', 484., 460., 2.92)], 10.)
+    shallow = targets('test_targeting_plot_gcc_shallow',
+                      [('C0', 300., 429., 1.56), ('H1', 538., 460., 1.69),
+                       ('C2', 357., 424., 0.33), ('H3', 477., 342., 0.84)], 10.)
+    twin = targets('test_targeting_plot_gcc_twin',
+                   [('C1', 300., 700., 1.), ('H1', 650., 320., 0.8),
+                    ('C2', 340., 420., 3.), ('H2', 480., 290., 1.5)], 10.)
+    nose = targets('test_targeting_plot_gcc_nose',
+                   [('C0', 463., 529., 1.84), ('H1', 407., 392., 0.95),
+                    ('C2', 300., 527., 1.56), ('H3', 438., 377., 2.33)], 10.)
+    # (whether any label is not where the side with room puts it, whether
+    # any is on along its level)
+    cases = [(t, (False, False)) for t in (gcc_A, furnace, liquid, kemp,
+                                           threshold, hot, quickstart)]
+    cases += [(pocket, (True, False)), (shallow, (True, False)),
+              (twin, (True, False)), (nose, (True, True))]
+    for t, expected in cases:
         fig, ax = plot_grand_composite_curve(t)
         try:
             heating = {u.ID: u.heating for u in t.utility_targets()}
             labels = _gid_artists(ax, 'Label:')
             assert len(labels) == len(heating)
             readable(fig, ax, labels, _gid_artists(ax, 'GCC'), legend=False)
-            lo, hi = ax.get_xlim()
+            renderer = fig.canvas.get_renderer()
+            frame = ax.get_window_extent(renderer)
+            pt = fig.dpi / 72.
+            moved = slid = False
             for label in labels:
-                (x, _), (dx, dy) = label.xy, label.xyann
-                right = dx > 0
-                assert right == (hi - x >= x - lo)
-                assert (dy > 0) == (heating[label.get_text()] != right)
+                box = label.get_window_extent(renderer)
+                x, y = ax.transData.transform(label.xy)
+                right, above = box.x0 > x, box.y0 > y
+                assert (box.y0 - y if above else y - box.y1) == pytest.approx(2. * pt, abs=0.5)
+                off = box.x0 - x if right else x - box.x1
+                if off > 3. * pt + 0.5: slid = True
+                else: assert off == pytest.approx(3. * pt, abs=0.5)
+                room = frame.x1 - x >= x - frame.x0
+                moved |= not (right == room and above == (heating[label.get_text()] != right))
+            assert (moved, slid) == expected
         finally:
             plt.close(fig)
+
+def test_plot_labels_placed_once(monkeypatch):
+    # the labels of the balanced curves are placed in one pass for each
+    # layout of the figure, not again for each label measured (which made
+    # a draw exponential in the number of labels): fifteen steam levels
+    # take a few passes, kept in the order of their levels, apart, inside
+    # the axes and off the curves
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from hensmith import targeting
+    t = targets('test_targeting_plot_many', [('C1', 300., 600., 1.),
+                                             ('H1', 590., 320., 0.3)], 10.)
+    thermo = agent('low_pressure_steam').thermo
+    steam = [bst.UtilityAgent(f'test_targeting_plot_steam_{i}', Water=1,
+                              T=330. + 230. * i / 14, P=1e5, phase='g', thermo=thermo,
+                              heat_transfer_price=1e-7 * (i + 1)) for i in range(15)]
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', RuntimeWarning)
+        utilities = t.utility_targets(steam)
+    assert sum(u.heating and u.agent is not None for u in utilities) == 15
+    calls = []
+    place = targeting._Stacked._place
+    monkeypatch.setattr(targeting._Stacked, '_place', lambda self, *args, **kwargs:
+                        calls.append(None) or place(self, *args, **kwargs))
+    fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
+    try:
+        for _ in range(2):
+            calls.clear()
+            fig.canvas.draw()
+            assert 1 <= len(calls) <= 4
+        renderer = fig.canvas.get_renderer()
+        frame = ax.get_window_extent(renderer)
+        labels = sorted(_gid_artists(ax, 'Utility:test_targeting_plot_steam'),
+                        key=lambda label: label.xy[1])
+        assert len(labels) == 15
+        boxes = [label.get_window_extent(renderer) for label in labels]
+        assert all(frame.y0 <= box.y0 and box.y1 <= frame.y1 for box in boxes)
+        assert all(a.y0 <= b.y0 for a, b in zip(boxes, boxes[1:]))
+        assert all(not a.overlaps(b) for i, a in enumerate(boxes) for b in boxes[i + 1:])
+    finally:
+        plt.close(fig)
 
 def test_plot_supertargets_gids(tmp_path):
     import matplotlib
