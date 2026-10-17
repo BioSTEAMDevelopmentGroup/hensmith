@@ -288,9 +288,14 @@ are): ``biosteam.MultistageCompressor`` builds its compressors and
 intercoolers anew, without an owner, whenever ``pr`` or ``n_stages``
 changes, and ``'K1'`` still covers the intercoolers of compressor K1 and
 ``('K1', 'K1_H1')`` names one in every sample, while ``'K1_H1'`` names
-nothing. (Outside the facility -- ``synthesize_network``,
-``temperature_interval_pinch_analysis``, ``PinchTargets.from_heat_utilities``
--- only the heat utilities' units and their owners are at hand, so such an
+nothing. Targets keep this relation as it was when they were made (those of
+``HXN.targets()`` as it was at the network's synthesis), for their
+contributions, film coefficient keys and labels (``'K1 - K1_H1'``): ``'K1'``
+still covers the intercoolers of targets stored in one sample after K1 has
+rebuilt them in the next, or has been simulated alone. (Outside the
+facility -- ``synthesize_network``, ``temperature_interval_pinch_analysis``,
+``PinchTargets.from_heat_utilities`` without ``key_units=sys.units`` -- only
+the heat utilities' units and their owners are at hand, so such an
 intercooler has no owner there and ``'K1_H1'`` is its key.) ID
 keys are the robust form: a unit that rebuilds its auxiliary units at every
 simulation (``biosteam.HXutilities``, for one) leaves a key holding an old

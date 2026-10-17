@@ -784,7 +784,7 @@ def _top(unit, owners=None):
     while (owner := _parent(unit, owners)) is not None: unit = owner
     return unit
 
-def _held_owners(units):
+def _held_owners(units, held=None):
     """
     The owners that the units at hand give the auxiliary units they hold
     without setting their owner: a dict from the id of such an auxiliary to
@@ -795,11 +795,14 @@ def _held_owners(units):
     exist when it is called, but some units build theirs anew without one:
     `biosteam.MultistageCompressor` rebuilds its compressors and
     intercoolers whenever `pr` or `n_stages` changes, so the keys of its
-    ID cover them only by this relation (see `_parent`). Nothing is
-    mutated.
+    ID cover them only by this relation (see `_parent`). `held`, such a
+    dict taken earlier (a snapshot, which keeps its objects alive), comes
+    first: its auxiliaries keep their holders even once a holder has
+    rebuilt them (no longer holds them), and the units at hand add the
+    others, along its owners. Nothing is mutated.
     """
-    owners = {}
-    for unit in _owner_chains(units):
+    owners = dict(held) if held else {}
+    for unit in _owner_chains(units, owners):
         for aux in getattr(unit, 'auxiliary_units', ()):
             if (not isinstance(aux, bst.Unit)
                     or getattr(aux, '_owner', None) is not None
@@ -890,12 +893,25 @@ def _owner_chains(units, owners=None):
             unit = _parent(unit, owners)
     return list(found.values())
 
-def _key_universe(units):
+def _with_auxiliaries(units):
+    """Each unit of `units` followed by its nested auxiliary units (those
+    that are `biosteam.Unit` objects): the units that keys may name, as
+    `HeatExchangerNetwork` takes those available to it, whether or not
+    they hold a heat utility."""
+    candidates = []
+    for unit in units:
+        candidates.append(unit)
+        candidates.extend([i for i in unit.nested_auxiliary_units
+                           if isinstance(i, bst.Unit)])
+    return candidates
+
+def _key_universe(units, held=None):
     """The units that keys may name, given the units at hand `units`:
     ``(universe, live, owners)``, the owner chains of `units` (see
     `_owner_chains`) along the owners they give the auxiliaries they hold
-    (`owners`, see `_held_owners`), and the ids of the universe (`live`)."""
-    owners = _held_owners(units)
+    (`owners`, see `_held_owners`, after those of the snapshot `held`), and
+    the ids of the universe (`live`)."""
+    owners = _held_owners(units, held)
     universe = _owner_chains(units, owners)
     return universe, {id(u) for u in universe}, owners
 
@@ -1019,7 +1035,8 @@ def _unknown_key_hints(keys, universe, owners=None):
     the stages without an owner that a `biosteam.MultistageCompressor` of
     that ID gives its IDs (see `_is_stage_ID`), such as the intercoolers
     of the heat utilities of a compressor K1 outside a HeatExchangerNetwork
-    (which alone takes K1 as their owner, see `_held_owners`). Returns them
+    (which, with the `key_units` of `hensmith.PinchTargets.from_heat_utilities`,
+    alone takes K1 as their owner, see `_held_owners`). Returns them
     as ``'; <hint>'`` each, joined ('' if none).
     """
     hints = {}
@@ -1041,7 +1058,8 @@ def _unknown_key_hints(keys, universe, owners=None):
                       f"{'has' if one else 'have'} no owner here, so {keyed}"
                       f' (a MultistageCompressor {key!r} owns the stages it '
                       'builds only among the units available to a '
-                      'HeatExchangerNetwork)'] = None
+                      'HeatExchangerNetwork, or the key_units of '
+                      'PinchTargets.from_heat_utilities)'] = None
         elif isinstance(key, tuple):
             for unit, held in _auxiliary_slots(key, universe, owners):
                 if held is not None and held.ID != key[1]:
@@ -1054,14 +1072,14 @@ def _unknown_key_hints(keys, universe, owners=None):
                       'here)'] = None
     return ''.join(hints)
 
-def _mapping_contributions(hus, mapping, units):
+def _mapping_contributions(hus, mapping, units, held=None):
     """
     `_stream_contributions` of a mapping from keys naming units to
     contributions: checks the types of keys and values, then that every key
     names a unit of the universe (the owner chains of the units of `hus`
     and of `units`, the units at hand of `_names_unit`, along the owners
-    they give the auxiliaries they hold without one, see `_key_universe`)
-    or an auxiliary unit that one of them may build but does not hold now
+    they give the auxiliaries they hold without one, after those of the
+    snapshot `held`, see `_key_universe`) or an auxiliary unit that one of them may build but does not hold now
     (see `_names_unbuilt_auxiliary`: such a key names nothing), then that
     no two keys of the same level for a unit of the universe give it
     different values (None and nan are equal); then each heat utility takes
@@ -1073,7 +1091,7 @@ def _mapping_contributions(hus, mapping, units):
         _check_contribution_key(key)
         items.append((key, _contribution_value(value, f'key {key!r}')))
     universe, live, owners = _key_universe([hu.unit for hu in hus]
-                                           + list(units or ()))
+                                           + list(units or ()), held)
     unknown = _unknown_keys([key for key, _ in items], universe, owners)
     if unknown:
         raise ValueError('approach_contributions keys that name no unit: '
@@ -1103,7 +1121,8 @@ def _mapping_contributions(hus, mapping, units):
         values.append(None if best is None else best[1])
     return values
 
-def _stream_contributions(hus, approach_contributions, units=None):
+def _stream_contributions(hus, approach_contributions, units=None,
+                          held=None):
     """
     Resolve `approach_contributions` to one approach temperature
     contribution per heat utility of `hus`, in the given order (zero-duty
@@ -1115,12 +1134,14 @@ def _stream_contributions(hus, approach_contributions, units=None):
     utility (called once per heat utility, in order). `units` adds units
     (with their owner chains) to those that keys may name and that are
     checked for conflicting keys, whether or not they hold a heat utility
-    of `hus`.
+    of `hus`, and `held` gives the holders of auxiliaries taken earlier
+    (see `_held_owners`).
     """
     N = len(hus)
     x = approach_contributions
     if x is None: return [None] * N
-    if isinstance(x, Mapping): return _mapping_contributions(hus, x, units)
+    if isinstance(x, Mapping):
+        return _mapping_contributions(hus, x, units, held)
     if isinstance(x, (Sequence, np.ndarray)) and not isinstance(x, (str, bytes)):
         values = list(x)
         if len(values) != N:
@@ -1136,14 +1157,15 @@ def _stream_contributions(hus, approach_contributions, units=None):
                     f'a callable, not {type(x).__name__!r}')
 
 def _explicit_contributions(hus, approach_contributions, T_min_app,
-                            units=None):
+                            units=None, held=None):
     """
-    `_stream_contributions` of `hus`, or None if nothing is specified
-    (`approach_contributions` None, or every value None or nan: the default
-    path). With a value, `T_min_app` must be finite and > 0.
+    `_stream_contributions` of `hus` (with `units` and `held`), or None if
+    nothing is specified (`approach_contributions` None, or every value
+    None or nan: the default path). With a value, `T_min_app` must be
+    finite and > 0.
     """
     if approach_contributions is None: return None
-    values = _stream_contributions(hus, approach_contributions, units)
+    values = _stream_contributions(hus, approach_contributions, units, held)
     if all(v is None for v in values): return None
     _approach_contributions(len(values), T_min_app, values) # checks T_min_app
     return values

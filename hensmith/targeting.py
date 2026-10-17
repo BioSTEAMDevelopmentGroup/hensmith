@@ -34,7 +34,8 @@ from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
     _contribution_key_level, _key_universe, _unknown_keys,
-    _unknown_key_hints, _unit_message_name)
+    _unknown_key_hints, _unit_message_name, _held_owners, _top,
+    _with_auxiliaries)
 
 __all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
            'plot_composite_curves', 'plot_grand_composite_curve',
@@ -310,9 +311,15 @@ def _duty_off_stream(hu):
     dH = unit.outs[0].H - unit.ins[0].H
     return abs(dH - hu.unit_duty) > 1e-6 * max(abs(dH), abs(hu.unit_duty))
 
-def _unit_label(unit):
-    """``unit.ID``, or ``'<owner.ID> - <unit.ID>'`` for an auxiliary unit."""
-    return unit.ID if unit.owner is unit else f'{unit.owner.ID} - {unit.ID}'
+def _unit_label(unit, owners=None):
+    """``unit.ID``, or ``'<owner.ID> - <unit.ID>'`` for an auxiliary unit,
+    with its top owner as keys take it (along
+    `hensmith.hxn_synthesis._parent` with `owners`, which may make a unit
+    the owner of an auxiliary it holds without one), and ``owner.ID`` alone
+    for an auxiliary whose ID is empty."""
+    owner = _top(unit, owners)
+    if owner is unit: return unit.ID
+    return f'{owner.ID} - {unit.ID}' if unit.ID else owner.ID
 
 def _utility_member(u):
     """The composite member ``(T, Hl, Hr)`` of a non-fuel `UtilityTarget`:
@@ -707,7 +714,13 @@ class PinchTargets:
         a stream of theirs, a key that names only such units then having no
         effect: for `HeatExchangerNetwork.targets`, every unit available to
         the network and its nested auxiliary units, which approach
-        contribution keys may name; else None (settable).
+        contribution keys may name; for `from_heat_utilities`, its
+        `key_units` and their nested auxiliary units; else None (settable).
+        An auxiliary that one of them, or a unit of `units`, holds without
+        an owner when the targets are made (for `HeatExchangerNetwork.targets`,
+        at the network's synthesis) stays that unit's for keys and labels,
+        as the facility takes it (see Notes of `HeatExchangerNetwork`), even
+        once the unit has rebuilt its auxiliaries.
     force_ideal_thermo : bool
         Whether the stream copies use ideal thermodynamics (False when built
         from streams).
@@ -1040,6 +1053,9 @@ class PinchTargets:
         self.key_units = None
         self.force_ideal_thermo = False
         self.system = None
+        #: The holders of auxiliaries held without an owner when the
+        #: targets were made (see `hensmith.hxn_synthesis._held_owners`).
+        self._holders = None
         #: Grid index of the pinch.
         self._k_pinch = int(np.flatnonzero(table.Ts == table.pinch_T)[0])
         #: Threshold of every heat comparison [kJ/hr], the table's own.
@@ -1047,7 +1063,8 @@ class PinchTargets:
 
     @classmethod
     def from_heat_utilities(cls, hus, T_min_app=5., approach_contributions=None,
-                            force_ideal_thermo=False, sort_hus_by_T=False):
+                            force_ideal_thermo=False, sort_hus_by_T=False,
+                            key_units=None):
         """
         Targets of the process streams behind heat utilities, prepared
         exactly as `hensmith.hxn_synthesis.synthesize_network` prepares them
@@ -1080,13 +1097,24 @@ class PinchTargets:
         sort_hus_by_T : bool, optional
             Order the streams by inlet temperature, as the synthesis's
             option. Defaults to False.
+        key_units : Iterable[Unit], optional
+            Further units at hand, such as ``sys.units``: the keys of
+            `approach_contributions` and of `h` (see `area_target`) may name
+            them and their nested auxiliary units (the targets'
+            `key_units`), whether or not they hold a heat utility of `hus`,
+            as the keys of a `HeatExchangerNetwork` with these units may. A
+            `biosteam.MultistageCompressor` K1 among them owns the stages it
+            holds without an owner, so ``'K1'`` covers its intercoolers and
+            ``('K1', 'K1_H1')`` names one. Without them, only the units of
+            `hus` and their owners are at hand, and ``'K1_H1'`` is that
+            intercooler's key. Defaults to None.
 
         Returns
         -------
         PinchTargets
             Streams in stream order (heating utilities, i.e. cold streams,
             first), labeled by unit (``'<owner> - <unit>'`` for an
-            auxiliary unit).
+            auxiliary unit, with its top owner as keys take it).
 
         Raises
         ------
@@ -1138,7 +1166,9 @@ class PinchTargets:
                  'they hold its utilities, and the streams it serves '
                  'completely have none and are left out; take its targets() '
                  'instead', RuntimeWarning)
-        values = _explicit_contributions(hus, approach_contributions, T_min_app)
+        if key_units is not None: key_units = _with_auxiliaries(key_units)
+        values = _explicit_contributions(hus, approach_contributions, T_min_app,
+                                         key_units)
         arranged, N_heating = _arrange_heat_utilities(hus, sort_hus_by_T)
         if values is None:
             contributions = None
@@ -1146,24 +1176,32 @@ class PinchTargets:
             value_of = dict(zip(map(id, hus), values))
             contributions = [value_of[id(hu)] for hu in arranged]
         is_hot = [False] * N_heating + [True] * (len(arranged) - N_heating)
-        return cls._from_exchangers([hu.unit for hu in arranged], is_hot,
+        holders = _held_owners([hu.unit for hu in hus] + (key_units or []))
+        self = cls._from_exchangers([hu.unit for hu in arranged], is_hot,
                                     T_min_app, contributions,
-                                    force_ideal_thermo, None, arranged)
+                                    force_ideal_thermo, None, arranged,
+                                    holders)
+        self.key_units = key_units
+        return self
 
     @classmethod
     def _from_exchangers(cls, hxs, is_hot, T_min_app, approach_contributions,
-                         force_ideal_thermo, labels=None, heat_utilities=None):
+                         force_ideal_thermo, labels=None, heat_utilities=None,
+                         holders=None):
         """Targets of the process streams of the exchangers `hxs` (stream
         order, contributions resolved in stream order), labeled by unit by
-        default."""
+        default, with the holders `holders` of auxiliaries held without an
+        owner (see `hensmith.hxn_synthesis._held_owners`), as they were when
+        the contributions were resolved."""
         _check_T_min_app(T_min_app)
         streams_inlet, streams_quenched = _process_streams(hxs, force_ideal_thermo)
-        if labels is None: labels = [_unit_label(hx) for hx in hxs]
+        if labels is None: labels = [_unit_label(hx, holders) for hx in hxs]
         self = cls(streams_inlet, streams_quenched, is_hot, T_min_app,
                    approach_contributions, labels)
         self.units = list(hxs)
         self.heat_utilities = None if heat_utilities is None else list(heat_utilities)
         self.force_ideal_thermo = bool(force_ideal_thermo)
+        self._holders = holders
         return self
 
     def at(self, T_min_app, scale_contributions=False):
@@ -1202,6 +1240,7 @@ class PinchTargets:
         new.key_units = self.key_units
         new.force_ideal_thermo = self.force_ideal_thermo
         new.system = self.system
+        new._holders = self._holders
         return new
 
     def __repr__(self):
@@ -1776,13 +1815,14 @@ class PinchTargets:
         it the same value. Unit keys may also name `key_units` (and their
         owners) and the auxiliaries that units may build but do not hold
         now, as approach contribution keys of the facility may, and then
-        have no effect. An auxiliary that a unit at hand holds without an
-        owner is that unit's (see `hensmith.hxn_synthesis._key_universe`).
+        have no effect. An auxiliary that a unit at hand held without an
+        owner when the targets were made, or holds so now, is that unit's
+        (see `hensmith.hxn_synthesis._key_universe`).
         """
         N = self.is_hot.size
         units = self.units or ()
         universe, live, owners = _key_universe(
-            [*units, *(self.key_units or ())])
+            [*units, *(self.key_units or ())], self._holders)
         items = []
         unknown = []
         for key, value in h.items():
@@ -2513,7 +2553,8 @@ def _check_targets(HXN, targets):
             s_out = _copy(s_out, s_out.thermo.ideal())
         if not _same_ends(c, s_in, s_out):
             raise ValueError(f'targets are not of the current states of '
-                             f'{_unit_label(hx)} (simulated since?): make '
+                             f'{_unit_label(hx, targets._holders)} '
+                             '(simulated since?): make '
                              'them again with HXN.targets()')
 
 def _check_network(HXN, targets):

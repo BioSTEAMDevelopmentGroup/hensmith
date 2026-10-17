@@ -22,7 +22,7 @@ import biosteam as bst
 import numpy as np
 from .hxn_synthesis import (
     synthesize_network, StreamLifeCycle, plot_pinch_diagram, _first_inlet,
-    _explicit_contributions,
+    _explicit_contributions, _held_owners, _with_auxiliaries,
 )
 from warnings import warn
 
@@ -534,21 +534,19 @@ class HeatExchangerNetwork(bst.Facility):
         `units` (defaults to `_get_units`) followed by its nested auxiliary
         units, whether or not it holds a heat utility the network takes."""
         if units is None: units = self._get_units()
-        candidates = []
-        for unit in units:
-            candidates.append(unit)
-            candidates.extend([i for i in unit.nested_auxiliary_units
-                               if isinstance(i, bst.Unit)])
-        return candidates
+        return _with_auxiliaries(units)
 
-    def _network_contributions(self, hx_utils, units=None):
+    def _network_contributions(self, hx_utils, units=None, held=None):
         """
         The explicit approach contributions of `hx_utils` (aligned with
         it; None where unspecified), or None if none is given (see
         `hensmith.hxn_synthesis._explicit_contributions`). The keys are
         checked against every candidate unit (`_candidate_units` of `units`,
         the units `hx_utils` were taken from if given), so a bad key or
-        value raises even while its unit holds no heat utility.
+        value raises even while its unit holds no heat utility. `held`, the
+        holders of auxiliaries held without an owner as taken earlier (see
+        `hensmith.hxn_synthesis._held_owners`), comes before those of the
+        units now.
         """
         x = self.approach_contributions
         if x is None: return None
@@ -559,7 +557,8 @@ class HeatExchangerNetwork(bst.Facility):
                             f'has nothing to align with), not '
                             f'{type(x).__name__!r}')
         return _explicit_contributions(hx_utils, x, self.T_min_app,
-                                       units=self._candidate_units(units))
+                                       units=self._candidate_units(units),
+                                       held=held)
 
     def _get_original_heat_utilties(self, units=None):
         if units is None: units = self._get_units()
@@ -725,6 +724,10 @@ class HeatExchangerNetwork(bst.Facility):
                 # Signed-duty order is the default matching priority of the
                 # synthesis passes: smallest heating duty first among the cold
                 # streams, largest cooling duty first among the hot streams.
+                # The holders of the auxiliaries held without an owner, as
+                # the contributions were resolved by (see `targets`).
+                holders = _held_owners([hu.unit for hu in hx_utils]
+                                       + self._candidate_units(units))
                 hx_utils.sort(key = lambda x: x.duty)
                 self.HXN_flowsheet = HXN_F = flowsheet
                 for i in HXN_F.registries: i.clear()
@@ -750,6 +753,7 @@ class HeatExchangerNetwork(bst.Facility):
                 self.new_HXs_cold_side = HXs_cold_side
                 self.cold_indices = cold_indices
                 self.original_heat_exchangers = hxs
+                self._holders = holders
                 self.new_HXs = new_HXs
                 self.new_HX_utils = new_HX_utils
                 self.streams_inlet = streams_inlet
@@ -1038,7 +1042,12 @@ class HeatExchangerNetwork(bst.Facility):
         `replace_unit_heat_utilities` hold the network's utilities, not the
         streams' (see `hensmith.targeting.PinchTargets`). A mapping of
         approach contributions is resolved again by the units of
-        `original_heat_utils`, so a mapping changed since applies; a
+        `original_heat_utils`, so a mapping changed since applies (an
+        auxiliary that a unit held without an owner at the synthesis, such
+        as an intercooler of a `biosteam.MultistageCompressor` K1, is still
+        that unit's, as are the targets' film coefficient keys, even after
+        K1 has rebuilt its stages: K1 simulated alone, or a later sample of
+        stored targets; the targets keep that relation); a
         callable is not called again (with `replace_unit_heat_utilities`, the
         heat utilities it would read hold the network's utilities by then):
         its values are those the last simulation resolved, and a callable set
@@ -1105,6 +1114,11 @@ class HeatExchangerNetwork(bst.Facility):
                 is_hot.append(dH < 0. if dH else i not in cold)
             x = self.approach_contributions
             units = list(self._get_units())
+            key_units = self._candidate_units(units)
+            # the holders of the auxiliaries held without an owner as at the
+            # synthesis, which a holder that has rebuilt them since (a
+            # MultistageCompressor simulated alone) no longer holds
+            held = getattr(self, '_holders', None)
             if x is not None and not isinstance(x, Mapping) and callable(x):
                 # Never called again: with replace_unit_heat_utilities, the
                 # heat utilities it would read now hold the network's
@@ -1114,11 +1128,11 @@ class HeatExchangerNetwork(bst.Facility):
                 contributions = getattr(self, '_resolved_contributions', None)
             else:
                 # by unit only, which the network never changes
-                contributions = self._network_contributions(hus, units)
+                contributions = self._network_contributions(hus, units, held)
             targets = PinchTargets._from_exchangers(
                 hxs, is_hot, T_min_app, contributions, self.force_ideal_thermo,
-                None, hus)
-            targets.key_units = self._candidate_units(units)
+                None, hus, _held_owners([*hxs, *key_units], held))
+            targets.key_units = key_units
             targets.system = self.system
             return targets
         if self.system is None and not self.units:
@@ -1129,8 +1143,7 @@ class HeatExchangerNetwork(bst.Facility):
         hx_utils.sort(key=lambda x: x.duty) # as `_cost` sorts them
         targets = PinchTargets.from_heat_utilities(
             hx_utils, T_min_app, self._network_contributions(hx_utils, units),
-            self.force_ideal_thermo, self.sort_hus_by_T)
-        targets.key_units = self._candidate_units(units)
+            self.force_ideal_thermo, self.sort_hus_by_T, key_units=units)
         targets.system = self.system
         return targets
 

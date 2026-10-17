@@ -1170,6 +1170,9 @@ def test_keys_of_auxiliaries_under_other_IDs():
     HXN.approach_contributions = None
     simulate_strictly(sys)
     targets = HXN.targets()
+    # labeled by owner, the heater of an empty ID by its owner's alone
+    assert dict(zip(targets.units, targets.labels)) == {
+        hx: 'T1', U.hxs[0]: 'U - U_hx0', U.hxs[1]: 'U - U_hx1', H1: 'H1'}
     area = targets.area_target()
     assert targets.area_target(h={('T1', ''): .5}) != area
     assert targets.area_target(h={('T1', ''): .5}) == targets.area_target(
@@ -1309,6 +1312,80 @@ def test_keys_of_stages_a_compressor_does_not_build():
     # a key of a stage beyond n_stages is no key of a unit not at hand
     with pytest.raises(ValueError, match=r"name no unit: \('K1', 'K1_H3'\)"):
         hxn_synthesis._stream_contributions(hus, {('K1', 'K1_H3'): 2.})
+
+def test_targets_keep_the_holders_of_stages_rebuilt_since():
+    # targets keep the holders of the stages that a MultistageCompressor
+    # holds without an owner as they were when they were made (those of
+    # HXN.targets() as at the synthesis): stored targets of one sample keep
+    # 'K1' and ('K1', 'K1_H1') on their intercoolers, and their labels,
+    # after K1 rebuilds its stages in the next sample or is simulated alone
+    bst.main_flowsheet.set_flowsheet('contributions_kept_holders')
+    bst.settings.set_thermo(['Water', 'Methane'], cache=True)
+    gas = bst.Stream('gas', Methane=100., units='kmol/hr', T=300.,
+                     P=101325., phase='g')
+    K1 = bst.MultistageCompressor('K1', ins=gas, pr=2., n_stages=3, eta=0.7)
+    cold = bst.Stream('cold', Water=200., units='kmol/hr', T=290., P=5e5)
+    C1 = bst.HXutility('C1', ins=cold, T=350., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5.,
+                               approach_contributions={'K1': 2.})
+    sys = bst.System.from_units('contributions_kept_holders',
+                                units=[K1, C1, HXN])
+    keys = ({'K1': .5}, {('K1', 'K1_H1'): .5}, {('K1', 'K1_H3'): .5})
+
+    def results(targets):
+        return (targets.labels, targets.approach_contributions,
+                [targets.area_target(h=h) for h in keys],
+                targets.at(10.).area_target(h=keys[0]))
+
+    stored = []
+    for pr in (2., 2.5, 3., 2.2):
+        K1.pr = pr
+        simulate_strictly(sys)
+        hxs = list(K1.hxs)
+        targets = HXN.targets()
+        assert dict(zip(targets.units, targets.labels)) == {
+            C1: 'C1', **{hx: f'K1 - {hx.ID}' for hx in hxs}}
+        first = results(targets)
+        area = targets.area_target()
+        assert all(a != area for a in first[2])
+        stored.append((targets, first, hxs))
+    for targets, first, hxs in stored:
+        assert all(getattr(hx, '_owner', None) is None for hx in hxs)
+        assert results(targets) == first
+    # K1 simulated alone rebuilds its stages: the facility's targets keep
+    # the contributions the network was synthesized with
+    info = HXN.synthesis_info['approach_contributions'].tolist()
+    old = list(K1.hxs)
+    K1.pr = 2.5
+    K1.simulate()
+    assert not any(hx in old for hx in K1.hxs)
+    targets = HXN.targets()
+    assert [2.5 if c is None else c
+            for c in targets.approach_contributions] == info == [
+        2.5, 2., 2., 2.]
+    assert targets.area_target(h={'K1': .5}) != targets.area_target()
+    # outside the facility, key_units put the compressor at hand
+    simulate_strictly(sys)
+    hus = bst.process_tools.heat_exchanger_utilities_from_units(sys.units)
+    hus.sort(key=lambda hu: hu.duty) # in the facility's order
+    for x in ({'K1': 2.}, {K1: 2.}, {('K1', 'K1_H1'): 2., 'K1': 2.}):
+        targets = PinchTargets.from_heat_utilities(hus, 5., x,
+                                                   key_units=sys.units)
+        assert targets.approach_contributions == (None, 2., 2., 2.)
+        assert targets.key_units == HXN._candidate_units(sys.units)
+        assert targets.labels == HXN.targets().labels
+        assert targets.area_target(h={'K1': .5}) == HXN.targets(
+            ).area_target(h={'K1': .5})
+    with pytest.raises(ValueError, match="name no unit: <MultistageCompr"):
+        PinchTargets.from_heat_utilities(hus, 5., {K1: 2.})
+    with pytest.raises(ValueError, match=r"or the key_units of PinchTargets"
+                                         r"\.from_heat_utilities\)"):
+        PinchTargets.from_heat_utilities(hus, 5., {'K1': 2.})
+    targets = PinchTargets.from_heat_utilities(hus, 5.)
+    assert targets.key_units is None
+    assert targets.labels == ['C1', 'K1_H3', 'K1_H1', 'K1_H2']
+    with pytest.raises(ValueError, match='h keys that name no stream'):
+        targets.area_target(h={'K1': .5})
 
 def test_held_owners_skip_loops_and_take_the_first_holder():
     # units that hold each other as auxiliaries without an owner: the first

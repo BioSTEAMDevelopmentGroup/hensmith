@@ -68,12 +68,15 @@ facility, from the heat utilities of heat exchangers with
 ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``, is the
 one to give it: a heat utility that a unit adds for itself (a reactor's or a
 heated mixer's, ``hu.hxn_ok`` False) raises a ``ValueError``, as its unit's
-first inlet and outlet need not be the stream it heats or cools. After a
-simulation with ``replace_unit_heat_utilities=True``, though, the units' heat
-utilities hold the network's utilities, not the process duties, and those of
-the streams that the process exchangers serve completely are empty: the
-selection then gives the wrong streams (with a ``RuntimeWarning``), and
-``HXN.targets()`` is the one to take.
+first inlet and outlet need not be the stream it heats or cools. Given
+``key_units=sys.units`` too, the keys of ``approach_contributions`` and of
+``h`` may name any unit, as the facility's may: ``'K1'`` then covers the
+intercoolers of a ``biosteam.MultistageCompressor`` K1, which builds them
+without an owner. After a simulation with ``replace_unit_heat_utilities=True``,
+though, the units' heat utilities hold the network's utilities, not the
+process duties, and those of the streams that the process exchangers serve
+completely are empty: the selection then gives the wrong streams (with a
+``RuntimeWarning``), and ``HXN.targets()`` is the one to take.
 
 Several utilities on the grand composite curve
 ----------------------------------------------

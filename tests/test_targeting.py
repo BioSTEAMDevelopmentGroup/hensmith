@@ -2225,6 +2225,13 @@ def test_facility_targets_keys_of_idle_units():
         assert direct.key_units is None
         with pytest.raises(ValueError, match="h keys that name no stream: 'H3'"):
             direct.area_target(h=h)
+        # unless given them, as the facility's
+        given = PinchTargets.from_heat_utilities(t.heat_utilities,
+                                                 key_units=sys.units)
+        assert H3 in given.key_units and H3 not in given.units
+        assert given.area_target(h=h) == given.area_target(h=busy_h)
+        with pytest.raises(ValueError, match='h keys that name no stream'):
+            given.area_target(h={'H9': 1.})
 
 #: Keys of `network_report`.
 REPORT_KEYS = ['T_min_app', 'targets_T_min_app', 'status', 'applied', 'Q_hot', 'Q_cold',
