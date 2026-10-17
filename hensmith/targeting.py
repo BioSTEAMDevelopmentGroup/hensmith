@@ -609,8 +609,8 @@ class PinchTargets:
     *Composite curves.* `composite_curves` adds up the streams on the
     table's own grid, whose knots hold every breakpoint of every stream, so
     the composites reproduce the table to rounding: the cold composite
-    starts at the cold utility target and ends the hot utility target to
-    the right of the hot one. On the shifted scale the composites touch at
+    starts at the cold utility target and ends the hot utility target
+    beyond the end of the hot one. On the shifted scale the composites touch at
     the pinch (if there is hot utility). On the real scale they are at
     least `T_min_app` apart, or, with approach contributions, at least the
     smallest hot and the smallest cold contribution apart (unspecified ones
@@ -641,8 +641,8 @@ class PinchTargets:
     equality).
 
     Each agent is priced as one biosteam heat utility over the stretch it
-    serves, from its level to the next zero of the balanced curve (the
-    pinch, or a utility pinch). Its `T_in` and `T_out` are the real
+    serves, from its level (or the end of the grid, if that is nearer) to
+    the next zero of the balanced curve (the pinch, or a utility pinch). Its `T_in` and `T_out` are the real
     temperatures of the streams it serves there (the cold streams with heat
     above the pinch, or the hot streams with heat below it): the coldest and
     the hottest for heating, the hottest and the coldest for cooling. They
@@ -703,12 +703,13 @@ class PinchTargets:
     one furnace for all fuel) [Linnhoff90]_ and costs each with biosteam's
     correlations at one pressure (biosteam takes each exchanger's highest
     inlet pressure: its pressure factor is up to about 12 % higher for
-    high pressure steam heaters): a double pipe below 150 ft² (at
-    biosteam's default CE of 567.5 and 1 atm, its base purchase cost of
-    about 3,211 USD just below 150 ft² jumps to 20,516 USD for a floating
-    head at 150 ft², and the installed cost from about 8,055 to 64,658 USD;
-    the floating head correlation, not monotone below about 126 ft², is not
-    used there), a shell and tube of any area above. The furnace is costed
+    high pressure steam heaters): a double pipe below 150 ft² (for carbon
+    steel at 1 atm and biosteam's default CE of 567.5, the purchase cost
+    jumps from about 5,486 USD just below 150 ft² to 20,138 USD for a
+    floating head at 150 ft², and the installed cost, the one used here,
+    from about 8,055 to 64,658 USD; the floating head correlation, not
+    monotone below about 126 ft², is not used there), a shell and tube of
+    any area above. The furnace is costed
     on the fuel's utility duty. `summary` adds the total annualized cost,
     the installed (bare module) cost times the capital recovery factor plus
     the utility cost times the operating hours: no Lang factor and no
@@ -1202,8 +1203,8 @@ class PinchTargets:
             cool.append((-math.inf, remaining, None))
             warn(f'no cooling agent can serve {remaining:.6g} kJ/hr of the '
                  'cold utility target; it is left unserved', RuntimeWarning)
-        # the stretch each agent serves: from its level to the next zero of
-        # the balanced curve, the pinch or a utility pinch
+        # the stretch each agent serves: from its level, clipped to the grid,
+        # to the next zero of the balanced curve, the pinch or a utility pinch
         Ts, arr, lea = self._gcc()
         positions = _positions(Ts, arr, lea,
                                [l for l, _, _ in heat + cool if math.isfinite(l)])
@@ -2277,7 +2278,7 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     file : str, optional
         If given, the figure is saved to this path.
     dpi : int, optional
-        Resolution used when saving.
+        Resolution used when saving. Defaults to 300.
 
     Returns
     -------
@@ -2452,7 +2453,7 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
     file : str, optional
         If given, the figure is saved to this path.
     dpi : int, optional
-        Resolution used when saving.
+        Resolution used when saving. Defaults to 300.
 
     Returns
     -------
@@ -2565,7 +2566,7 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     file : str, optional
         If given, the figure is saved to this path.
     dpi : int, optional
-        Resolution used when saving.
+        Resolution used when saving. Defaults to 300.
 
     Returns
     -------

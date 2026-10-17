@@ -390,9 +390,10 @@ serves that temperature's point loads; BioSTEAM's own rule is strict, and the
 two differ only at exact equality.
 
 **Served intervals and pricing.** Each agent is priced as one BioSTEAM heat
-utility over the stretch it serves: from its level to the next zero of the
-**balanced grand composite curve** (the cascade net of the utilities), which
-is the pinch or a *utility pinch* where a lower agent is used to its limit.
+utility over the stretch it serves: from its level, or from the end of the
+grid if that is nearer, to the next zero of the **balanced grand composite
+curve** (the cascade net of the utilities), which is the pinch or a *utility
+pinch* where a lower agent is used to its limit.
 A target's ``T_in`` and ``T_out`` are the real temperatures of the streams it
 serves in that stretch: the coldest and the hottest for heating, the hottest
 and the coldest for cooling. Without approach contributions they are the

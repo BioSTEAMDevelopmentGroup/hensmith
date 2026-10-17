@@ -63,7 +63,7 @@ are those of the units' current states, which, with ``cache_network=True``,
 can differ from the cached network's. The same object can be built without a
 facility, from heat utilities with
 :meth:`PinchTargets.from_heat_utilities <hensmith.PinchTargets.from_heat_utilities>`
-(as the end of this page does) or from streams as
+(as the trade-off example below does) or from streams as
 :func:`~hensmith.problem_table` takes them.
 
 Several utilities on the grand composite curve
@@ -85,10 +85,15 @@ and prices each with biosteam.
    :language: text
 
 Each agent has a **level** on the shifted scale: the warmest temperature it
-can serve (the coldest, for a coolant), its own temperature less biosteam's
-approach. Low pressure steam, first in biosteam's list of heating agents, is
-at 407.19 K, above the top of the cold streams, so it takes the whole hot
-utility target; a hotter steam would only be used for what it cannot serve.
+can serve, or the coldest, for a coolant. A heating agent's level is its
+temperature less biosteam's approach, the agent's own ``dT`` plus
+``HeatUtility.dT``: 412.19 - 0 - 5 = 407.19 K for low pressure steam. A
+coolant's level is its temperature plus that approach, moved onto the shifted
+scale by subtracting ``T_min_app``, the hot streams' shift:
+280.37 + 2 + 5 - 5 = 282.37 K for chilled water. Low pressure steam, first in
+biosteam's list of heating agents, is above the top of the cold streams, so it
+takes the whole hot utility target; a hotter steam would only be used for what
+it cannot serve.
 Every cold stream above the pinch is heated by it, from 298.15 K (the pinch)
 to 372.60 K, and biosteam prices that duty at 1829.93 USD/hr, with the same
 division by the heat transfer efficiency as in the network: the utility duty
@@ -151,8 +156,8 @@ target below is computed on.
 
    The composite curves of chapter 2, drawn by the library: the shaded band is
    the heat recovered, the cold composite starts at the cold utility target,
-   1.936e+06 kJ/hr, and ends the hot utility target, 2.828e+08 kJ/hr, to the
-   right of the hot one. The script checks that their knots are chapter 2's.
+   1.936e+06 kJ/hr, and ends the hot utility target, 2.828e+08 kJ/hr, beyond
+   the end of the hot one. The script checks that their knots are chapter 2's.
 
 .. figure:: /_static/images/examples/tutorial_05_balanced_composites.png
    :class: white-bg
