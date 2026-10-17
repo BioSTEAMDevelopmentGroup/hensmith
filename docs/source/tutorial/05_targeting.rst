@@ -96,10 +96,12 @@ is 2.977e+08 kJ/hr. On the cold side, cooling water, the first coolant in the
 list, gets nothing: all the cold utility is needed below 303.15 K (30 °C, the
 pinch on the hot streams' scale), colder than cooling water can serve. Chilled
 water serves it. A sensible agent, it enters at 280.37 K and leaves at 298.15
-K, 5 K below the warm end of the process temperatures it serves, 303.15 K:
-biosteam prices a sensible agent from that end, so its outlet follows the
-temperatures it actually serves. The utility cost target, 1839.61 USD/hr, is
-the cost of the MER utilities with biosteam's agents placed this way.
+K, 5 K below the warmest process temperature it serves, 303.15 K: biosteam
+limits a sensible agent's outlet at that end, and hensmith also keeps its
+line 5 K from the process across the whole stretch, which here allows the
+same outlet (a condenser at the cold end of the stretch would hold it lower).
+The utility cost target, 1839.61 USD/hr, is the cost of the MER utilities
+with biosteam's agents placed this way.
 
 The grand composite curve shows the allocation: each agent is a horizontal
 segment at its level, as wide as its duty, the heating ones from the lowest

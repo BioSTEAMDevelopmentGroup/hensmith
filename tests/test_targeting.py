@@ -279,6 +279,22 @@ def test_composites_consistent_with_table(name):
     assert np.all(np.diff(T) <= 0)
     assert abs(H.min()) <= t._tol
     assert_allclose([H[0], H[-1]], [t.Q_hot, t.Q_cold], rtol=1e-12, atol=t._tol)
+    # the utility targets add up to the MER targets, the balanced grand
+    # composite curve is non-negative and zero at the pinch, the balanced
+    # composite curves end at the same heat, and the area is finite
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        utilities = t.utility_targets()
+        area = t.area_target(utilities)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert_allclose([sum(u.duty for u in utilities if u.heating),
+                     sum(u.duty for u in utilities if not u.heating)],
+                    [t.Q_hot, t.Q_cold], rtol=1e-9, atol=t._tol)
+    T, B = t.balanced_grand_composite_curve(utilities)
+    assert B.min() >= -t._tol and B[T == t.pinch_T].min() <= t._tol
+    hot_T, hot_H, cold_T, cold_H = t.balanced_composite_curves(utilities)
+    assert_allclose(hot_H[-1], cold_H[-1], rtol=1e-9)
+    assert 0. < area < math.inf
 
 def test_contributions():
     assert 'approach_contributions' in inspect.signature(_problem_table).parameters
@@ -547,9 +563,129 @@ def test_pricing_is_isolated():
     assert fuel.cost == pytest.approx(fresh_price(fuel.duty, fuel.T_in, fuel.T_out, gas)[0],
                                       rel=1e-12)
     assert registered() == registry
+    assert '_hensmith_targets' not in bst.Flowsheet.flowsheet.__dict__
     for a, (dump, items) in zip(agents, dumps):
         assert a.utility_stream_dump is dump and a.utility_stream_dump == items
     assert fresh_price(10 * kW, 450., 500., gas)[0] == before
+
+def vacuum_condenser(name, T_sat):
+    """A vacuum condenser and a liquid cooler of water: 40 kmol/hr of vapour
+    condensed at `T_sat` [K] (from 0.5 K above it) and 20 kmol/hr of liquid
+    cooled from 345 K to `T_sat`."""
+    test_hxn_targets.setup(name, ['Water'])
+    P = bst.settings.chemicals.Water.Psat(T_sat)
+    vapour = bst.Stream(name + '_vapour', Water=40., T=T_sat + .5, P=P, phase='g')
+    condenser = bst.HXutility(name + '_condenser', ins=vapour, V=0., rigorous=True)
+    liquid = bst.Stream(name + '_liquid', Water=20., T=345., P=3e5)
+    cooler = bst.HXutility(name + '_cooler', ins=liquid, T=T_sat, rigorous=False)
+    condenser.simulate()
+    cooler.simulate()
+    return [condenser, cooler]
+
+@pytest.mark.parametrize('T_sat', [316., 330.])
+def test_sensible_line_condenser(T_sat):
+    # cooling water serves a condenser at the cold end of its stretch:
+    # priced from the warm end alone (biosteam's rule) it would leave at its
+    # limit, 324.817 K, passing the condensing temperature with most of its
+    # duty taken (the balanced composites would cross)
+    t = targets_of(vacuum_condenser(f'test_targeting_vacuum_{T_sat:.0f}', T_sat), 10.)
+    dT, CW = bst.HeatUtility.dT, agent('cooling_water')
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        utilities = t.utility_targets()
+        area = t.area_target(utilities)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    (u,) = utilities
+    assert u.ID == 'cooling_water' and u.duty == pytest.approx(t.Q_cold, rel=1e-12)
+    # the highest outlet of a line that has taken H when it passes the knot
+    # (T, H) of the hot composite at T - dT or below: the series minimum flow
+    hot_T, hot_H, _, _ = t.composite_curves()
+    knot = hot_H > 0.
+    bound = CW.T + np.min((hot_T[knot] - dT - CW.T) * hot_H[-1] / hot_H[knot])
+    T_out = min(CW.T_limit, bound)
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-9)
+    priced = fresh_price(-u.duty, min(u.T_in, bound + dT), u.T_out, CW)[0]
+    assert u.cost == pytest.approx(priced, rel=1e-9)
+    warm_end = fresh_price(-u.duty, u.T_in, u.T_out, CW)[0]
+    if T_sat == 316.:
+        assert T_out < T_sat - dT + 1. and u.cost > 3 * warm_end
+    else:
+        assert u.T_utility_out == CW.T_limit and u.cost == warm_end
+    # the line keeps dT below the hot composite, so the area is finite, at
+    # any T_min_app
+    curves = t.balanced_composite_curves(utilities)
+    assert min_vertical_gap(*curves) >= dT - 1e-6
+    assert 0. < area < math.inf
+    for T_min_app in (2., 20.):
+        assert 0. < t.at(T_min_app).area_target() < math.inf
+
+def test_sensible_line_constant_cp():
+    dT = bst.HeatUtility.dT
+    # cooling water: 40 of its 64 kW are below 316 K
+    t = targets('test_targeting_line_water', [('H1', 340., 312.372, 1.),
+                                              ('H2', 316., 312.372, 10.)], 10.)
+    CW = agent('cooling_water')
+    (u,) = t.utility_targets()
+    q = 340. - 312.372 + 10. * (316. - 312.372)
+    assert u.duty / kW == pytest.approx(q, rel=1e-9)
+    T_out = CW.T + (316. - dT - CW.T) * q / (q - (340. - 316.))
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-9) and T_out < 315.
+    assert u.cost == pytest.approx(fresh_price(-u.duty, T_out + dT, u.T_out, CW)[0],
+                                   rel=1e-9)
+    curves = t.balanced_composite_curves([u])
+    assert min_vertical_gap(*curves) == pytest.approx(dT, abs=1e-6)
+    assert 0. < t.area_target([u]) < math.inf
+    # a sensible heating agent against a concave cold composite: 110 of the
+    # 180 kW of a hot oil (480 -> 420 K at most) are above 460 K
+    t = targets('test_targeting_line_oil', [('C1', 390., 470., 1.),
+                                            ('C2', 460., 470., 10.)], 10.)
+    oil = bst.UtilityAgent('test_targeting_hot_oil', Water=1, T=480., P=5e6,
+                           phase='l', thermo=bst.HeatUtility.thermo_water,
+                           T_limit=420., heat_transfer_price=1e-6)
+    (u,) = t.utility_targets([oil], [])
+    assert (u.ID, u.T_in, u.T_out) == ('test_targeting_hot_oil', 390., 470.)
+    T_out = oil.T - (oil.T - dT - 460.) * 180. / 110.
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-9) and T_out > 455.
+    cost, utility_duty, priced = fresh_price(u.duty, T_out - dT, u.T_out, oil)
+    assert (u.cost, u.utility_duty) == (pytest.approx(cost, rel=1e-12),
+                                        pytest.approx(utility_duty, rel=1e-12))
+    assert priced == pytest.approx(T_out, rel=1e-12)
+    curves = t.balanced_composite_curves([u])
+    assert min_vertical_gap(*curves) == pytest.approx(dT, abs=1e-6)
+    assert 0. < t.area_target([u]) < math.inf
+
+def test_pricing_temperatures():
+    dT = bst.HeatUtility.dT
+    # the hot stream's top, 445 K shifted, is above every cold stream: medium
+    # pressure steam serves C1 up to its outlet, 440 K
+    t = targets('test_targeting_ends', [('H1', 455., 300., 1.),
+                                        ('C1', 330., 440., 3.)], 10.)
+    MP = by_ID(t.utility_targets())['medium_pressure_steam']
+    assert (MP.T_in, MP.T_out) == (pytest.approx(407.189, abs=1e-9), 440.)
+    # with approach contributions, the temperatures of the streams served:
+    # the outlet within the agent's limit, as biosteam requires
+    rng = np.random.default_rng(11)
+    for n in range(24):
+        rows = []
+        for i in range(int(rng.integers(2, 6))):
+            a, b = rng.uniform(290., 520., 2).round(1)
+            if abs(a - b) < 2.: b = a + 5.
+            rows.append((('H' if a > b else 'C') + str(i), float(a), float(b),
+                         round(float(rng.uniform(.1, 5.)), 2)))
+        contributions = {ID: round(float(rng.uniform(.5, 15.)), 1)
+                         for ID, *_ in rows if rng.random() < .6}
+        t = targets(f'test_targeting_ends_{n}', rows,
+                    float(rng.choice([1., 5., 10., 20.])),
+                    approach_contributions=contributions or None)
+        for u in t.utility_targets():
+            a = u.agent
+            if a is None or a.isfuel: continue
+            if u.heating:
+                assert u.T_in <= u.T_out and u.T_out + dT <= a.T - a.dT + 1e-6
+                if a.T_limit: assert u.T_utility_out >= u.T_in + dT - 1e-6
+            else:
+                assert u.T_in >= u.T_out and u.T_out - dT >= a.T + a.dT - 1e-6
+                if a.T_limit: assert u.T_utility_out <= u.T_in - dT + 1e-6
 
 # %% Area, units, capital and total annualized cost
 
@@ -757,7 +893,7 @@ def test_capital_target_formula():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
         zero = t.at(0.).summary()
-    assert any('zero driving force' in str(w.message) for w in caught)
+    assert any('non-positive driving force' in str(w.message) for w in caught)
     assert zero['area'] == zero['installed_cost'] == zero['TAC'] == math.inf
     assert zero['Q_hot'] < t.Q_hot
     with pytest.raises(ValueError, match='heat_exchanger_type must be one of'):

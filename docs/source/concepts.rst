@@ -393,13 +393,31 @@ two differ only at exact equality.
 utility over the stretch it serves: from its level to the next zero of the
 **balanced grand composite curve** (the cascade net of the utilities), which
 is the pinch or a *utility pinch* where a lower agent is used to its limit.
-The process temperatures of that stretch are its shifted temperatures plus the
-largest shift of the cold streams in it (heating) or the smallest shift of the
-hot streams (cooling) -- exactly the streams' own temperatures without
-approach contributions, an approximation with them. A sensible agent's outlet
-therefore follows the temperatures it actually serves. BioSTEAM divides each
-duty by the agent's heat transfer efficiency, so a target's ``utility_duty``
-is utility side while its ``duty``, like the MER targets, is process side.
+A target's ``T_in`` and ``T_out`` are the real temperatures of the streams it
+serves in that stretch: the coldest and the hottest for heating, the hottest
+and the coldest for cooling. Without approach contributions they are the
+stretch's ends where streams reach them, and in every case ``T_out`` is within
+the agent's limit. BioSTEAM prices a latent agent and fuel from them.
+
+A **sensible** agent, such as cooling water, warms (or cools) along a line as
+it takes its duty, and BioSTEAM checks that line only at the process inlet: a
+coolant leaves at ``T_in - dT`` or at its limit, whichever is lower. Inside
+the stretch the line must keep ``dT`` from the process too. Cooling water that
+serves a condenser at the cold end of its stretch, say, has taken most of its
+duty by the time it passes the condensing temperature, so it must leave well
+below ``T_in - dT``. At each point of the stretch the agent has taken at least
+the duty less the balanced heat flowing there (on the grand composite curve:
+its line stays inside the curve, as a non-isothermal utility's does in pinch
+analysis), and that bounds its outlet. hensmith prices the agent at the
+highest outlet the bound allows (the lowest, for heating), by giving BioSTEAM
+the matching inlet. Its flow, and therefore its cost, is then the least a
+single stream of the agent needs. With approach contributions the bound takes,
+at each point, the lowest real temperature of the hot streams there (the
+highest of the cold ones), which is conservative.
+
+BioSTEAM divides each duty by the agent's heat transfer efficiency, so a
+target's ``utility_duty`` is utility side while its ``duty``, like the MER
+targets, is process side.
 Each pricing uses fresh utility streams in a temporary flowsheet: the costs
 are deterministic, and the user's flowsheet, the agents and their later costs
 are untouched.
@@ -442,8 +460,8 @@ inside an interval, so the sum is exact. hensmith takes :math:`h_j` = 1
 kW/m²/K for every stream and utility by default, which gives any pair
 BioSTEAM's heuristic overall coefficient of 0.5 kW/m²/K (condensing against
 boiling, where BioSTEAM takes 1.0, is not reproduced); ``h=`` and
-``h_utilities=`` set others. A zero driving force anywhere makes the area
-infinite, with a ``RuntimeWarning``, as at ``T_min_app = 0``.
+``h_utilities=`` set others. A zero or negative driving force anywhere
+makes the area infinite, with a ``RuntimeWarning``, as at ``T_min_app = 0``.
 
 **Units.** A network of :math:`S` streams and utilities that forms one
 connected component needs at least :math:`S - 1` units (Euler's rule). The

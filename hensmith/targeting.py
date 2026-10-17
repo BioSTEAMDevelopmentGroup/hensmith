@@ -60,8 +60,8 @@ _INTEREST, _YEARS, _OPERATING_HOURS = 0.10, 10, 8000.
 #: Default minimum approach temperatures of `supertarget` [K].
 _T_MIN_APPS = np.arange(1., 41.)
 
-#: A vertical temperature difference at or below this is a zero driving
-#: force [K].
+#: A vertical temperature difference at or below this is no driving force
+#: [K].
 _DT_ZERO = 1e-9
 
 #: The options of `PinchTargets.summary` (and `supertarget`).
@@ -102,8 +102,11 @@ flow : float
 cost : float
     Cost of the utility [USD/hr], from biosteam; nan when unserved.
 T_in, T_out : float
-    Process temperatures at which the utility was priced [K]: the inlet and
-    outlet of the stretch of the process it serves.
+    Process temperatures of the stretch it serves [K]: the real temperatures
+    of the streams it serves there, the coldest and the hottest (heating) or
+    the hottest and the coldest (cooling). biosteam prices the utility from
+    them, a sensible agent from the inlet that keeps its line ``dT`` from
+    the process (see Notes of `PinchTargets`).
 T_utility_in, T_utility_out : float
     Inlet and outlet temperature of the agent [K], from the priced
     `HeatUtility`; nan when unserved.
@@ -264,15 +267,22 @@ def _isolated_pricing(agents):
     `utility_stream_dump` is replaced by a new empty list (so every pricing
     gets fresh utility streams, and the costs do not depend on what was
     priced before) and new streams are registered in a temporary flowsheet;
-    the original dumps are restored on exit.
+    the original dumps, and biosteam's registry of flowsheets, are restored
+    on exit.
     """
     dumps = {id(a): (a, a.utility_stream_dump) for a in agents}
+    flowsheets = bst.Flowsheet.flowsheet.__dict__
+    ID = '_hensmith_targets'
+    missing = object()
+    previous = flowsheets.get(ID, missing)
     try:
         for a, _ in dumps.values(): a.utility_stream_dump = []
-        with bst.Flowsheet('_hensmith_targets'):
+        with bst.Flowsheet(ID):
             yield
     finally:
         for a, dump in dumps.values(): a.utility_stream_dump = dump
+        if previous is missing: flowsheets.pop(ID, None)
+        else: flowsheets[ID] = previous
 
 def _unit_label(unit):
     """``unit.ID``, or ``'<owner.ID> - <unit.ID>'`` for an auxiliary unit."""
@@ -288,6 +298,11 @@ def _utility_member(u):
         return np.array([T]), np.array([0.]), np.array([u.duty])
     return (np.array([T_a, T_b]), np.array([0., u.duty]),
             np.array([0., u.duty]))
+
+def _sensible(agent):
+    """Whether biosteam prices `agent` by its sensible heat: a non-fuel
+    agent with a temperature limit."""
+    return agent is not None and not agent.isfuel and bool(agent.T_limit)
 
 def _euler(regions):
     """Euler's S - 1 per connected component of the members of `regions`
@@ -365,7 +380,7 @@ def _bath(hot, cold):
     exact on the stretches between the breakpoints of both curves, where
     both and every member are linear. A hot stretch at infinite temperature
     (fuel) takes no area. inf with a RuntimeWarning at a driving force of
-    `_DT_ZERO` or less.
+    `_DT_ZERO` or less (a zero or negative one).
     """
     if not (hot[0].size and cold[0].size): return 0.
     end = min(hot[1][-1], cold[1][-1])
@@ -385,8 +400,8 @@ def _bath(hot, cold):
     zero = np.flatnonzero(np.minimum(d1, d2) <= _DT_ZERO)
     if zero.size:
         k = zero[0]
-        warn('vertical heat transfer at zero driving force between H = '
-             f'{x[k]:.6g} and {y[k]:.6g} kJ/hr', RuntimeWarning)
+        warn('vertical heat transfer at a non-positive driving force between '
+             f'H = {x[k]:.6g} and {y[k]:.6g} kJ/hr', RuntimeWarning)
         return math.inf
     with np.errstate(divide='ignore', invalid='ignore'):
         LMTD = np.where(np.abs(d1 - d2) <= 1e-12 * np.maximum(d1, d2), d1,
@@ -608,15 +623,29 @@ class PinchTargets:
 
     Each agent is priced as one biosteam heat utility over the stretch it
     serves, from its level to the next zero of the balanced curve (the
-    pinch, or a utility pinch), at real temperatures: shifted ones plus the
-    largest shift of the cold streams there (heating) or the smallest of the
-    hot streams (cooling), exactly the streams' own temperatures without
-    approach contributions and an approximation with them. So a sensible
-    agent's outlet follows the temperatures it actually serves, and biosteam
-    divides the duty by the agent's heat transfer efficiency. Pricing uses
-    fresh utility streams in a temporary flowsheet: costs are
-    deterministic, and the flowsheet's registry and the agents' stream dumps
-    are untouched.
+    pinch, or a utility pinch). Its `T_in` and `T_out` are the real
+    temperatures of the streams it serves there (the cold streams with heat
+    above the pinch, or the hot streams with heat below it): the coldest and
+    the hottest for heating, the hottest and the coldest for cooling. They
+    are the stretch's ends without approach contributions (where a stream
+    reaches them), and `T_out` is within the agent's limit. biosteam prices
+    a latent agent and fuel from them (the flue leaves at least ``dT``
+    above `T_in`), but checks a sensible agent's outlet only against
+    `T_in`, while its line must keep ``dT`` from the process over the whole
+    stretch (cooling water serving a condenser at the cold end of its
+    stretch must leave ``dT`` below the condensing temperature). At each
+    position p of the stretch, the agent takes at least ``x = q - B(p)`` of
+    its duty q below p (gives it above p, for heating), B being the
+    balanced heat flow at p. Its outlet is therefore at most
+    ``agent.T + min_p (T(p) - dT - agent.T) * q / x`` for cooling and at
+    least ``agent.T - min_p (agent.T - dT - T(p)) * q / x`` for heating,
+    T(p) being the lowest real temperature of the served hot streams at p
+    (the highest of the cold ones): its line stays inside the grand
+    composite curve, as a non-isothermal utility's does in pinch analysis.
+    biosteam is given the inlet that gives this outlet, and divides the
+    duty by the agent's heat transfer efficiency. Pricing uses fresh
+    utility streams in a temporary flowsheet: costs are deterministic, and
+    the flowsheet's registry and the agents' stream dumps are untouched.
 
     *Balanced composite curves.* `balanced_composite_curves` adds the
     utilities to the real composites (heating ones to the hot composite,
@@ -637,7 +666,8 @@ class PinchTargets:
     biosteam takes 1, is not reproduced). The sum is exact on the
     piecewise-linear curves, a stream's share of a stretch being linear in
     the heat. Fuel takes no area, and the area is inf (with a
-    RuntimeWarning) at a zero driving force, as at ``T_min_app = 0``.
+    RuntimeWarning) at a zero or negative driving force, as at
+    ``T_min_app = 0``.
 
     *Units target.* `units_target` applies Euler's N = S - 1 to each region
     of the balanced grand composite curve between its zeros (the process
@@ -1048,17 +1078,59 @@ class PinchTargets:
                 remaining -= q
         return allocated, remaining
 
-    def _offset(self, lo, hi, heating):
-        """The pricing offset of a utility serving shifted [lo, hi]: the
-        largest shift of the cold streams overlapping it (heating; 0 if
-        none) or the smallest of the hot ones (cooling; `T_min_app`)."""
+    def _served(self, heating):
+        """``(top, bottom, shift)`` of the streams a heating agent can serve
+        (the cold streams with heat above the pinch) or a cooling one (the
+        hot streams with heat below it): shifted temperatures [K] and shifts
+        [K]."""
         grid = self.grid
+        above, below = self._side_heat()
+        if heating: j = np.flatnonzero(~self.is_hot & (above > self._tol))
+        else: j = np.flatnonzero(self.is_hot & (below > self._tol))
         Ts = grid['Ts']
-        overlap = (Ts[grid['k_hi']] > lo) & (Ts[grid['k_lo']] < hi)
-        overlap &= ~self.is_hot if heating else self.is_hot
-        if not overlap.any(): return 0. if heating else self.T_min_app
-        s = self.shift[overlap]
-        return float(s.max() if heating else s.min())
+        return Ts[grid['k_hi'][j]], Ts[grid['k_lo'][j]], self.shift[j]
+
+    def _ends(self, served, lo, hi, heating):
+        """
+        ``((T_in, T_out), overlap)`` of a utility serving shifted [lo, hi]:
+        the real temperatures [K] of the `served` streams overlapping the
+        stretch (`overlap`, a mask), the coldest and the hottest (heating;
+        the hottest and the coldest for cooling); the stretch's ends plus 0
+        (heating) or `T_min_app` (cooling) if none overlaps it.
+        """
+        top, bottom, s = served
+        overlap = (top > lo) & (bottom < hi)
+        if not overlap.any():
+            if heating: return (lo, hi), overlap
+            return (hi + self.T_min_app, lo + self.T_min_app), overlap
+        s = s[overlap]
+        cold = float(np.min(np.maximum(bottom[overlap], lo) + s))
+        hot = float(np.max(np.minimum(top[overlap], hi) + s))
+        return ((cold, hot) if heating else (hot, cold)), overlap
+
+    def _line_limit(self, agent, heating, q, T, B, served):
+        """
+        The limit [K] on the outlet of the sensible `agent` serving `q` from
+        the positions of its stretch (shifted temperatures `T` and balanced
+        heat flow `B`): the lowest outlet (heating; the highest for cooling)
+        at which its line, linear in its heat, stays `dT` from the `served`
+        streams present at each position (see Notes of the class); None if
+        no position bounds it.
+        """
+        top, bottom, s = served
+        # the heat the agent has at least given above each position (heating)
+        # or taken below it (cooling): the rest of the heat flowing there
+        x = q - B
+        present = (bottom - _T_EQ <= T[:, None]) & (T[:, None] <= top + _T_EQ)
+        bound = (x > self._tol) & present.any(axis=1)
+        if not bound.any(): return None
+        dT = bst.HeatUtility.dT
+        x, T, present = x[bound], T[bound], present[bound]
+        if heating:
+            T_process = T + np.where(present, s, -math.inf).max(axis=1)
+            return agent.T - float(np.min((agent.T - dT - T_process) * q / x))
+        T_process = T + np.where(present, s, math.inf).min(axis=1)
+        return agent.T + float(np.min((T_process - dT - agent.T) * q / x))
 
     def utility_targets(self, heating_agents=None, cooling_agents=None):
         """
@@ -1113,40 +1185,57 @@ class PinchTargets:
         Ts, arr, lea = self._gcc()
         positions = _positions(Ts, arr, lea,
                                [l for l, _, _ in heat + cool if math.isfinite(l)])
-        zero = _balance(positions, [(l, q) for l, q, _ in heat],
-                        [(l, q) for l, q, _ in cool]) <= tol
+        B = _balance(positions, [(l, q) for l, q, _ in heat],
+                     [(l, q) for l, q, _ in cool])
+        zero = B <= tol
         T = positions[0]
+        dT = bst.HeatUtility.dT
         utilities = []
         with _isolated_pricing([a for *_, a in heat + cool if a is not None]):
+            served = self._served(True)
             for level, q, agent in heat:
                 g = _gap(positions, level)
                 z = np.flatnonzero(zero[g:])
-                lo = float(T[g + z[0]]) if z.size else self.pinch_T
+                end = g + z[0] + 1 if z.size else T.size
+                lo = float(T[end - 1]) if z.size else self.pinch_T
                 hi = min(level, float(Ts[0]))
-                o = self._offset(lo, hi, True)
-                utilities.append(self._utility(agent, True, level, q,
-                                               lo + o, hi + o))
+                (T_in, T_out), overlap = self._ends(served, lo, hi, True)
+                T_priced = T_in
+                if _sensible(agent):
+                    limit = self._line_limit(agent, True, q, T[g:end], B[g:end],
+                                             [x[overlap] for x in served])
+                    if limit is not None: T_priced = max(T_in, limit - dT)
+                utilities.append(self._utility(agent, True, level, q, T_in,
+                                               T_out, T_priced))
+            served = self._served(False)
             for level, q, agent in cool:
                 g = _gap(positions, level)
                 z = np.flatnonzero(zero[:g])
-                hi = float(T[z[-1]]) if z.size else self.pinch_T
+                start = int(z[-1]) if z.size else 0
+                hi = float(T[start]) if z.size else self.pinch_T
                 lo = max(level, float(Ts[-1]))
-                o = self._offset(lo, hi, False)
-                utilities.append(self._utility(agent, False, level, q,
-                                               hi + o, lo + o))
+                (T_in, T_out), overlap = self._ends(served, lo, hi, False)
+                T_priced = T_in
+                if _sensible(agent):
+                    limit = self._line_limit(agent, False, q, T[start:g],
+                                             B[start:g],
+                                             [x[overlap] for x in served])
+                    if limit is not None: T_priced = min(T_in, limit + dT)
+                utilities.append(self._utility(agent, False, level, q, T_in,
+                                               T_out, T_priced))
         return utilities
 
     @staticmethod
-    def _utility(agent, heating, level, q, T_in, T_out):
+    def _utility(agent, heating, level, q, T_in, T_out, T_priced):
         """The `UtilityTarget` of `agent` serving `q` from `T_in` to `T_out`
-        (process temperatures), priced as one biosteam heat utility (inside
-        `_isolated_pricing`)."""
+        (process temperatures), priced as one biosteam heat utility from
+        `T_priced` to `T_out` (inside `_isolated_pricing`)."""
         if agent is None:
             nan = math.nan
             return UtilityTarget(None, None, heating, level, q, nan, nan, nan,
                                  T_in, T_out, nan, nan)
         hu = bst.HeatUtility()
-        hu(q if heating else -q, T_in, T_out, agent=agent)
+        hu(q if heating else -q, T_priced, T_out, agent=agent)
         return UtilityTarget(agent.ID, agent, heating, level, q, abs(hu.duty),
                              abs(hu.flow), hu.cost, T_in, T_out,
                              hu.inlet_utility_stream.T,
@@ -1358,8 +1447,9 @@ class PinchTargets:
         Returns
         -------
         float
-            The area [m²]: inf (with a RuntimeWarning) at a zero driving
-            force, nan if part of a utility target is unserved.
+            The area [m²]: inf (with a RuntimeWarning) at a zero or
+            negative driving force, nan if part of a utility target is
+            unserved.
 
         """
         if utilities is None: utilities = self.utility_targets()
