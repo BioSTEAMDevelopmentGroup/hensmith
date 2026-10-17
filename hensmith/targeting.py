@@ -652,7 +652,13 @@ class PinchTargets:
     table : ProblemTable
         The problem table.
     grid : dict
-        The table's grid (see `hensmith.hxn_synthesis._problem_table`).
+        The table's grid: 'Ts', its shifted temperatures [K] (descending,
+        n); 'shift', as `shift`; 'contributions', each stream's approach
+        temperature contribution [K] (N); 'Hl' and 'Hr', (N, n) each
+        stream's enthalpy [kJ/hr] at every grid temperature, the left (low
+        enthalpy) and right (high enthalpy) limit, which differ only at a
+        point load of the stream; 'k_hi' and 'k_lo', (N,) the grid indices
+        of each stream's own upper and lower temperature.
     shift : numpy.ndarray
         (N,) shift of each stream [K]: its real temperature at shifted
         temperature T* is ``T* + shift[j]``.
@@ -663,8 +669,10 @@ class PinchTargets:
         Shifted pinch temperature [K].
     cut : str
         'below' or 'above': the side of the pinch to which the point loads
-        at the pinch temperature belong (see
-        `hensmith.hxn_synthesis._pinch_cut`).
+        at the pinch temperature belong. It is 'below' when the zero heat
+        flow of the cascade is the flow arriving at `pinch_T` (before those
+        point loads), 'above' when it is the flow leaving it (after them),
+        and always 'below' for a threshold problem with no hot utility.
     heat_utilities : list[HeatUtility] or None
         The heat utilities the streams were taken from, in stream order;
         None when built from streams. For `HeatExchangerNetwork.targets`
@@ -2014,9 +2022,12 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     (below the threshold of a threshold problem, where neither the utilities
     nor the balanced composite curves change), the TACs differ only by the
     discretization of the streams' curves on the problem table's grid, by
-    a tiny relative amount, and the optimum is an arbitrary point of that
-    flat stretch: compare the TACs of its neighbors before reading anything
-    into its position.
+    a tiny relative amount, and where the optimum lies in that flat stretch
+    means nothing physically. Where the discretization trend is steady, it
+    lies at an end of the stretch (for the quickstart system of the
+    tutorial, the warmest point evaluated, just short of the threshold):
+    compare the TACs of its neighbors before reading anything into its
+    position.
 
     Unless `operating_hours` or `tea` is given, the operating hours are
     those of ``targets.system`` if it has them (see `PinchTargets.summary`).

@@ -246,11 +246,14 @@ change with ``T_min_app``, and neither does any target. The TACs at 1 and at
 effect: the problem table's grid moves with ``T_min_app`` over the curved
 (vapor-liquid) profiles of the streams, and the area follows it, too little
 to show in the table (6836 m² at both). Every ``T_min_app`` of that flat
-stretch is an optimum; the refinement happens to report the last one it
-evaluated, 1.848 K (inside the sweep, not at its bound). The real step comes at the next point, 1.853 K: the cold utility
-appears and needs a unit of its own (6 units), which adds about 12000 USD/yr
-to the TAC. Between 10 and 15 K, where chapter 4's sweep saw the pinch move to
-the column condenser's vapor inlet, the units target jumps to 9.
+stretch is an optimum but for these few USD/yr. The area, and with it the TAC,
+falls steadily across the stretch as the grid moves, so the least TAC is always
+the warmest point evaluated below the threshold, here 1.848 K (inside the
+sweep, not at its bound), 0.005 K short of the step. That step comes at the
+next point, 1.853 K: the cold utility appears and needs a unit of its own (6
+units), which adds about 12000 USD/yr to the TAC. Between 10 and 15 K, where
+chapter 4's sweep saw the pinch move to the column condenser's vapor inlet,
+the units target jumps to 9.
 
 .. figure:: /_static/images/examples/tutorial_05_supertargets.png
    :class: white-bg

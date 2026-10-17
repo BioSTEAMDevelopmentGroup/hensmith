@@ -498,9 +498,10 @@ divide it, and every unit added adds cost. BioSTEAM's correlations are not of
 that form: a double pipe exchanger below 150 ft² costs at most about 8,100
 USD installed, a shell and tube at 150 ft² about 64,700 USD. An equal division
 can then put every shell below 150 ft², so that a utility of a few watts that
-adds units would cut the capital target by most of it (KEMP at 5.56 K: seven
-double pipes instead of four floating heads, a fifth of the cost), although a
-network just adds a small exchanger and keeps its large ones. So when the
+adds units would cut the capital target by most of it (the four-stream problem
+of Linnhoff & Hindmarsh at 5.56 K: seven double pipes instead of four floating
+heads, a fifth of the cost), although a network just adds a small exchanger
+and keeps its large ones. So when the
 equal division puts the shells below 150 ft² and the area fills
 :math:`k = \lfloor A / 150\ \mathrm{ft^2} \rfloor \geq 1` shells of at least
 150 ft², the target is the costlier of the :math:`N` double pipes and of
@@ -546,8 +547,10 @@ equal shells place only roughly. Where the targets do
 not depend on ``T_min_app`` -- below the threshold of a threshold problem, the
 utilities and the balanced composite curves stay the same -- the costs differ
 only by the discretization of the curves, by a tiny relative amount (4e-7
-of the total cost for the quickstart system), so the optimum is an arbitrary
-point of that flat stretch. A sweep with no finite
+of the total cost for the quickstart system), so where the optimum lies in
+that flat stretch means nothing physically; where the discretization trend is
+steady, it lies at an end of the stretch (for the quickstart system, the
+warmest point evaluated, just short of the threshold). A sweep with no finite
 total cost (an unserved utility everywhere, say) is not refined and warns that
 its optimum is meaningless. With approach
 contributions, only the unspecified streams follow ``T_min_app``;
