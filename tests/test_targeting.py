@@ -513,9 +513,15 @@ def test_unserved_warns():
         assert u.agent is None
         assert all(math.isnan(x) for x in (u.cost, u.flow, u.utility_duty,
                                            u.T_utility_in, u.T_utility_out))
-    # the unserved heat is missing from the balanced composites
-    hot_T, hot_H, cold_T, cold_H = t.balanced_composite_curves(utilities)
-    assert_allclose(cold_H[-1] - hot_H[-1], (32.811 - 12.372) * kW, rtol=1e-9)
+    # the unserved heat is missing from the balanced composites: the
+    # unserved cooling, the coldest of the cold side, is a gap at the start
+    # of the cold one (which keeps the curves aligned, dT apart at cooling
+    # water), the unserved heating one at the end of the hot one
+    curves = t.balanced_composite_curves(utilities)
+    hot_T, hot_H, cold_T, cold_H = curves
+    assert hot_H[0] == 0. and cold_H[0] == pytest.approx(12.372 * kW, rel=1e-9)
+    assert_allclose(cold_H[-1] - hot_H[-1], 32.811 * kW, rtol=1e-9)
+    assert min_vertical_gap(*curves) == pytest.approx(bst.HeatUtility.dT, abs=1e-6)
     # so the area, the capital cost and the total annualized cost are nan
     assert math.isnan(t.area_target(utilities))
     assert math.isnan(t.capital_cost_target(utilities)['installed_cost'])
@@ -1509,6 +1515,31 @@ def test_facility_targets_bitwise(kemp_hxn, kemp_hxn_replaced):
     with pytest.raises(RuntimeError, match='before targeting'):
         HeatExchangerNetwork('test_targeting_alone').targets()
 
+def test_facility_targets_reversed_stream():
+    # C1 made a cooler after the synthesis, simulated alone or with the
+    # cached network reused: the targets take it as a hot stream at its
+    # current state, as those of the units' heat utilities do
+    for k, cache_network in enumerate((False, True)):
+        units = cp_units(f'test_targeting_reversed_{k}', KEMP, K)
+        sys, HXN = simulate_HXN(units, 10., cache_network=cache_network)
+        assert list(HXN.targets().is_hot) == [False, False, True, True]
+        C1 = units[0]
+        C1.T = C1.ins[0].T - 20.
+        if cache_network:
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                sys.simulate()
+            assert HXN.original_heat_exchangers[0] is C1 # not synthesized again
+        else:
+            C1.simulate()
+        t = HXN.targets()
+        assert t.labels == ['C1', 'C3', 'H2', 'H4']
+        assert list(t.is_hot) == [True, False, True, True]
+        fresh = PinchTargets.from_heat_utilities([u.heat_utilities[0] for u in units], 10.)
+        assert t.Q_hot == pytest.approx(fresh.Q_hot, abs=1e-6)
+        assert t.Q_cold == pytest.approx(fresh.Q_cold, rel=1e-12)
+        assert t.Q_cold > 1e6 > HXN.synthesis_info['Q_cold_target']
+
 def test_facility_targets_replaced_callable():
     # replace_unit_heat_utilities overwrites the heat utilities a callable
     # reads (the network's utility, or none for H2 and C3, which the process
@@ -1955,17 +1986,69 @@ def test_plot_readability():
             assert [x.get_text() for x in ax.get_legend().get_texts()] == legend
         finally:
             plt.close(fig)
-    # the unserved remainders, without which the balanced curves end apart
+    # no utility on a threshold problem's other side: a plain 0
+    for kind in ('real', 'shifted'):
+        fig, ax = plot_composite_curves(threshold, kind=kind)
+        try:
+            label, = _gid_artists(ax, 'Hot utility')
+            assert label.get_text() == 'hot utility 0 kJ/hr'
+        finally:
+            plt.close(fig)
+    # the unserved remainders, without which the balanced curves end apart:
+    # the cold one starts at the unserved cooling, the coldest of its
+    # members, so the curves drawn do not cross (they keep dT apart at
+    # cooling water, as when it is all served)
     t = targets('test_targeting_plot_unserved', REF_A, 10.)
-    with pytest.warns(RuntimeWarning, match='left unserved'):
-        utilities = t.utility_targets([agent('low_pressure_steam')], [agent('cooling_water')])
-    fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
-    try:
-        label, = _gid_artists(ax, 'Utility:unserved')
-        assert label.get_text() == ('unserved heating 1.18E5 kJ/hr (not drawn)\n'
-                                    'unserved cooling 4.45E4 kJ/hr (not drawn)')
-    finally:
-        plt.close(fig)
+    texts = {True: ('unserved heating 1.18E5 kJ/hr (not drawn)\n'
+                    'unserved cooling 4.45E4 kJ/hr (not drawn)'),
+             False: 'unserved cooling 4.45E4 kJ/hr (not drawn)'}
+    for LP_only in (True, False):
+        heating = [agent('low_pressure_steam')] if LP_only else None
+        with pytest.warns(RuntimeWarning, match='left unserved'):
+            utilities = t.utility_targets(heating, [agent('cooling_water')])
+        fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
+        try:
+            label, = _gid_artists(ax, 'Utility:unserved')
+            assert label.get_text() == texts[LP_only]
+            hot, = _gid_artists(ax, 'Hot balanced composite')
+            cold, = _gid_artists(ax, 'Cold balanced composite')
+            (hot_H, hot_T), (cold_H, cold_T) = hot.get_data(), cold.get_data()
+            assert hot_H[0] == 0. and cold_H[0] == pytest.approx(12.372 * kW, rel=1e-9)
+            assert min_vertical_gap(hot_T, hot_H, cold_T, cold_H) == pytest.approx(
+                bst.HeatUtility.dT, abs=1e-6)
+        finally:
+            plt.close(fig)
+    # every utility label off both balanced composites: a sensible agent's
+    # beside the middle of its line (below right of the rising cold curve
+    # for cooling water and chilled water, above left of the hot curve for a
+    # hot oil), a latent one's by its flat and the furnace's above the end
+    oil = bst.UtilityAgent('test_targeting_plot_hot_oil', Water=1, T=480., P=5e6,
+                           phase='l', thermo=bst.HeatUtility.thermo_water,
+                           T_limit=420., heat_transfer_price=1e-6)
+    oiled = targets('test_targeting_plot_oil', [('C1', 390., 470., 1.),
+                                                ('C2', 460., 470., 10.)], 10.)
+    cases = [(threshold, None), (furnace, None), (oiled, oiled.utility_targets([oil], [])),
+             (liquids('test_targeting_plot_liquids')[1].targets(), None)]
+    for t, utilities in cases:
+        fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
+        try:
+            labels = _gid_artists(ax, 'Utility:') + _gid_artists(ax, 'Fuel')
+            assert any(not (u.agent.isfuel or u.agent.T_limit is None)
+                       for u in utilities or t.utility_targets())
+            curves = [line for line in ax.get_lines()
+                      if 'balanced composite' in (line.get_gid() or '')]
+            assert len(curves) == 2
+            points = []
+            for line in curves:
+                xy = ax.transData.transform(np.column_stack(line.get_data()))
+                points += [np.linspace(a, b, 500) for a, b in zip(xy, xy[1:])]
+            points = np.concatenate(points)
+            for box, label in zip(boxes(fig, labels), labels):
+                inside = ((points[:, 0] >= box.x0) & (points[:, 0] <= box.x1)
+                          & (points[:, 1] >= box.y0) & (points[:, 1] <= box.y1))
+                assert not inside.any(), label.get_text()
+        finally:
+            plt.close(fig)
     # the grand composite curve at its default size: heats of six digits
     # [kJ/hr] in scientific notation, whose tick labels do not run together,
     # and every label off the curve (which meets the end of a step)
@@ -2011,5 +2094,20 @@ def test_plot_supertargets_gids(tmp_path):
         optimum, = _gid_artists(ax, 'Optimum')
         assert (optimum.get_xdata()[0], optimum.get_ydata()[0]) == (
             sweep.T_min_app, sweep.optimum['TAC'])
+        assert not sweep.at_bound and optimum.get_label() == 'optimum 10 K'
     finally:
         plt.close(fig)
+    # an optimum at an end of the sweep is labeled so; one without a finite
+    # TAC (an unserved utility everywhere) is not marked
+    at_bound = supertarget(t, [10., 20., 30.], refine=0)
+    with pytest.warns(RuntimeWarning):
+        unserved = supertarget(t, [5., 10.], heating_agents=[agent('low_pressure_steam')],
+                               cooling_agents=[agent('cooling_water')])
+    assert at_bound.at_bound and not np.isfinite(unserved['TAC']).any()
+    for sweep, labels in ((at_bound, ['optimum 10 K (at the bound)']), (unserved, [])):
+        fig, ax = plot_supertargets(sweep)
+        try:
+            assert [a.get_label() for a in _gid_artists(ax, 'Optimum')] == labels
+            assert len(ax.lines) == 3 + 2 * len(labels) # with the dashed line
+        finally:
+            plt.close(fig)

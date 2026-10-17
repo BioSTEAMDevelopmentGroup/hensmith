@@ -996,9 +996,16 @@ class HeatExchangerNetwork(bst.Facility):
         -----
         After a simulation, the streams are those of
         `original_heat_exchangers`, in the network's stream order, at the
-        units' current states: right after a synthesis, the energy targets
-        at the facility's `T_min_app` equal ``synthesis_info['Q_hot_target']``
-        and ``synthesis_info['Q_cold_target']`` bit for bit. A mapping of
+        units' current states, each hot or cold by its current direction (a
+        stream that has reversed since the synthesis, its unit simulated
+        alone or the network reused by `cache_network`, changes sides; one
+        without duty keeps its side): right after a synthesis, the energy
+        targets at the facility's `T_min_app` equal
+        ``synthesis_info['Q_hot_target']`` and
+        ``synthesis_info['Q_cold_target']`` bit for bit. The targets'
+        `heat_utilities` are `original_heat_utils`, which with
+        `replace_unit_heat_utilities` hold the network's utilities, not the
+        streams' (see `hensmith.targeting.PinchTargets`). A mapping of
         approach contributions is resolved again by the units of
         `original_heat_utils`, so a mapping changed since applies; a
         callable is not called again (with `replace_unit_heat_utilities`, the
@@ -1057,6 +1064,14 @@ class HeatExchangerNetwork(bst.Facility):
             hxs = self.original_heat_exchangers
             hus = self.original_heat_utils # in stream order
             cold = set(self.cold_indices)
+            # hot or cold by the current direction of each stream (the heat
+            # utility, which replace_unit_heat_utilities overwrites, cannot
+            # tell): a stream that has reversed since the synthesis changes
+            # sides, one without duty keeps its side
+            is_hot = []
+            for i, hx in enumerate(hxs):
+                dH = hx.outs[0].H - hx.ins[0].H
+                is_hot.append(dH < 0. if dH else i not in cold)
             x = self.approach_contributions
             if x is not None and not isinstance(x, Mapping) and callable(x):
                 # Never called again: with replace_unit_heat_utilities, the
@@ -1069,8 +1084,8 @@ class HeatExchangerNetwork(bst.Facility):
                 # by unit only, which the network never changes
                 contributions = self._network_contributions(hus)
             targets = PinchTargets._from_exchangers(
-                hxs, [i not in cold for i in range(len(hxs))], T_min_app,
-                contributions, self.force_ideal_thermo, None, hus)
+                hxs, is_hot, T_min_app, contributions, self.force_ideal_thermo,
+                None, hus)
             targets.system = self.system
             return targets
         if self.system is None and not self.units:

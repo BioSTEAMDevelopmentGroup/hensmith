@@ -452,7 +452,8 @@ curve -- gives two curves that span the same heat
 flat at its temperature, a sensible one a line between its inlet and outlet
 temperatures, and fuel a furnace that takes no area. If some utility is
 unserved, the curves cannot balance, and the area, capital and total cost
-targets are nan.
+targets are nan; the unserved cooling, the coldest part of the cold curve, is
+left out as a gap at its start, which keeps the two curves aligned.
 
 **Area.** The area target is Bath's formula (Townsend & Linnhoff, 1984) on
 the balanced composite curves: heat is transferred vertically, from the hot

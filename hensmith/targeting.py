@@ -666,7 +666,10 @@ class PinchTargets:
         `hensmith.hxn_synthesis._pinch_cut`).
     heat_utilities : list[HeatUtility] or None
         The heat utilities the streams were taken from, in stream order;
-        None when built from streams.
+        None when built from streams. For `HeatExchangerNetwork.targets`
+        after a simulation they are the facility's `original_heat_utils`,
+        which with `replace_unit_heat_utilities` hold the network's
+        utilities (the streams are read from the units).
     units : list[Unit] or None
         The unit of each stream (``hu.unit``), in stream order; None when
         built from streams.
@@ -754,7 +757,10 @@ class PinchTargets:
     cooling ones to the cold one), so both end at the same heat: a latent
     agent as a flat at its temperature, a sensible one as a line between its
     inlet and outlet temperatures, and fuel as a furnace at infinite
-    temperature. `balanced_grand_composite_curve` is the cascade net of the
+    temperature. An unserved remainder is left out: unserved cooling, the
+    coldest member of the cold composite, as a gap at its start (which
+    keeps the curves aligned), unserved heating as one at the end of the
+    hot composite. `balanced_grand_composite_curve` is the cascade net of the
     utilities, zero at the process pinch and at every utility pinch.
 
     *Area target.* `area_target` is Bath's formula [Townsend84]_ on the
@@ -1484,14 +1490,22 @@ class PinchTargets:
         -------
         hot_T, hot_H, cold_T, cold_H : numpy.ndarray
             Real temperatures [K] and cumulative heat [kJ/hr] of each
-            composite, ascending from 0; fuel is a last hot stretch at
-            ``T = inf``. Both end at the same heat unless part of a target is
-            unserved.
+            composite, ascending: the hot one from 0, with fuel as a last
+            stretch at ``T = inf``, and the cold one from the unserved
+            cooling (0 if none), the coldest of its members, which is left
+            out. The curves are thus aligned for vertical heat transfer, and
+            end at the same heat unless part of the heating target is
+            unserved (the hot one then ends short of the cold one by it).
 
         """
         if utilities is None: utilities = self.utility_targets()
         hot, cold = self._balanced_segments(utilities)
-        return (*_curve(hot), *_curve(cold))
+        hot_T, hot_H = _curve(hot)
+        cold_T, cold_H = _curve(cold)
+        unserved = sum([u.duty for u in utilities
+                        if u.agent is None and not u.heating], 0.)
+        if unserved: cold_H = cold_H + unserved
+        return hot_T, hot_H, cold_T, cold_H
 
     def _balanced_positions(self, utilities):
         """The constraint positions with the levels of every allocated
@@ -2468,6 +2482,11 @@ def network_report(HXN, targets=None, **options):
     }
 
 
+def _format_duty(H):
+    """A duty `H` [kJ/hr] for a plot label: '0', or as `_format_H` (three
+    significant digits, e.g. '1.18E5')."""
+    return '0' if H == 0. else _format_H(H)
+
 def _legend(label, H):
     """`label` for the legend if a curve of heats `H` has points, else none
     (a label starting with '_' stays out of the legend)."""
@@ -2520,8 +2539,11 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     end apart, nor without streams on one side (whose empty composite stays
     out of the legend). Fuel, at infinite temperature on the balanced
     curves, is labeled rather than drawn, and so is an unserved remainder
-    ('Utility:unserved', in the upper left corner), without which the
-    balanced curves end at different heats.
+    ('Utility:unserved', in the upper left corner): the cold balanced
+    composite starts at the unserved cooling, and the hot one ends short of
+    the cold one by the unserved heating. A label of a sensible agent sits
+    off the middle of its line, above left for heating and below right for
+    cooling.
 
     Examples
     --------
@@ -2574,12 +2596,12 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         for u in utilities:
             if u.agent is None:
                 unserved.append(f"unserved {'heating' if u.heating else 'cooling'} "
-                                f'{_format_H(u.duty)} kJ/hr (not drawn)')
+                                f'{_format_duty(u.duty)} kJ/hr (not drawn)')
                 continue
             if u.agent.isfuel:
                 fuels.append(u)
                 continue
-            label = f'{u.ID} {_format_H(u.duty)} kJ/hr'
+            label = f'{u.ID} {_format_duty(u.duty)} kJ/hr'
             T, H = (hot_T, hot_H) if u.heating else (cold_T, cold_H)
             if u.agent.T_limit is None:
                 # above a heating flat, ending at its warm end (left of it the
@@ -2594,11 +2616,16 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                     offset, ha, va = (2, -2), 'left', 'top'
                 x = H[min(max(i, 0), H.size - 1)]
                 if u.heating: above.append((x, T_u))
-            else: # beside the middle of a sensible agent's line
+            else:
+                # at the middle of a sensible agent's line, off the rising
+                # composite: above left of it for heating, below right of it
+                # for cooling (the other composite is on the far side)
                 T_u = 0.5 * (u.T_utility_in + u.T_utility_out)
                 x = np.interp(T_u, T, H)
-                offset = (-6, 0) if u.heating else (6, 0)
-                ha, va = 'right' if u.heating else 'left', 'center'
+                if u.heating:
+                    offset, ha, va = (-6, 4), 'right', 'bottom'
+                else:
+                    offset, ha, va = (6, -4), 'left', 'top'
             ax.annotate(label, xy=(x, T_u - 273.15), xytext=offset,
                         textcoords='offset points', ha=ha, va=va,
                         color=hot_color if u.heating else cold_color,
@@ -2610,7 +2637,7 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
             # above the label of the top flat if that ends there too
             stacked = any(abs(x - a) <= 1e-9 * (abs(x) + abs(a)) + 1e-12
                           and abs(y - b) <= 1e-6 for a, b in above)
-            ax.annotate(f'{u.ID} (furnace) {_format_H(u.duty)} kJ/hr',
+            ax.annotate(f'{u.ID} (furnace) {_format_duty(u.duty)} kJ/hr',
                         xy=(x, y - 273.15), xytext=(-2, 14) if stacked else (0, 4),
                         textcoords='offset points', ha='right', va='bottom',
                         color=hot_color, gid='Fuel', **text_kwargs)
@@ -2636,10 +2663,10 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         H_cold_end = cold_H[-1] if cold_H.size else targets.Q_cold
         ax.margins(y=0.12) # headroom for the utility labels
         ax.text(0.5 * (H_hot_end + H_cold_end), T_all.max() + 1.,
-                f'hot utility {_format_H(targets.Q_hot)} kJ/hr', ha='center',
+                f'hot utility {_format_duty(targets.Q_hot)} kJ/hr', ha='center',
                 va='bottom', gid='Hot utility', **text_kwargs)
         ax.text(0.5 * targets.Q_cold, T_all.min() - 1.,
-                f'cold utility {_format_H(targets.Q_cold)} kJ/hr', ha='left',
+                f'cold utility {_format_duty(targets.Q_cold)} kJ/hr', ha='left',
                 va='top', gid='Cold utility', **text_kwargs)
         pinch_T = targets.pinch_T
         tol = 1e-9 * pinch_T
@@ -2801,7 +2828,9 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     Notes
     -----
     Artists carry stable gids: 'TAC', 'Capital' (the annualized capital
-    cost), 'Operating' and 'Optimum'.
+    cost), 'Operating' and 'Optimum'. The optimum is labeled '(at the
+    bound)' if it is at an end of the sweep (`Supertargets.at_bound`), and
+    is not marked without a finite TAC.
 
     Examples
     --------
@@ -2843,10 +2872,13 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     ax.plot(T, sweep['operating_cost'], color='#d62728', lw=1.5,
             label='operating cost', gid='Operating')
     optimum = sweep.optimum
-    ax.axvline(optimum['T_min_app'], color='k', ls='--', lw=0.8)
-    ax.plot([optimum['T_min_app']], [optimum['TAC']], 'o', mfc='w', mec='k',
-            ms=7, zorder=4, label=f"optimum {optimum['T_min_app']:.3g} K",
-            gid='Optimum')
+    if math.isfinite(optimum['TAC']):
+        bound = ' (at the bound)' if sweep.at_bound else ''
+        ax.axvline(optimum['T_min_app'], color='k', ls='--', lw=0.8)
+        ax.plot([optimum['T_min_app']], [optimum['TAC']], 'o', mfc='w',
+                mec='k', ms=7, zorder=4,
+                label=f"optimum {optimum['T_min_app']:.3g} K{bound}",
+                gid='Optimum')
     ax.set_xlabel('$T_{min,app}$ [K]')
     ax.set_ylabel('cost [USD·yr$^{-1}$]')
     ax.legend(loc='best', fontsize=8)
