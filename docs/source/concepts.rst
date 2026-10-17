@@ -576,13 +576,23 @@ contribution scaling of Ahmad, Linnhoff & Smith (1990).
 synthesized network with its targets: utility cost, units, area, capital and
 total annualized cost. Its ``'area'`` re-sizes the network's exchangers like
 the target sizes them (the same film coefficients, a correction factor of 1,
-the integrated driving force along the exact stream profiles and the process
-side duty), so it is comparable with the target; ``'area_biosteam'`` is
-BioSTEAM's own sizing, which includes its correction factor, the terminal
-log-mean temperature difference and the utility side duty. The report checks
-that its targets and the network's streams are both of the units' current
-states: after a stream or a unit changes, it raises a ``ValueError`` until the
-system is simulated again. The comparison has limits:
+the integrated driving force along the streams' profiles as the targets'
+curves model them and the process side duty), so it is comparable with the
+target; ``'area_biosteam'`` is BioSTEAM's own sizing, which includes its
+correction factor, the terminal log-mean temperature difference and the
+utility side duty. An exchanger whose profiles meet or cross has an infinite
+``'area'``, and so has the network, with a ``RuntimeWarning`` naming it, while
+its ``'area_biosteam'`` stays finite: BioSTEAM specifies a utility from the
+ends of its exchanger only, taking a sensible agent to its limit (cooling
+water to 324.82 K) whenever the process inlet allows it, so against a stream
+that condenses a little below that limit (a vacuum condenser, say) the
+utility's line crosses the condensing stretch inside the exchanger. The
+report keeps BioSTEAM's specification of the utility, whose cost it reports;
+the target, which keeps a sensible agent's line inside the grand composite
+curve, stays finite. The report checks that its targets and the network's
+streams are both of the units' current states: after a stream or a unit
+changes, it raises a ``ValueError`` until the system is simulated again. The
+comparison has limits:
 
 - the Bath target bounds the area only with equal film coefficients and the
   same utilities;

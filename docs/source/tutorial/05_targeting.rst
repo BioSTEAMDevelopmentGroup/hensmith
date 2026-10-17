@@ -344,16 +344,24 @@ network:
 
 - **Area.** The report's ``'area'``, 7462 m², re-sizes every exchanger of the
   network like the target sizes it: the same film coefficients, a correction
-  factor of 1 and the integrated temperature difference along the exact
-  stream profiles. On that basis the network needs more area than the 5946 m²
-  target, as it should with equal film coefficients and the same utilities.
+  factor of 1 and the integrated temperature difference along the streams'
+  profiles as the targets' curves model them. On that basis the network needs
+  more area than the 5946 m² target, as it should with equal film
+  coefficients and the same utilities.
   biosteam's own sizing, 5536 m² (``'area_biosteam'``), is lower still,
   mostly because it takes an overall coefficient of 1.0 kW/m²/K for
   condensing steam against a boiling stream (the steam heaters ``Util_0_hs``
   and ``Util_1_hs``: 177 and 1200 m² instead of 356 and 2983 m²), and because
   its terminal log-mean temperature difference overstates the mean driving
   force of a glide; it also applies a correction factor for its shells and
-  sizes utility exchangers on the utility side duty.
+  sizes utility exchangers on the utility side duty. Because biosteam sizes
+  on the terminal temperature differences only, an exchanger whose profiles
+  cross inside it keeps a finite ``'area_biosteam'``, while its ``'area'``,
+  and so the network's, is infinite, with a ``RuntimeWarning`` naming it. This
+  happens when biosteam heats cooling water to its limit, 324.82 K, against
+  a stream that condenses a little below that, as in a vacuum condenser: the
+  utility's line crosses the condensing stretch (see the Notes of
+  :func:`~hensmith.network_report`).
 - **Units.** The network has 7 exchangers against an estimate of 6 because
   it has a loop. Above the pinch, the bottoms cooler ``D1_H1`` heats both the
   reboiler (``HX_0_2_hs``) and the flash's feed heater (``HX_1_2_hs``), and

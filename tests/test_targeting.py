@@ -26,10 +26,11 @@ D. The facility and the report: the facility's targets equal the
    contributions and with replaced heat utilities), the report's areas
    against terminal log-mean temperature differences and against an
    independent integration on the network's own streams (branches of a
-   split, phase changes), the report at the units' current states only
-   (a cached network re-simulated, stale states detected, also with ideal
-   thermodynamics), and no side effects on the flowsheet, the agents'
-   stream dumps or a later synthesis.
+   split, phase changes), an infinite area where biosteam's utility
+   crosses its stream inside the exchanger, the report at the units'
+   current states only (a cached network re-simulated, stale states
+   detected, also with ideal thermodynamics), and no side effects on the
+   flowsheet, the agents' stream dumps or a later synthesis.
 E. Plots: stable gids whose data equal the curves, and readable labels
    and markers.
 
@@ -2060,6 +2061,55 @@ def test_network_report_independent_areas(quickstart_hxn):
             boiling = [ID for ID in areas if changes_phase(exchangers[ID])]
             assert any(ID.startswith('HX_') for ID in boiling)
             assert any(ID.startswith('Util_') for ID in boiling)
+
+def test_network_report_crossed_utility():
+    # A vacuum condenser: steam at 10.6 kPa (dew point 320.10 K) condensed
+    # to 317 K. biosteam heats its cooling water to the limit, 324.82 K,
+    # since the process inlet less dT is above it: the terminal
+    # differences are positive, but the water's line crosses the
+    # condensing stretch inside the exchanger. Its area is inf, and so the
+    # network's, with a warning giving the cause; biosteam's area, the
+    # costs and the targets stay finite.
+    bst.main_flowsheet.set_flowsheet('test_targeting_report_crossed')
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    vapor = bst.Stream('V_in', Water=100., T=345., P=10600., phase='g')
+    liquid = bst.Stream('L_in', Water=5., T=300., P=101325., phase='l')
+    H1 = bst.HXutility('H1', ins=vapor, T=317., rigorous=True)
+    C1 = bst.HXutility('C1', ins=liquid, T=305., rigorous=False)
+    dew = vapor.dew_point_at_P().T
+    sys, HXN = simulate_HXN([H1, C1], 5.)
+    condenser, = [hx for hx in HXN.new_HX_utils if hx.total_heat_transfer > 1e-12]
+    hu = condenser.heat_utilities[0]
+    water = bst.HeatUtility.get_agent('cooling_water')
+    assert hu.agent.ID == 'cooling_water'
+    assert hu.outlet_utility_stream.T == water.T_limit
+    s_in, s_out = condenser.ins[0], condenser.outs[0]
+    assert s_in.T - hu.outlet_utility_stream.T > 0. and s_out.T - hu.inlet_utility_stream.T > 0.
+    assert s_out.T < dew < water.T_limit
+    # independently: flashes of the outlet put the stream below the water
+    # inside the exchanger
+    x = np.linspace(0., s_in.H - s_out.H, 41)
+    T_u = hu.inlet_utility_stream.T + (water.T_limit - hu.inlet_utility_stream.T) * x / x[-1]
+    dT = np.array([flashed_T(s_out, s_out.H + q) for q in x]) - T_u
+    assert dT.min() < -1.
+    with pytest.warns(RuntimeWarning, match=(
+            rf'{condenser.ID} transfers heat at a driving force of -[\d.]+ K: its '
+            'cooling_water from 305.37 to 324.82 K, as biosteam specifies it, '
+            'meets or crosses the profile of H1')):
+        report = network_report(HXN)
+    areas = report['exchanger_areas']
+    assert sorted(areas) == sorted(hx.ID for hx in HXN.new_HXs + [condenser])
+    assert areas[condenser.ID][0] == report['area'] == math.inf
+    assert math.isfinite(areas[condenser.ID][1]) and areas[condenser.ID][1] > 0.
+    assert all(math.isfinite(a) for ID, (a, _) in areas.items() if ID != condenser.ID)
+    assert report['area_biosteam'] == pytest.approx(sum(b for _, b in areas.values()), rel=1e-12)
+    assert math.isfinite(report['TAC']) and math.isfinite(report['installed_cost'])
+    targets = report['targets']
+    assert math.isfinite(targets['area']) and math.isfinite(targets['TAC'])
+    # the targets keep the water's line inside the grand composite curve
+    (cooling,) = [u for u in HXN.targets().utility_targets() if not u.heating]
+    assert cooling.agent.ID == 'cooling_water'
+    assert cooling.T_utility_out < dew
 
 def test_network_report_current_states():
     # With cache_network, the network re-simulated at changed states is

@@ -2356,17 +2356,17 @@ class Supertargets:
                 f'(TAC {self.optimum["TAC"]:.3e} USD/yr){bound}>')
 
 
-def _profile_area(x, dT, inv_U, ID):
+def _profile_area(x, dT, inv_U, ID, cause=''):
     """
     Area [m²] of counter-current heat transfer over the duties `x` [kJ/hr]
     (ascending) at the driving forces `dT` [K] there, linear in between (each
     stretch at its log-mean temperature difference), with an overall 1/U of
     `inv_U` [m²·K/kW]; inf with a RuntimeWarning naming the exchanger `ID`
-    at a driving force of `_DT_ZERO` or less.
+    (followed by `cause`) at a driving force of `_DT_ZERO` or less.
     """
     if dT.min() <= _DT_ZERO:
-        warn(f'{ID} transfers heat at a driving force of {dT.min():.6g} K',
-             RuntimeWarning)
+        warn(f'{ID} transfers heat at a driving force of {dT.min():.6g} K'
+             f'{cause}', RuntimeWarning)
         return math.inf
     LMTD = _lmtd(dT[:-1], dT[1:])
     return float(np.sum(np.diff(x) / LMTD)) * inv_U / 3600.
@@ -2489,8 +2489,12 @@ def _network_areas(HXN, targets, h, h_utilities, agents):
         T_a, T_b = hu.inlet_utility_stream.T, hu.outlet_utility_stream.T
         T_u = T_a + (T_b - T_a) * x / Q
         dT = T_u - T_p(x) if heating else T_p(x) - T_u
+        span = (f'at {T_a:.2f} K' if T_a == T_b
+                else f'from {T_a:.2f} to {T_b:.2f} K')
+        cause = (f': its {agent.ID} {span}, as biosteam specifies it, meets '
+                 f'or crosses the profile of {targets.labels[i]}')
         areas[hx.ID] = (
-            _profile_area(x, dT, 1. / h[i] + 1. / h_agent, hx.ID),
+            _profile_area(x, dT, 1. / h[i] + 1. / h_agent, hx.ID, cause),
             hx.design_results.get('Area', 0.) / _FT2_PER_M2)
     return areas
 
@@ -2535,12 +2539,14 @@ def network_report(HXN, targets=None, **options):
         'utility_cost' [USD/hr]; 'N_units', the exchangers with duty (a
         furnace included), of which 'N_process_units' and
         'N_utility_units'; 'area', the network's area like for like with
-        the area target (see Notes) [m²]; 'area_biosteam', the area biosteam
-        sized [m²]; 'exchanger_areas', ``{ID: (area, area_biosteam)}`` of
-        each exchanger with duty [m²]; 'purchase_cost' and 'installed_cost'
-        of all the network's exchangers [USD]; 'annualized_capital_cost',
-        'operating_cost' and 'TAC' [USD/yr], as `PinchTargets.summary`
-        computes them; 'targets', `PinchTargets.summary` of the targets.
+        the area target [m²], inf if an exchanger's is (see Notes);
+        'area_biosteam', the area biosteam sized on terminal temperature
+        differences [m²]; 'exchanger_areas',
+        ``{ID: (area, area_biosteam)}`` of each exchanger with duty [m²];
+        'purchase_cost' and 'installed_cost' of all the network's
+        exchangers [USD]; 'annualized_capital_cost', 'operating_cost' and
+        'TAC' [USD/yr], as `PinchTargets.summary` computes them; 'targets',
+        `PinchTargets.summary` of the targets.
 
     Raises
     ------
@@ -2573,6 +2579,25 @@ def network_report(HXN, targets=None, **options):
     the log-mean of the terminal temperature differences (which overstates
     the mean difference along a glide) and the utility duty (the process
     duty divided by the heat transfer efficiency).
+
+    An exchanger's 'area' is inf, and so the network's 'area', with a
+    RuntimeWarning naming the exchanger, where its two temperature profiles
+    meet or cross. biosteam specifies a utility from the temperatures at
+    the ends of its exchanger only: it takes a sensible agent to its limit
+    whenever the process inlet allows it (by ``bst.HeatUtility.dT``), as
+    cooling water to 324.82 K and chilled water to 300.37 K, so against a
+    stream that condenses a little below that limit (a vacuum condenser of
+    steam condensing at 320 K, say) the utility's line crosses the
+    condensing stretch inside the exchanger: as specified, the exchanger
+    cannot be built. Its 'area_biosteam' stays finite, since biosteam sizes
+    on the terminal temperature differences, and so do the costs and the
+    TAC, which are biosteam's. The targets keep a sensible agent's line
+    inside the grand composite curve, so the area target of such streams
+    is finite. The report keeps biosteam's specification rather than size
+    the exchanger for more of the utility, leaving where its line stays
+    inside the stream's profile: that would be another network at another
+    utility cost. 'exchanger_areas' gives the areas of the other
+    exchangers.
 
     The capital and utility costs are those of the whole network
     (`HXN.new_HXs` and `HXN.new_HX_utils`), not the facility's costs,
