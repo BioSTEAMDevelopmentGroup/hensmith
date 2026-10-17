@@ -414,6 +414,13 @@ line would have no driving force left there: with ``agent.dT`` of 0
 (``UtilityAgent``'s default), it could serve a point load at its limit only
 at its own inlet temperature, at an unbounded flow, so its level stays just
 short of that point load, which the next agent serves, as in BioSTEAM.
+The order is BioSTEAM's preference, not price: the utility cost target is
+what the agents cost placed this way, not the least utility cost, and an
+agent later in the list can be cheaper per kJ (with BioSTEAM's default
+prices, natural gas is cheaper than any steam for a furnace heating from
+below about 565 K), so a network can cost less than the target as well as
+more (see the comparison of a network with its targets in `Supertargeting:
+area, units, capital and total cost`_ below).
 
 **Served intervals and pricing.** Each agent is priced as one BioSTEAM heat
 utility over the stretch it serves: from its level, or from the end of the
@@ -568,9 +575,12 @@ only by the discretization of the curves, by a tiny relative amount (4e-7
 of the total cost for the quickstart system), so where the optimum lies in
 that flat stretch means nothing physically; where the discretization trend is
 steady, it lies at an end of the stretch (for the quickstart system, the
-warmest point evaluated, just short of the threshold). A sweep with no finite
+warmest point evaluated, just short of the threshold). A sweep whose costs
+are all finite and the same to round-off (streams that recover no heat, say)
+is not refined, and ``constant`` flags it. A sweep with no finite
 total cost (an unserved utility everywhere, say) is not refined and warns that
-its optimum is meaningless. With approach
+its optimum is meaningless; :func:`~hensmith.plot_supertargets` shades the
+stretches of a sweep without a finite cost. With approach
 contributions, only the unspecified streams follow ``T_min_app``;
 ``scale_contributions=True`` scales the specified ones with it, the
 contribution scaling of Ahmad, Linnhoff & Smith (1990).
@@ -600,10 +610,21 @@ comparison has limits:
 - the Bath target bounds the area only with equal film coefficients and the
   same utilities;
 - the network gives each stream one agent at its outlet, BioSTEAM's list
-  rule, while the target allocates the agents on the grand composite curve,
-  so the network can use costlier agents than the target (on the four-stream
-  problem of Linnhoff & Hindmarsh at 10 K, the target is low pressure steam
-  and cooling water, the network medium pressure steam and chilled water);
+  rule, while the target allocates the agents on the grand composite curve
+  in list order, fuel last, so the network can use other agents than the
+  target, costlier or cheaper ones. On the four-stream problem of Linnhoff &
+  Hindmarsh at 10 K, the target is low pressure steam and cooling water,
+  the network medium pressure steam and chilled water, which cost more. But
+  a stream heated above the hottest steam takes fuel over its whole utility
+  stretch, and with BioSTEAM's default prices natural gas costs less per kJ
+  than the steam the target places below the fuel: a stream of 1 kW/K
+  heated from 330 to 520 K against one cooled from 400 to 300 K, at 10 K,
+  takes natural gas from 390 K at 5.2e-6 USD/kJ, where the target places
+  low, medium and high pressure steam (6.5e-6 to 1.2e-5 USD/kJ) and fuel
+  only above 504 K, so the network at MER costs 3.14 USD/hr against a
+  target of 4.56 USD/hr. The utility cost target is the cost of BioSTEAM's
+  placement of its agents, not a minimum, and neither it nor the network's
+  utility cost bounds the other;
 - the units target is an estimate in both directions, since Euler's S - 1
   assumes one component and no loop per region: a balanced subset of
   streams, or one agent serving a stream whose heat the target splits
@@ -1140,9 +1161,11 @@ What it is not:
   `Approach temperature contributions`_). The utility exchangers use
   BioSTEAM's approach rule whatever a stream's contribution.
 - **Targets are estimates.** Beyond the MER targets, the targets of
-  ``hensmith.targeting`` are estimates: the area target bounds a network's
-  area only with equal film coefficients and the same utilities, the units
-  target can be wrong in both directions, the capital target assumes shells
+  ``hensmith.targeting`` are estimates: the utility cost target is the cost
+  of BioSTEAM's placement of its agents, which a network at MER can exceed
+  or undercut, the area target bounds a network's area only with equal film
+  coefficients and the same utilities, the units target can be wrong in
+  both directions, the capital target assumes shells
   of equal area at one pressure (keeping the shell and tubes the area fills
   when an equal division would drop below 150 ft²), and with approach
   contributions the utility levels are conservative and their pricing

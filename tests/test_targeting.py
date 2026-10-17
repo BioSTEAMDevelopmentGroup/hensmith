@@ -1746,6 +1746,7 @@ def test_sweep(monkeypatch):
     assert sweep.at_bound == (sweep.T_min_app in (T[0], T[-1]))
     single = supertarget(t, [10.], refine=2)
     assert len(single.records) == 1 and single.at_bound and 'at the bound' in repr(single)
+    assert not single.constant and not sweep.constant
     assert single.optimum == t.summary()
     # the options reach every evaluation
     hours = supertarget(t, [5., 10.], refine=0, operating_hours=0.)
@@ -1825,6 +1826,32 @@ def test_sweep(monkeypatch):
     with pytest.raises(ValueError, match='> 0 K with approach contributions'):
         supertarget(partial, [0., 5.])
     assert np.ptp(supertarget(partial, [5., 20.], refine=0)['Q_hot']) > 0.
+
+def test_sweep_constant():
+    # streams that recover no heat (only heaters): every target is the same
+    # at every T_min_app, so the sweep is not refined, and says so instead
+    # of flagging its optimum, the first record, at the bound
+    t = targets('test_targeting_sweep_constant', [('C1', 330., 380., 1.),
+                                                  ('C2', 300., 350., 2.)], 10.)
+    sweep = supertarget(t)
+    assert len(sweep.records) == 40 and np.ptp(sweep['TAC']) == 0.
+    assert sweep.constant and sweep.at_bound and sweep.T_min_app == 1.
+    assert repr(sweep) == ('<Supertargets: 40 points, T_min_app 1-40 K, optimum 1 K '
+                           f'(TAC {sweep.optimum["TAC"]:.3e} USD/yr), TAC constant '
+                           'over the sweep>')
+    # a balanced pair below its threshold (10 K): no utility, and the same
+    # exchanger whatever the T_min_app
+    pair = targets('test_targeting_sweep_constant_pair', PAIR, 10.)
+    below = supertarget(pair, [2., 4., 6., 8.])
+    assert len(below.records) == 4 and below.constant
+    assert np.ptp(below['TAC']) <= 1e-12 * below['TAC'].max()
+    # past the threshold the TAC changes: refined as before
+    across = supertarget(pair, [5., 10., 15., 20.], refine=1, n_refine=2)
+    assert len(across.records) == 6 and not across.constant
+    # a nan TAC is not constant (nor are the TACs of a single temperature)
+    with pytest.warns(RuntimeWarning, match='leave part of a utility target unserved'):
+        unserved = supertarget(pair, [12., 14.], refine=0, cooling_agents=[])
+    assert np.isnan(unserved['TAC']).all() and not unserved.constant
 
 def test_sweep_refinement():
     # each round evaluates n_refine new temperatures, on both sides of the
@@ -2365,6 +2392,44 @@ def test_network_report_micro_kelvin_stream():
     simulate_strictly(sys)
     assert network_report(HXN)['targets'] == report['targets']
 
+def test_network_report_cheaper_than_utility_target():
+    # The utility cost target is the cost of biosteam's placement of its
+    # agents (list order, fuel last), not a minimum: C1 ends above high
+    # pressure steam, so the network heats it with natural gas from its
+    # match on, which biosteam's default prices make cheaper per kJ than
+    # the steam the targets place below the fuel (the case of the Notes of
+    # network_report and of concepts.rst)
+    _, HXN = simulate_HXN(cp_units('test_targeting_report_cheaper', FURNACE), 10.)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        report = network_report(HXN)
+    assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    targets = report['targets']
+    assert report['status'] == 'mer'
+    assert report['Q_hot'] == pytest.approx(targets['Q_hot'], rel=1e-9)
+    assert report['Q_cold'] == pytest.approx(targets['Q_cold'], rel=1e-9)
+    [furnace] = [hx for hx in HXN.new_HX_utils if hx.heat_utilities[0].duty > 0.]
+    assert furnace.heat_utilities[0].agent.ID == 'natural_gas'
+    assert furnace.ins[0].T == pytest.approx(390.) and furnace.outs[0].T == pytest.approx(520.)
+    gas = report['utilities']['natural_gas']
+    assert gas['duty'] == pytest.approx(report['Q_hot'], rel=1e-9)
+    heating = [u for u in HXN.targets().utility_targets() if u.heating]
+    assert [u.ID for u in heating] == ['low_pressure_steam', 'medium_pressure_steam',
+                                       'high_pressure_steam', 'natural_gas']
+    assert heating[-1].T_in == pytest.approx(503.991) # fuel above high pressure steam
+    # per kJ of process heat [USD/kJ]
+    assert gas['cost'] / gas['duty'] == pytest.approx(5.165e-6, rel=1e-3)
+    assert [round(u.cost / u.duty, 8) for u in heating[:3]] == [6.47e-6, 8.46e-6, 1.16e-5]
+    assert gas['cost'] < sum(u.cost for u in heating)
+    assert (round(report['utility_cost'], 2), round(targets['utility_cost'], 2)) == (3.14, 4.56)
+    assert report['TAC'] < targets['TAC']
+    # natural gas is cheaper per kJ than any steam for a furnace heating
+    # from below about 565 K
+    LP = heating[0].cost / heating[0].duty
+    gas_per_kJ = lambda T_in: fresh_price(10 * kW, T_in, T_in + 10.,
+                                          agent('natural_gas'))[0] / (10 * kW)
+    assert gas_per_kJ(560.) < LP < gas_per_kJ(570.)
+
 def test_no_side_effects(kemp_hxn):
     units, HXN = kemp_hxn
     # the furnace case of test_capital_target_formula: the network heats C1
@@ -2716,3 +2781,40 @@ def test_plot_supertargets_gids(tmp_path):
             assert len(ax.lines) == 3 + 2 * len(labels) # with the dashed line
         finally:
             plt.close(fig)
+    # the temperatures without a finite TAC are shaded, halfway to their
+    # finite neighbors, so the axis keeps the whole sweep: the infinite area
+    # at 0 K, the unserved cooling of a pair past its threshold (10 K), a
+    # sweep unserved everywhere; none where every TAC is finite
+    pair = targets('test_targeting_plot_sweep_pair', PAIR, 10.)
+    with pytest.warns(RuntimeWarning, match='leave part of a utility target unserved'):
+        partly = supertarget(pair, [5., 10., 15., 20., 30.], refine=0, cooling_agents=[])
+    assert list(np.isfinite(partly['TAC'])) == [True, True, False, False, False]
+    # two stretches (one legend entry), on records edited to have them
+    records = [dict(r) for r in supertarget(t, [5., 10., 15., 20., 25.], refine=0).records]
+    records[0]['TAC'] = math.inf
+    records[3]['TAC'] = records[4]['TAC'] = math.nan
+    two = Supertargets(t, records)
+    for sweep, spans in ((supertarget(t, [0., 5., 10., 20.], refine=0), [(0., 2.5)]),
+                         (partly, [(12.5, 30.)]), (unserved, [(5., 10.)]),
+                         (two, [(5., 7.5), (17.5, 25.)]), (at_bound, [])):
+        fig, ax = plot_supertargets(sweep)
+        try:
+            shaded = _gid_artists(ax, 'Nonfinite')
+            assert [(a.get_x(), a.get_x() + a.get_width()) for a in shaded] == spans
+            lo, hi = ax.get_xlim()
+            assert lo <= sweep['T_min_app'][0] and sweep['T_min_app'][-1] <= hi
+            labels = ax.get_legend_handles_labels()[1]
+            assert labels.count('no finite TAC') == (1 if spans else 0)
+            assert ax.get_legend().get_texts()[-1].get_text() == (
+                'no finite TAC' if spans else labels[-1])
+        finally:
+            plt.close(fig)
+    # a constant TAC is labeled so
+    flat = supertarget(targets('test_targeting_plot_sweep_flat', [('C1', 330., 380., 1.)], 10.),
+                       [5., 10.])
+    fig, ax = plot_supertargets(flat)
+    try:
+        assert [a.get_label() for a in _gid_artists(ax, 'Optimum')] == [
+            'optimum 5 K (TAC constant)']
+    finally:
+        plt.close(fig)

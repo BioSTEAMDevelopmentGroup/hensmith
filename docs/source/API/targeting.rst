@@ -3,8 +3,9 @@ Targeting and supertargeting (hensmith.targeting)
 
 .. currentmodule:: hensmith
 
-``hensmith.targeting`` says what any heat exchanger network of a set of
-process streams can achieve, before (or instead of) synthesizing one.
+``hensmith.targeting`` says what a heat exchanger network of a set of
+process streams can achieve, before (or instead of) synthesizing one: the
+energy targets bound every network, the others are estimates.
 :class:`PinchTargets` holds the problem table of the streams and derives from
 it the composite and grand composite curves, the targets of several utilities
 priced by biosteam (:class:`~hensmith.targeting.UtilityTarget`), the balanced

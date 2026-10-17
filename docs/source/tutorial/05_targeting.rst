@@ -5,7 +5,7 @@ The chapters before this one judged a network by one pair of numbers, the
 minimum energy requirement (MER) targets of its problem table. Pinch analysis
 can say much more before a single exchanger exists: how the heating and
 cooling targets split between several utilities and what they cost, how much
-exchanger area and how many units any network of these streams needs, what
+exchanger area and how many units a network of these streams needs, what
 that area costs, and therefore which ``T_min_app`` minimizes the total
 annualized cost. ``hensmith.targeting`` computes all of these
 (:class:`~hensmith.PinchTargets`), sweeps ``T_min_app`` for the least total
@@ -339,9 +339,14 @@ synthesized with the targets of its streams, on the same options.
    :language: text
 
 The network reaches the utility cost target, 1839.61 USD/hr: it is at MER,
-with the steam and chilled water that the targets allocate. The comparison of
-everything else needs care, because a target is an estimate of an ideal
-network:
+with the steam and chilled water that the targets allocate. That is not a
+rule: the utility cost target is the cost of biosteam's agents placed on the
+grand composite curve, not a minimum, and a network at MER, which serves
+each stream with one agent at its outlet, can cost more (a costlier agent
+over a whole stream) or less (natural gas, which with biosteam's default
+prices costs less per kJ than steam, heating a whole stream that ends above
+the hottest steam) than the target. The comparison of everything else needs
+care too, because a target is an estimate of an ideal network:
 
 - **Area.** The report's ``'area'``, 7462 m², re-sizes every exchanger of the
   network like the target sizes it: the same film coefficients, a correction

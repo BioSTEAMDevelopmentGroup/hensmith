@@ -7,8 +7,9 @@
 # github.com/BioSTEAMDevelopmentGroup/hensmith/blob/master/LICENSE.txt
 # for license details.
 """
-Targeting: what any heat exchanger network of a set of process streams can
-achieve, before (or instead of) synthesizing one. `PinchTargets` holds the
+Targeting: what a heat exchanger network of a set of process streams can
+achieve, before (or instead of) synthesizing one (the energy targets bound
+every network, the others are estimates). `PinchTargets` holds the
 problem table of the streams and derives from it the composite and grand
 composite curves, the multiple-utility targets priced by biosteam
 (`PinchTargets.utility_targets`), the balanced composite curves, and the
@@ -753,7 +754,14 @@ class PinchTargets:
     lists the lowest steam and the warmest coolant first), each as much as
     the curve above its level (below it, for cooling) allows given the
     agents already placed; what remains goes to the first fuel agent, or is
-    left unserved with a RuntimeWarning (nan cost). A level equal to a grid
+    left unserved with a RuntimeWarning (nan cost). The order is biosteam's
+    preference, not price: the utility cost target is the cost of the
+    agents placed this way, not the least utility cost, and an agent later
+    in the list can be cheaper per kJ (with biosteam's default prices,
+    natural gas is cheaper than any steam for a furnace heating from below
+    about 565 K), so a network, which serves each stream with one agent at
+    its outlet, can cost less than the target as well as more (see Notes of
+    `network_report`). A level equal to a grid
     temperature serves that temperature's point loads (biosteam's own rule
     is strict; they differ only at exact equality), except where a sensible
     agent's line would have no driving force left: at a point load at
@@ -1472,7 +1480,9 @@ class PinchTargets:
     def utility_targets(self, heating_agents=None, cooling_agents=None):
         """
         Multiple-utility targets: the agents placed on the grand composite
-        curve and priced by biosteam (see Notes of the class).
+        curve and priced by biosteam (see Notes of the class). They are
+        placed in biosteam's order of preference, not by price, so their
+        total cost is not the least utility cost of a network.
 
         Parameters
         ----------
@@ -2110,6 +2120,13 @@ def _least_TAC(records):
     TAC = np.array([r['TAC'] for r in records], dtype=float)
     return int(np.argmin(np.where(np.isnan(TAC), math.inf, TAC)))
 
+def _constant_TAC(records):
+    """Whether the records are at least two, each with a finite TAC, and
+    their TACs the same to within round-off (a relative 1e-12)."""
+    TAC = np.array([r['TAC'] for r in records], dtype=float)
+    return (TAC.size > 1 and bool(np.isfinite(TAC).all())
+            and float(np.ptp(TAC)) <= 1e-12 * float(np.abs(TAC).max()))
+
 def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
                 scale_contributions=False, **options):
     """
@@ -2176,7 +2193,11 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     after r rounds the spacing near the optimum is then about the grid's
     times ``(2 / (n_refine + 2))**r``, (1/5)**r for the defaults. A least
     TAC at the smallest or largest temperature evaluated is flagged
-    (`Supertargets.at_bound`).
+    (`Supertargets.at_bound`). A sweep whose TACs are all finite and the
+    same (to a relative 1e-12) is not refined: its targets do not depend on
+    the minimum approach temperature over the sweep (for streams that
+    recover no heat, only heaters, say), its optimum is merely the smallest
+    temperature, and `Supertargets.constant` flags it.
 
     The capital target drops by about a shell and tube wherever the
     shrinking area fills one fewer of 150 ft² (see Notes of
@@ -2289,6 +2310,8 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     for _ in range(refine):
         if not any(math.isfinite(r['TAC']) for r in records):
             break # nothing to refine around
+        if _constant_TAC(records):
+            break # a flat line: nothing to refine either
         records.sort(key=lambda r: r['T_min_app'])
         i = _least_TAC(records)
         lo = records[max(i - 1, 0)]['T_min_app']
@@ -2359,6 +2382,11 @@ class Supertargets:
     at_bound : bool
         Whether `optimum` is at the smallest or largest temperature
         evaluated: the least TAC may lie beyond the sweep.
+    constant : bool
+        Whether the TAC is the same at every temperature evaluated (at least
+        two, each finite, to a relative 1e-12): the targets do not depend
+        on the minimum approach temperature over the sweep, and `optimum`
+        is merely the first record.
 
     Notes
     -----
@@ -2378,6 +2406,7 @@ class Supertargets:
         self.optimum = self.records[i]
         self.T_min_app = self.optimum['T_min_app']
         self.at_bound = i in (0, len(self.records) - 1)
+        self.constant = _constant_TAC(self.records)
 
     def __getitem__(self, key):
         return np.array([r[key] for r in self.records])
@@ -2390,7 +2419,9 @@ class Supertargets:
     def __repr__(self):
         n = len(self.records)
         lo, hi = self.records[0]['T_min_app'], self.records[-1]['T_min_app']
-        bound = ', at the bound' if self.at_bound else ''
+        if self.constant: bound = ', TAC constant over the sweep'
+        elif self.at_bound: bound = ', at the bound'
+        else: bound = ''
         return (f'<{type(self).__name__}: {n} point{"s" if n != 1 else ""}, '
                 f'T_min_app {lo:g}-{hi:g} K, optimum {self.T_min_app:.4g} K '
                 f'(TAC {self.optimum["TAC"]:.3e} USD/yr){bound}>')
@@ -2650,14 +2681,23 @@ def network_report(HXN, targets=None, **options):
     original exchangers, to which the utility exchangers of the network,
     reported here, are equivalent).
 
-    The targets are estimates, and the network may beat some of them:
+    Only the energy targets ('Q_hot' and 'Q_cold') bound the network; the
+    others are estimates, and the network may beat some of them:
 
     - the network serves each stream with one agent at its outlet (biosteam's
       rule: the first agent of the list that can), while the targets place
-      the agents on the grand composite curve, so the network may use other
-      agents than the targets (with Linnhoff & Hindmarsh's problem at
-      10 K, medium pressure steam and chilled water where the targets need
-      only low pressure steam and cooling water);
+      the agents on the grand composite curve in list order (fuel last), so
+      the network may use other agents than the targets, costlier or
+      cheaper ones: with Linnhoff & Hindmarsh's problem at 10 K, medium
+      pressure steam and chilled water where the targets need only low
+      pressure steam and cooling water, but a stream heated above the
+      hottest steam takes fuel over its whole utility stretch, and with
+      biosteam's default prices natural gas costs less per kJ than the
+      steam the targets place below the fuel (a stream of 1 kW/K heated
+      from 330 to 520 K against one cooled from 400 to 300 K, at 10 K: 3.14
+      USD/hr at MER against a target of 4.56 USD/hr). The utility cost
+      target is the cost of biosteam's placement of its agents, not a
+      minimum: neither it nor the network's utility cost bounds the other;
     - the area target is a minimum only for equal film coefficients and the
       same utilities: that problem's network takes 54.06 m² against a target
       of 59.68 m², with hotter steam and colder coolant;
@@ -3150,9 +3190,14 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     Notes
     -----
     Artists carry stable gids: 'TAC', 'Capital' (the annualized capital
-    cost), 'Operating' and 'Optimum'. The optimum is labeled '(at the
-    bound)' if it is at an end of the sweep (`Supertargets.at_bound`), and
-    is not marked without a finite TAC.
+    cost), 'Operating', 'Optimum' and 'Nonfinite'. The optimum is labeled
+    '(TAC constant)' if the TAC is the same over the sweep
+    (`Supertargets.constant`), else '(at the bound)' if it is at an end of
+    the sweep (`Supertargets.at_bound`), and is not marked without a finite
+    TAC. The lines leave out the temperatures without a finite TAC (an
+    unserved utility or an infinite area): each stretch of them is shaded
+    ('Nonfinite', halfway to its finite neighbors), so the axis keeps the
+    whole sweep.
 
     Examples
     --------
@@ -3187,7 +3232,8 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     else:
         fig = ax.figure
     T = sweep['T_min_app']
-    ax.plot(T, sweep['TAC'], color='k', lw=2, label='total annualized cost',
+    TAC = sweep['TAC']
+    ax.plot(T, TAC, color='k', lw=2, label='total annualized cost',
             gid='TAC')
     ax.plot(T, sweep['annualized_capital_cost'], color='#2e6db4', lw=1.5,
             label='annualized capital cost', gid='Capital')
@@ -3195,12 +3241,27 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
             label='operating cost', gid='Operating')
     optimum = sweep.optimum
     if math.isfinite(optimum['TAC']):
-        bound = ' (at the bound)' if sweep.at_bound else ''
+        if sweep.constant: bound = ' (TAC constant)'
+        elif sweep.at_bound: bound = ' (at the bound)'
+        else: bound = ''
         ax.axvline(optimum['T_min_app'], color='k', ls='--', lw=0.8)
         ax.plot([optimum['T_min_app']], [optimum['TAC']], 'o', mfc='w',
                 mec='k', ms=7, zorder=4,
                 label=f"optimum {optimum['T_min_app']:.3g} K{bound}",
                 gid='Optimum')
+    bad = ~np.isfinite(TAC)
+    if bad.any():
+        # the stretches without a finite TAC, which the lines leave out:
+        # shaded behind them, halfway to their finite neighbors
+        n = T.size
+        starts = np.flatnonzero(bad & ~np.r_[False, bad[:-1]])
+        ends = np.flatnonzero(bad & ~np.r_[bad[1:], False])
+        for k, (a, b) in enumerate(zip(starts, ends)):
+            left = T[a] if a == 0 else (T[a - 1] + T[a]) / 2
+            right = T[b] if b == n - 1 else (T[b] + T[b + 1]) / 2
+            ax.axvspan(left, right, color='0.85', lw=0, zorder=0,
+                       label='no finite TAC' if k == 0 else '_nolegend_',
+                       gid='Nonfinite')
     ax.set_xlabel('$T_{min,app}$ [K]')
     ax.set_ylabel('cost [USD·yr$^{-1}$]')
     ax.legend(loc='best', fontsize=8)
