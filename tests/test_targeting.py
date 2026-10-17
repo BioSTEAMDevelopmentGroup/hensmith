@@ -896,6 +896,58 @@ def test_levels_of_streams_beyond_reach():
                                    pytest.approx(B.outs[0].T, abs=1e-9))
     assert u.duty + MP.duty == pytest.approx(t.Q_hot, rel=1e-12)
 
+def test_levels_of_streams_past_a_zero():
+    # the heat of a level reaches only the next zero of the balanced curve
+    # given the agents placed before it: a stream wholly past that zero (a
+    # utility pinch, or a second process pinch) moves no level. Heating: low
+    # pressure steam takes 25.5 kW and leaves a utility pinch at shifted
+    # 447 K; Ck (shifted 420 -> 446.5 K) lies below it and is served by
+    # Hmid, so it does not cap medium pressure steam at its own limit (MP's
+    # less 4.5 K), and MP, not high pressure steam, serves Ctop's 20 kW.
+    rows = [('Ctop', 447., 449., 10.), ('Hmid', 457., 410., 3.),
+            ('Ck', 424.5, 451., 1.), ('Clow', 330., 400., 2.)]
+    t = targets('test_targeting_past_zero_heat', rows, 10.,
+                approach_contributions={'Ck': .5})
+    utilities = t.utility_targets()
+    LP, MP = agent('low_pressure_steam'), agent('medium_pressure_steam')
+    assert [u.ID for u in utilities] == [LP.ID, MP.ID]
+    assert_allclose([u.duty for u in utilities], [25.5 * kW, 20. * kW], rtol=1e-12)
+    u = utilities[1]
+    assert u.level == MP.T - MP.dT - bst.HeatUtility.dT
+    assert (u.T_in, u.T_out) == (pytest.approx(447., abs=1e-9),
+                                 pytest.approx(449., abs=1e-9))
+    assert u.cost == pytest.approx(fresh_price(20. * kW, 447., 449., MP)[0], rel=1e-9)
+    # biosteam's own choice for Ctop
+    hu = bst.HeatUtility()
+    hu(20. * kW, 447., 449.)
+    assert hu.agent is MP
+    # cooling: the curve is zero at shifted 450 K (the pinch) and 300 K. H1
+    # (shifted 450 -> 302 or 307 K) lies between the two and gives all its
+    # heat to C2, so wherever it ends it moves no level: cooling water
+    # serves H2 (shifted 300 -> 280 K) down to its limit, 312.372 K real.
+    CW, CHW = agent('cooling_water'), agent('chilled_water')
+    T_limit = CW.T + CW.dT + bst.HeatUtility.dT # real
+    results = []
+    for end, CP in ((308., 1.), (313., 148. / 143.)):
+        rows = [('C1', 450., 500., 1.), ('H1', 456., end, CP),
+                ('C2', 300., 440., 148. / 140.), ('H2', 314., 294., 10.)]
+        t = targets(f'test_targeting_past_zero_cool_{end:g}', rows, 10.,
+                    approach_contributions={'H1': 1., 'H2': 9.})
+        assert (t.Q_hot, t.Q_cold) == (pytest.approx(50. * kW, rel=1e-12),
+                                       pytest.approx(200. * kW, rel=1e-12))
+        T, H = t.grand_composite_curve()
+        assert np.abs(H[(T == 450.) | (T == 300.)]).max() <= 1e-6
+        cool = [u for u in t.utility_targets() if not u.heating]
+        assert [u.ID for u in cool] == [CW.ID, CHW.ID]
+        u = cool[0]
+        assert u.duty == pytest.approx(10. * kW * (314. - T_limit), rel=1e-9)
+        assert (u.T_in, u.T_out) == (pytest.approx(314., abs=1e-9),
+                                     pytest.approx(T_limit, abs=1e-9))
+        assert u.cost == pytest.approx(fresh_price(-u.duty, 314., T_limit, CW)[0],
+                                       rel=1e-9)
+        results.append([(u.level, u.duty, u.cost) for u in cool])
+    assert_allclose(results[0], results[1], rtol=1e-12)
+
 def test_sensible_agent_without_driving_force():
     # a sensible agent with agent.dT = 0 (UtilityAgent's default) has no
     # driving force left at a point load at its limit, agent.T - dT
@@ -1421,6 +1473,46 @@ def test_from_heat_utilities_takes_exchangers():
     same = PinchTargets.from_heat_utilities(
         [idle, *sorted(selected, key=lambda hu: hu.duty)], 10.)
     assert same.labels == t.labels and (same.Q_hot, same.Q_cold) == (t.Q_hot, t.Q_cold)
+
+def test_from_heat_utilities_after_replaced_heat_utilities(kemp_hxn, kemp_hxn_replaced):
+    # biosteam's selection after a simulation with
+    # replace_unit_heat_utilities=True holds the network's utilities: C1
+    # and H4 keep 20 and 60 kW of their 230 and 180 kW, and H2 and C3,
+    # served by the process exchangers alone, are empty and left out. A
+    # RuntimeWarning says so (the targets would be those of C1 and H4
+    # alone); the facility's targets are the process's.
+    def select(sys):
+        hus = bst.process_tools.heat_exchanger_utilities_from_units(sys.units)
+        return sorted(hus, key=lambda hu: hu.unit.ID)
+    units, HXN = kemp_hxn_replaced
+    hus = select(HXN.system)
+    assert [hu.unit for hu in hus] == [units[0], units[3]]
+    assert_allclose([hu.unit_duty / kW for hu in hus], [20., -60.], rtol=1e-9)
+    message = (r"heat utilities of 'C1', 'H4' have duties \(hu.unit_duty\) other "
+               r"than their process streams' .*replace_unit_heat_utilities=True"
+               r".*take its targets\(\) instead")
+    with pytest.warns(RuntimeWarning, match=message):
+        t = PinchTargets.from_heat_utilities(hus, 10.)
+    assert t.labels == ['C1', 'H4']
+    facility = HXN.targets()
+    assert facility.labels == ['C1', 'C3', 'H2', 'H4']
+    assert (facility.Q_hot, facility.Q_cold) == (pytest.approx(20. * kW, rel=1e-9),
+                                                 pytest.approx(60. * kW, rel=1e-9))
+    # every unit's own heat utility: the empty ones are named too
+    with pytest.warns(RuntimeWarning, match="of 'C1', 'H2', 'C3', 'H4' have duties"):
+        PinchTargets.from_heat_utilities([u.heat_utilities[0] for u in units], 10.)
+    # without replace_unit_heat_utilities the selection is the process's, and
+    # no warning is raised
+    units, HXN = kemp_hxn
+    hus = select(HXN.system)
+    assert [hu.unit for hu in hus] == [units[0], units[2], units[1], units[3]]
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        t = PinchTargets.from_heat_utilities(hus, 10.)
+    facility = HXN.targets()
+    assert t.labels == facility.labels
+    assert (t.Q_hot, t.Q_cold) == (pytest.approx(facility.Q_hot, rel=1e-12),
+                                   pytest.approx(facility.Q_cold, rel=1e-12))
 
 def test_is_hot_validated():
     # is_hot must agree with each stream's direction (a stream without duty

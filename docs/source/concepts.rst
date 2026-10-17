@@ -393,8 +393,11 @@ BioSTEAM's rule exactly. With approach contributions the streams have
 different shifts, and an agent's level is the highest single shifted
 temperature (the lowest, for cooling), up to the highest of the streams' own
 limits, at which it serves no stream beyond that stream's own real limit. A
-level serves only what lies below it (above it, for cooling), so a stream
-lying wholly beyond its limit bounds the level only at the stream's own end;
+level serves only what lies below it (above it, for cooling), and its heat
+goes no further than the next zero of the curve balanced with the agents
+placed before it (see below): the pinch, a utility pinch or another process
+pinch. So a stream lying wholly beyond its limit bounds the level only at the
+stream's own end, and a stream lying wholly past that zero does not bound it;
 streams with slack are then served conservatively.
 
 **List order and fuel.** Non-fuel agents are placed in the order of

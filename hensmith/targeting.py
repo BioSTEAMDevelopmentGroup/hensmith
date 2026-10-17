@@ -290,6 +290,16 @@ def _isolated_pricing(agents):
         if previous is missing: flowsheets.pop(ID, None)
         else: flowsheets[ID] = previous
 
+def _duty_off_stream(hu):
+    """Whether the duty of the heat exchanger's heat utility `hu`
+    (``hu.unit_duty``) differs from that of its process stream (``outs[0].H
+    - ins[0].H`` of its unit) beyond rounding, as for the heat utilities
+    that a heat exchanger network simulated with
+    ``replace_unit_heat_utilities`` writes its utilities over or empties."""
+    unit = hu.unit
+    dH = unit.outs[0].H - unit.ins[0].H
+    return abs(dH - hu.unit_duty) > 1e-6 * max(abs(dH), abs(hu.unit_duty))
+
 def _unit_label(unit):
     """``unit.ID``, or ``'<owner.ID> - <unit.ID>'`` for an auxiliary unit."""
     return unit.ID if unit.owner is unit else f'{unit.owner.ID} - {unit.ID}'
@@ -724,23 +734,26 @@ class PinchTargets:
     above its own limit (the lowest, down to the lowest limit, for
     cooling): ``R`` for heating and ``R - T_min_app`` for cooling without
     approach contributions, which is biosteam's rule. A level serves only
-    what lies below it (above it, for cooling), so a stream reaching beyond
-    its limit bounds the level at that limit, but one lying wholly beyond
-    it only at its own end (just short of it, if it has a point load
-    there). With contributions the level can be conservative for streams
-    with slack. Non-fuel agents are placed in list order (biosteam's first
-    feasible agent: for the default lists the lowest steam and the warmest
-    coolant first), each as much as the curve above its level (below it, for
-    cooling) allows given the agents already placed; what remains goes to
-    the first fuel agent, or is left unserved with a RuntimeWarning (nan
-    cost). A level equal to a grid temperature serves that temperature's
-    point loads (biosteam's own rule is strict; they differ only at exact
-    equality), except where a sensible agent's line would have no driving
-    force left: at a point load at ``agent.T - dT`` (``agent.T + dT`` for
-    cooling), a stream's limit when ``agent.dT`` is 0 (`UtilityAgent`'s
-    default), the agent would leave at its inlet temperature at an
-    unbounded flow, so its level stays just short of that point load, which
-    the next agent serves, as in biosteam.
+    what lies below it (above it, for cooling) and above the highest zero
+    of the curve balanced with the agents already placed (below the lowest
+    one): the pinch, a utility pinch or another process pinch, which its
+    heat never passes. So a stream reaching beyond its limit bounds the
+    level at that limit, one lying wholly beyond it only at its own end
+    (just short of it, if it has a point load there), and one with no heat
+    on the level's side of that zero not at all. With contributions the
+    level can be conservative for streams with slack. Non-fuel agents are
+    placed in list order (biosteam's first feasible agent: for the default
+    lists the lowest steam and the warmest coolant first), each as much as
+    the curve above its level (below it, for cooling) allows given the
+    agents already placed; what remains goes to the first fuel agent, or is
+    left unserved with a RuntimeWarning (nan cost). A level equal to a grid
+    temperature serves that temperature's point loads (biosteam's own rule
+    is strict; they differ only at exact equality), except where a sensible
+    agent's line would have no driving force left: at a point load at
+    ``agent.T - dT`` (``agent.T + dT`` for cooling), a stream's limit when
+    ``agent.dT`` is 0 (`UtilityAgent`'s default), the agent would leave at
+    its inlet temperature at an unbounded flow, so its level stays just
+    short of that point load, which the next agent serves, as in biosteam.
 
     Each agent is priced as one biosteam heat utility over the stretch it
     serves, from its level (or the end of the grid, if that is nearer) to
@@ -1030,7 +1043,13 @@ class PinchTargets:
             ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``
             (those a heat exchanger network may take, ``hu.hxn_ok``, as
             `HeatExchangerNetwork` selects them), not ``sys.heat_utilities``
-            (sums by agent, of no unit). Zero-duty ones are dropped.
+            (sums by agent, of no unit). Zero-duty ones are dropped. After a
+            simulation of a `HeatExchangerNetwork` with
+            ``replace_unit_heat_utilities=True`` they hold the network's
+            utilities, not the process duties, and those of the streams it
+            serves completely are empty (left out of biosteam's selection):
+            take `HeatExchangerNetwork.targets` then, or build the targets
+            before that simulation.
         T_min_app : float, optional
             Minimum approach temperature [K], finite and >= 0 (> 0 with
             approach contributions). Defaults to 5.
@@ -1060,16 +1079,28 @@ class PinchTargets:
             ``Unit.add_heat_utility``: their unit's first inlet and outlet
             need not be the stream they heat or cool).
 
+        Warns
+        -----
+        RuntimeWarning
+            If the duty of a heat exchanger's heat utility (``hu.unit_duty``)
+            differs from that of its process stream (``outs[0].H -
+            ins[0].H`` of its unit, which the targets use) beyond rounding,
+            as after a simulation with ``replace_unit_heat_utilities=True``.
+
         """
         hus = list(hus)
         _check_T_min_app(T_min_app)
         selection = ('take bst.process_tools.heat_exchanger_utilities_from_'
                      'units(sys.units), the heat utilities a heat exchanger '
-                     'network may take')
+                     'network may take (before any simulation of a '
+                     'HeatExchangerNetwork with replace_unit_heat_utilities='
+                     'True, which writes its utilities over them; take its '
+                     'targets() after one)')
         if any(hu.unit is None for hu in hus):
             raise ValueError('every heat utility must belong to a heat '
-                             f'exchanger (hu.unit): {selection}, not '
-                             'System.heat_utilities (sums by agent, of no unit)')
+                             'exchanger (hu.unit), not be one of '
+                             'System.heat_utilities (sums by agent, of no '
+                             f'unit): {selection}')
         others = [hu for hu in hus if hu.duty and not hu.hxn_ok]
         if others:
             names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
@@ -1078,6 +1109,17 @@ class PinchTargets:
                              f'(hu.hxn_ok), not those of {names}, whose first '
                              'inlet and outlet need not be the stream they '
                              f'heat or cool: {selection}')
+        replaced = [hu for hu in hus if hu.hxn_ok and _duty_off_stream(hu)]
+        if replaced:
+            names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
+                                            for hu in replaced))
+            warn(f'the heat utilities of {names} have duties (hu.unit_duty) '
+                 'other than their process streams\' (outs[0].H - ins[0].H), '
+                 'which the targets use: after a simulation of a '
+                 'HeatExchangerNetwork with replace_unit_heat_utilities=True '
+                 'they hold its utilities, and the streams it serves '
+                 'completely have none and are left out; take its targets() '
+                 'instead', RuntimeWarning)
         values = _explicit_contributions(hus, approach_contributions, T_min_app)
         arranged, N_heating = _arrange_heat_utilities(hus, sort_hus_by_T)
         if values is None:
@@ -1223,45 +1265,64 @@ class PinchTargets:
         if self.Q_hot == 0.: above, below = 0. * above, below + above
         return above, below
 
-    def _levels(self, agents, heating):
+    def _level(self, agent, heating, j, reach):
         """
-        ``[(agent, level)]``: each agent's shifted level, the highest
-        (lowest for cooling), up to the highest of the served streams'
-        shifted limits (down to the lowest), that serves no stream beyond
+        The shifted level of `agent` serving the streams `j` (`_served`) of
+        which those of the mask `reach` (`_in_reach`) are in its reach: the
+        highest (lowest for cooling), up to the highest of the shifted limits
+        of `j` (down to the lowest), that serves no stream in reach beyond
         its own real limit (see Notes of the class).
         """
         dT = bst.HeatUtility.dT
         grid = self.grid
         Ts = grid['Ts']
-        j = self._served(heating)
         s = self.shift[j]
         top, bottom = Ts[grid['k_hi'][j]], Ts[grid['k_lo'][j]]
         # the point load at the end a level beyond the stream would reach
         # first: its bottom (heating) or its top (cooling)
         k = grid['k_lo' if heating else 'k_hi'][j]
         point = np.abs(self.table.point_H[j, k]) > self._tol
-        levels = []
-        for agent in agents:
-            # a stream reaching beyond its limit caps the level at the limit,
-            # or, lying wholly beyond it, at its own end (just short of it if
-            # a point load is there): a level serves only what lies below it
-            # (above it, for cooling)
-            if heating:
-                R = agent.T - agent.dT - dT
-                limit = R - s
-                caps = np.maximum(limit, bottom - _T_SHORT * point)[top > limit]
-                if j.size: L = caps.min(initial=limit.max())
-                else: L = R
-            else:
-                R = agent.T + agent.dT + dT
-                limit = R - s
-                caps = np.minimum(limit, top + _T_SHORT * point)[bottom < limit]
-                if j.size: L = caps.max(initial=limit.min())
-                else: L = R - self.T_min_app
-            if j.size and _sensible(agent):
-                L = self._short_of_stuck_loads(agent, heating, L, j, s)
-            levels.append((agent, float(L)))
-        return levels
+        # a stream in reach reaching beyond its limit caps the level at the
+        # limit, or, lying wholly beyond it, at its own end (just short of it
+        # if a point load is there): a level serves only what lies below it
+        # (above it, for cooling)
+        if heating:
+            R = agent.T - agent.dT - dT
+            limit = R - s
+            caps = np.maximum(limit, bottom - _T_SHORT * point)[reach & (top > limit)]
+            if j.size: L = caps.min(initial=limit.max())
+            else: L = R
+        else:
+            R = agent.T + agent.dT + dT
+            limit = R - s
+            caps = np.minimum(limit, top + _T_SHORT * point)[reach & (bottom < limit)]
+            if j.size: L = caps.max(initial=limit.min())
+            else: L = R - self.T_min_app
+        if reach.any() and _sensible(agent):
+            L = self._short_of_stuck_loads(agent, heating, L, j[reach], s[reach])
+        return float(L)
+
+    def _in_reach(self, j, positions, B, heating):
+        """
+        Mask of the streams `j` (`_served`) that the heat of a next agent
+        can reach given the balanced heat flow `B` at the `positions` of the
+        agents already placed: those with heat above the highest zero of `B`
+        above the pinch temperature (below the lowest one below it, for
+        cooling), a utility pinch or another process pinch; all of them if
+        there is no such zero. A level at or beyond that zero gets no duty,
+        and the heat of a level short of it never passes it.
+        """
+        T = positions[0]
+        pinch_T = self.pinch_T
+        if heating: z = np.flatnonzero((B <= self._tol) & (T > pinch_T))
+        else: z = np.flatnonzero((B <= self._tol) & (T < pinch_T))
+        if not z.size: return np.ones(j.size, dtype=bool)
+        # the heat between the virtual top and the zero (heating), or the
+        # zero and the virtual bottom (cooling): position p is column p + 1
+        H = self._position_H(positions)[j]
+        if heating: heat = np.abs(H[:, z[0] + 1] - H[:, 0])
+        else: heat = np.abs(H[:, -1] - H[:, z[-1] + 1])
+        return heat > self._tol
 
     def _short_of_stuck_loads(self, agent, heating, L, j, s):
         """
@@ -1284,21 +1345,27 @@ class PinchTargets:
         elif (load & (T <= agent.T + dT + _T_EQ)).any(): return L + _T_SHORT
         return L
 
-    def _allocate(self, levels, Q, heating):
+    def _allocate(self, agents, Q, heating):
         """
-        Greedy list-order allocation of `Q` to the agents of `levels` on the
-        grand composite curve: ``([(level, q, agent)], remaining)``.
+        Greedy list-order allocation of `Q` to `agents` on the grand
+        composite curve: ``([(level, q, agent)], remaining)``. Each agent's
+        level (`_level`) is set by the streams in reach given the agents
+        placed before it (`_in_reach`).
         """
         Ts, arr, lea = self._gcc()
         tol = self._tol
+        served = self._served(heating)
         allocated = []
         remaining = Q
-        for agent, level in levels:
+        for agent in agents:
             if remaining <= tol: break
-            level = _snap(Ts, level)
-            positions = _positions(Ts, arr, lea,
-                                   [level] + [l for l, _, _ in allocated])
             done = [(l, q) for l, q, _ in allocated]
+            positions = _positions(Ts, arr, lea, [l for l, _ in done])
+            B = (_balance(positions, done, ()) if heating
+                 else _balance(positions, (), done))
+            reach = self._in_reach(served, positions, B, heating)
+            level = _snap(Ts, self._level(agent, heating, served, reach))
+            positions = _positions(Ts, arr, lea, [level] + [l for l, _ in done])
             if heating:
                 B = _balance(positions, done, ())
                 bound = B[:_gap(positions, level)]
@@ -1438,16 +1505,14 @@ class PinchTargets:
         if cooling_agents is None: cooling_agents = list(bst.HeatUtility.cooling_agents)
         tol = self._tol
         heat, remaining = self._allocate(
-            self._levels([a for a in heating_agents if not a.isfuel], True),
-            self.Q_hot, True)
+            [a for a in heating_agents if not a.isfuel], self.Q_hot, True)
         if remaining > tol:
             fuels = [a for a in heating_agents if a.isfuel]
             heat.append((math.inf, remaining, fuels[0] if fuels else None))
             if not fuels:
                 warn(f'no heating agent can serve {remaining:.6g} kJ/hr of the '
                      'hot utility target; it is left unserved', RuntimeWarning)
-        cool, remaining = self._allocate(
-            self._levels(cooling_agents, False), self.Q_cold, False)
+        cool, remaining = self._allocate(cooling_agents, self.Q_cold, False)
         if remaining > tol:
             cool.append((-math.inf, remaining, None))
             warn(f'no cooling agent can serve {remaining:.6g} kJ/hr of the '
