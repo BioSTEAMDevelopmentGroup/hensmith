@@ -852,10 +852,12 @@ def _names_unbuilt_auxiliary(key, universe, live):
     may build but does not hold now, as a `biosteam.HXutilities` builds one
     exchanger per agent it needs: an old auxiliary object whose top owner is
     in `universe` (rebuilt with fewer auxiliaries), or ``(owner.ID, ID)``
-    for the ID that biosteam gives an auxiliary, ``name`` or ``name[k]``,
-    with `name` one of the `auxiliary_unit_names` of a unit of `universe`
-    under that top owner (e.g. ``('X1', 'heat_exchangers[2]')``). Such a key
-    is valid but names nothing.
+    for the ID that biosteam gives an auxiliary, with `name` one of the
+    `auxiliary_unit_names` of a unit of `universe` under that top owner:
+    ``name[k]`` if that unit's attribute `name` holds a list of auxiliaries
+    (e.g. ``('X1', 'heat_exchangers[2]')``), ``name`` if it holds a single
+    one, and either while it holds none (None or missing). Such a key is
+    valid but names nothing.
     """
     if isinstance(key, bst.Unit):
         top = key.owner
@@ -863,11 +865,17 @@ def _names_unbuilt_auxiliary(key, universe, live):
     if not isinstance(key, tuple): return False
     owner_ID, ID = key
     match = re.fullmatch(r'(.+)\[\d+\]', ID)
-    names = {ID, match[1]} if match else {ID}
-    return any(unit.owner.ID == owner_ID
-               and not names.isdisjoint(getattr(unit, 'auxiliary_unit_names',
-                                                ()))
-               for unit in universe)
+    name = match[1] if match else ID
+    for unit in universe:
+        if (unit.owner.ID != owner_ID
+                or name not in getattr(unit, 'auxiliary_unit_names', ())):
+            continue
+        # biosteam's ID of an auxiliary under `name`: 'name[k]' while the
+        # attribute holds a list, else 'name' (either while it holds nothing)
+        held = getattr(unit, name, None)
+        if held is None or isinstance(held, list) == bool(match):
+            return True
+    return False
 
 def _unknown_keys(keys, universe):
     """The keys of `keys` (units, str or pairs of str) that name neither a

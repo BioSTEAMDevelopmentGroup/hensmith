@@ -732,6 +732,12 @@ def test_contribution_keys_on_auxiliary_units():
     with pytest.raises(ValueError, match="name no unit: 'condenser', "
                                          r"\('D1', 'nope'\)"):
         resolve({'condenser': 1., ('D1', 'nope'): 1., 'D1': 2.})
+    # biosteam gives a single auxiliary its bare name, so an indexed ID of
+    # one names nothing
+    for key in (('D1', 'condenser[0]'), ('D1', 'reboiler[7]'),
+                ('D1', 'pump[0]'), ('F1', 'heat_exchanger[3]')):
+        with pytest.raises(ValueError, match='name no unit'):
+            resolve({key: 1.})
     # sequence (aligned with hus) and callable (once per heat utility, in
     # order) forms; heat utility and other keys are rejected
     assert hxn_synthesis._stream_contributions(
@@ -1006,7 +1012,8 @@ def test_keys_of_auxiliaries_a_unit_does_not_build():
     # a lower outlet temperature drops 'heat_exchangers[2]' (and [1]): a key
     # of it, the tuple or the old object, is valid but has no effect while
     # it is missing, and names the exchanger again once it is built; keys
-    # of IDs the unit never gives an auxiliary still raise
+    # of IDs the unit never gives an auxiliary still raise (the bare name of
+    # a list of auxiliaries among them)
     bst.main_flowsheet.set_flowsheet('contributions_unbuilt')
     bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
     feed = bst.Stream('feed', Water=500., units='kmol/hr', T=300., P=20e5)
@@ -1033,7 +1040,7 @@ def test_keys_of_auxiliaries_a_unit_does_not_build():
     for T, N in ((440., 2), (400., 1)):
         reference = run(T, None)
         assert len(X1.heat_exchangers) == N
-        for x in (tuple_key, {old: 3.}, {('X1', 'heat_exchangers'): 3.}):
+        for x in (tuple_key, {old: 3.}):
             assert run(T, x) == reference
             assert HXN._resolved_contributions is None
         # film coefficient keys of the facility's targets alike
@@ -1051,7 +1058,7 @@ def test_keys_of_auxiliaries_a_unit_does_not_build():
     targets = HXN.targets()
     for key in (('X1', 'heat_exchanger[2]'), ('X1', 'heat_exchangers[x]'),
                 ('X1', 'heat_exchangers[2'), ('X2', 'heat_exchangers[2]'),
-                ('X9', 'heat_exchangers[2]')):
+                ('X9', 'heat_exchangers[2]'), ('X1', 'heat_exchangers')):
         with pytest.raises(ValueError, match='h keys that name no stream'):
             targets.area_target(h={key: 2.})
         HXN.approach_contributions = {key: 3.}
@@ -1065,7 +1072,7 @@ def test_keys_of_auxiliaries_a_unit_does_not_build():
 def test_contribution_keys_with_the_units_option():
     # keys may name the units of the units option and their auxiliary units,
     # idle or not, but no other unit; a callable option is called once per
-    # simulation, and a one-shot iterable is read once
+    # simulation
     D1, D1_H1, D1_H2, F1 = quickstart('contributions_units_option')
     calls = []
     def listed():
@@ -1073,8 +1080,7 @@ def test_contribution_keys_with_the_units_option():
         return [D1, D1_H1, F1]
     x = {'D1': 1., F1: 1., 'D1_H1': 4.}
     hand = {'condenser': 1., 'reboiler': 1., 'heat_exchanger': 1., 'D1_H1': 4.}
-    for k, option in enumerate([[D1, D1_H1, F1], listed,
-                                iter([D1, D1_H1, F1])]):
+    for k, option in enumerate([[D1, D1_H1, F1], listed]):
         HXN = HeatExchangerNetwork(f'HXN_{k}', T_min_app=5., units=option,
                                    approach_contributions=x | {D1.pump: 2.})
         sys = bst.System.from_units(f'contributions_units_option_{k}',

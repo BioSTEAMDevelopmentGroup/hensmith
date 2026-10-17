@@ -301,11 +301,14 @@ which a unit falls idle does not fail. The same holds for an auxiliary that a
 unit may build but does not hold in a sample: ``biosteam.HXutilities``, for
 one, builds one exchanger per agent it needs, so a lower outlet temperature
 drops ``('X1', 'heat_exchangers[2]')``. A key of the ID that BioSTEAM gives an
-auxiliary, ``(owner.ID, name)`` or ``(owner.ID, 'name[k]')`` for a name of the
-``auxiliary_unit_names`` of the owner or of one of its auxiliaries, is valid
-whether or not that auxiliary is built, as is an old auxiliary object of a unit
-at hand that none took the place of; while the auxiliary is missing, the key
-has no effect.
+auxiliary under a name of the ``auxiliary_unit_names`` of the owner or of one
+of its auxiliaries is valid whether or not that auxiliary is built, as is an
+old auxiliary object of a unit at hand that none took the place of; while the
+auxiliary is missing, the key has no effect. That ID is ``(owner.ID,
+'name[k]')`` where the attribute ``name`` holds a list of auxiliaries (as
+``heat_exchangers`` of ``HXutilities`` does) and ``(owner.ID, name)`` where it
+holds a single one, so ``('X1', 'heat_exchangers')`` or ``('D1',
+'condenser[0]')`` still raise.
 
 **The cache.** With ``cache_network=True``, a cached network is reused only
 while the explicit contributions resolve to the same value for every stream

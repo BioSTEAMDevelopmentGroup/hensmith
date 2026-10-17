@@ -305,11 +305,13 @@ class HeatExchangerNetwork(bst.Facility):
     no effect, so that, e.g., Monte Carlo samples do not fail. A key of an
     auxiliary that a unit may build but does not hold in a simulation is
     valid too, and has no effect: an old auxiliary object of the unit that
-    none took the place of, or ``(owner.ID, name)`` or ``(owner.ID,
-    'name[k]')``, the IDs biosteam gives auxiliaries, for a name of the
-    `auxiliary_unit_names` of the owner or of one of its auxiliaries (e.g.
-    ``('X1', 'heat_exchangers[2]')`` while a `biosteam.HXutilities` X1,
-    which builds one exchanger per agent it needs, needs fewer). A callable is
+    none took the place of, or the ID biosteam gives an auxiliary under a
+    name of the `auxiliary_unit_names` of the owner or of one of its
+    auxiliaries: ``(owner.ID, 'name[k]')`` where the attribute `name` holds a
+    list of auxiliaries (e.g. ``('X1', 'heat_exchangers[2]')`` while a
+    `biosteam.HXutilities` X1, which builds one exchanger per agent it needs,
+    needs fewer), and ``(owner.ID, name)`` where it holds a single one (so
+    ``('X1', 'heat_exchangers')`` raises). A callable is
     called once per heat utility at every simulation (also to check a
     cached network, and again if a failed cache synthesizes anew), in the
     order of the facility's heat utilities: it should be pure. After a
