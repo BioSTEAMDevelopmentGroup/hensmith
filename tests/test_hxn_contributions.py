@@ -40,15 +40,17 @@ C. Non-uniform contributions against INDEPENDENT references: a closed-form
 D. Keys and validation: the value domain (None or nan, else a finite
    number > 0); the mapping, sequence and callable forms; keys naming
    units, auxiliary units through their owners (the nearest key wins),
-   auxiliaries of one ID under different owners and stale auxiliaries, and
-   the units option; unknown keys, conflicting keys and bad values,
-   checked before any stream is flashed and, in the facility, even for
-   idle units.
+   auxiliaries of one ID under different owners, stale auxiliaries,
+   auxiliaries a unit holds under other IDs than biosteam's or without an
+   owner, and the units option; unknown keys, conflicting keys and bad
+   values, checked before any stream is flashed and, in the facility, even
+   for idle units.
 E. The ``cache_network`` rule: a cached network is reused while the
    explicit contributions resolve to the same values per stream.
 """
 import math
 import random
+import re
 import numpy as np
 import pytest
 import biosteam as bst
@@ -1095,6 +1097,151 @@ def test_keys_of_auxiliaries_a_unit_does_not_build():
     hus = bst.process_tools.heat_exchanger_utilities_from_units([X1, X2])
     assert hxn_synthesis._stream_contributions(hus, tuple_key) == [None, None]
     assert hxn_synthesis._stream_contributions(hus, {old: 3.}) == [None, None]
+
+class ListedHeaters(bst.Unit):
+    """Two heaters in the list ``hxs``, built as some biosteam units build
+    their auxiliaries (the high-rate wastewater reactors, say): under IDs of
+    their own (``'<ID>_hx<k>'``), not the ``'hxs[k]'`` that
+    `biosteam.Unit.auxiliary` gives."""
+    _N_ins = 1
+    _N_outs = 1
+    auxiliary_unit_names = ('hxs',)
+
+    def _init(self, Ts=(330., 360.)):
+        self.hxs = [bst.HXutility(f'.{self.ID}_hx{k}', ins=bst.Stream(None),
+                                  outs=bst.Stream(None), T=T, rigorous=False)
+                    for k, T in enumerate(Ts)]
+
+    def _run(self):
+        feed = self.ins[0]
+        for hx in self.hxs:
+            hx.ins[0].copy_like(feed)
+            hx.simulate()
+            feed = hx.outs[0]
+        self.outs[0].copy_like(feed)
+
+    def _design(self): pass
+    def _cost(self): pass
+
+def test_keys_of_auxiliaries_under_other_IDs():
+    # where a unit holds an auxiliary under another ID than the one biosteam
+    # gives it ('' for the heater of an EnzymeTreatment, '<ID>_hx<k>' for
+    # ListedHeaters'), a key of biosteam's ID names nothing and raises, with
+    # the held unit's key in the message, for approach contributions and
+    # film coefficients, in and outside the facility; the held unit's own
+    # key and its owner's apply, and a list place past the end stays valid
+    # (no effect)
+    bst.main_flowsheet.set_flowsheet('contributions_other_IDs')
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    feed = bst.Stream('feed', Water=1000., units='kmol/hr', T=300.)
+    T1 = bst.units.EnzymeTreatment('T1', ins=feed, T=340.)
+    water = bst.Stream('water', Water=500., units='kmol/hr', T=300.)
+    U = ListedHeaters('U', ins=water)
+    hot = bst.Stream('hot', Water=1500., units='kmol/hr', T=420., P=5e5)
+    H1 = bst.HXutility('H1', ins=hot, T=320., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=10.)
+    sys = bst.System.from_units('contributions_other_IDs',
+                                units=[T1, U, H1, HXN])
+    simulate_strictly(sys)
+    hx = T1.heat_exchanger
+    assert hx.ID == '' and [i.ID for i in U.hxs] == ['U_hx0', 'U_hx1']
+
+    def used(x):
+        HXN.approach_contributions = x
+        simulate_strictly(sys)
+        return dict(zip(HXN.original_heat_exchangers,
+                        HXN.synthesis_info['approach_contributions'].tolist()))
+
+    default = used(None)
+    assert set(default) == {hx, *U.hxs, H1}
+    for x, given in [({'T1': 2.}, {hx: 2.}), ({('T1', ''): 2.}, {hx: 2.}),
+                     ({hx: 2.}, {hx: 2.}),
+                     ({'U': 3.}, dict.fromkeys(U.hxs, 3.)),
+                     ({('U', 'U_hx1'): 3.}, {U.hxs[1]: 3.}),
+                     ({('U', 'hxs[2]'): 3.}, {})]:
+        assert used(x) == default | given
+    bad = [(('T1', 'heat_exchanger'), r"T1\.heat_exchanger is \('T1', ''\)"),
+           (('U', 'hxs[1]'), r"U\.hxs\[1\] is \('U', 'U_hx1'\)")]
+    for key, hint in bad:
+        HXN.approach_contributions = {key: 2.}
+        with pytest.raises(ValueError, match='name no unit: '
+                           + re.escape(repr(key)) + '.*; ' + hint):
+            sys.simulate()
+    HXN.approach_contributions = None
+    simulate_strictly(sys)
+    targets = HXN.targets()
+    area = targets.area_target()
+    assert targets.area_target(h={('T1', ''): .5}) != area
+    assert targets.area_target(h={('T1', ''): .5}) == targets.area_target(
+        h={'T1': .5})
+    assert targets.area_target(h={('U', 'hxs[2]'): .5}) == area
+    for key, hint in bad:
+        with pytest.raises(ValueError, match='h keys that name no stream: '
+                           + re.escape(repr(key)) + '.*; ' + hint):
+            targets.area_target(h={key: .5})
+    # outside the facility, the universe is that of the heat utilities
+    hus = bst.process_tools.heat_exchanger_utilities_from_units([T1, U, H1])
+    assert [hu.unit for hu in hus] == [hx, *U.hxs, H1]
+    assert hxn_synthesis._stream_contributions(hus, {('T1', ''): 2.}) == [
+        2., None, None, None]
+    for key, hint in bad:
+        with pytest.raises(ValueError, match=hint):
+            hxn_synthesis._stream_contributions(hus, {key: 2.})
+
+def test_keys_of_auxiliaries_held_without_an_owner():
+    # biosteam.MultistageCompressor builds its compressors and intercoolers
+    # anew, without an owner, whenever pr changes (System.from_units sets
+    # the owners of those that exist when it is called): the facility takes
+    # the compressor as their owner, so 'K1' and ('K1', 'K1_H1') apply and
+    # the bare 'K1_H1' raises in every sample, whichever order the system
+    # was built in, and the user's objects are left as they are
+    for presimulated in (False, True):
+        name = f'contributions_no_owner_{presimulated}'
+        bst.main_flowsheet.set_flowsheet(name)
+        bst.settings.set_thermo(['Water', 'Methane'], cache=True)
+        gas = bst.Stream('gas', Methane=100., units='kmol/hr', T=300.,
+                         P=101325., phase='g')
+        K1 = bst.MultistageCompressor('K1', ins=gas, pr=2., n_stages=3,
+                                      eta=0.7)
+        cold = bst.Stream('cold', Water=200., units='kmol/hr', T=290.,
+                          P=5e5)
+        C1 = bst.HXutility('C1', ins=cold, T=350., rigorous=False)
+        if presimulated: K1.simulate()
+        HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
+        sys = bst.System.from_units(name, units=[K1, C1, HXN])
+
+        def used(x):
+            HXN.approach_contributions = x
+            simulate_strictly(sys)
+            return dict(zip(HXN.original_heat_exchangers, HXN.synthesis_info[
+                'approach_contributions'].tolist()))
+
+        for k, pr in enumerate((2., 2.2, 2.)):
+            K1.pr = pr
+            default = used(None)
+            hxs = K1.hxs
+            assert set(default) == {*hxs, C1}
+            assert [hx.ID for hx in hxs] == ['K1_H1', 'K1_H2', 'K1_H3']
+            assert used({'K1': 2.}) == default | dict.fromkeys(hxs, 2.)
+            assert used({('K1', 'K1_H1'): 2.}) == default | {hxs[0]: 2.}
+            HXN.approach_contributions = {'K1_H1': 2.}
+            with pytest.raises(ValueError,
+                               match=r"name no unit: 'K1_H1' .*; 'K1_H1' is "
+                                     r"\('K1', 'K1_H1'\)"):
+                sys.simulate()
+            HXN.approach_contributions = None
+            simulate_strictly(sys)
+            targets = HXN.targets()
+            area = targets.area_target()
+            assert targets.area_target(h={'K1': .5}) != area
+            assert targets.area_target(h={'K1': .5}) == targets.area_target(
+                h={('K1', f'K1_H{n}'): .5 for n in (1, 2, 3)})
+            with pytest.raises(ValueError, match='h keys that name no stream'):
+                targets.area_target(h={'K1_H1': .5})
+            # the owners as biosteam left them: set by System.from_units for
+            # the intercoolers it saw, none for those built since
+            owner = K1 if presimulated and k == 0 else None
+            assert all(getattr(hx, '_owner', None) is owner for hx in hxs)
 
 def test_contribution_keys_with_the_units_option():
     # keys may name the units of the units option and their auxiliary units,

@@ -768,54 +768,99 @@ def _pinch_cut(table):
     arriving = table.residual - point_total
     return 'below' if arriving[k] <= table.residual[k] else 'above'
 
-def _unit_name(unit):
-    """``(owner.ID, unit.ID)``, with the top owner (``(ID, ID)`` for a unit
-    without an owner): the unit's tuple key."""
-    return unit.owner.ID, unit.ID
+def _parent(unit, owners=None):
+    """The unit one step up the owner chain of `unit`: ``unit._owner`` or,
+    without one, the unit that holds `unit` by `owners` (see
+    `_held_owners`), or None for a top unit."""
+    owner = getattr(unit, '_owner', None)
+    if owner is None and owners:
+        held = owners.get(id(unit))
+        if held is not None and held[0] is unit: owner = held[1]
+    return owner
 
-def _id_path(unit):
-    """The IDs of `unit` and of its owners in turn, ``(unit.ID,
-    unit._owner.ID, ..., top.ID)``, which tell apart auxiliary units of the
-    same ID under different owners."""
+def _top(unit, owners=None):
+    """The top owner of `unit` along `_parent` (`unit` itself without an
+    owner)."""
+    while (owner := _parent(unit, owners)) is not None: unit = owner
+    return unit
+
+def _held_owners(units):
+    """
+    The owners that the units at hand give the auxiliary units they hold
+    without setting their owner: a dict from the id of such an auxiliary to
+    ``(auxiliary, holder)``, for each `biosteam.Unit` without an ``_owner``
+    among the `auxiliary_units` of a unit of `units` or of one on their
+    owner chains (the first holder wins; none that would close a loop).
+    `biosteam.System.from_units` sets the owners of the auxiliaries that
+    exist when it is called, but some units build theirs anew without one:
+    `biosteam.MultistageCompressor` rebuilds its compressors and
+    intercoolers whenever `pr` or `n_stages` changes, so the keys of its
+    ID cover them only by this relation (see `_parent`). Nothing is
+    mutated.
+    """
+    owners = {}
+    for unit in _owner_chains(units):
+        for aux in getattr(unit, 'auxiliary_units', ()):
+            if (not isinstance(aux, bst.Unit)
+                    or getattr(aux, '_owner', None) is not None
+                    or id(aux) in owners):
+                continue
+            above = unit
+            while above is not None and above is not aux:
+                above = _parent(above, owners)
+            if above is None: owners[id(aux)] = (aux, unit)
+    return owners
+
+def _unit_name(unit, owners=None):
+    """``(owner.ID, unit.ID)``, with the top owner (``(ID, ID)`` for a unit
+    without an owner; owners along `_parent`): the unit's tuple key."""
+    return _top(unit, owners).ID, unit.ID
+
+def _id_path(unit, owners=None):
+    """The IDs of `unit` and of its owners in turn (along `_parent`),
+    ``(unit.ID, owner.ID, ..., top.ID)``, which tell apart auxiliary units
+    of the same ID under different owners."""
     path = []
     while unit is not None:
         path.append(unit.ID)
-        unit = getattr(unit, '_owner', None)
+        unit = _parent(unit, owners)
     return tuple(path)
 
-def _unit_message_name(unit):
+def _unit_message_name(unit, owners=None):
     """How messages name a unit: its tuple key (`_unit_name`), followed by
     its owners below the top one when there are any (the tuple key of an
     auxiliary of an auxiliary is shared by its namesakes)."""
-    path = _id_path(unit)
-    label = repr(_unit_name(unit))
+    path = _id_path(unit, owners)
+    label = repr(_unit_name(unit, owners))
     if len(path) <= 2: return label
     return f"{label} (of {' of '.join(map(repr, path[1:-1]))})"
 
-def _names_unit(key, unit, live=()):
+def _names_unit(key, unit, live=(), owners=None):
     """
     Whether the approach contribution key `key` (of a valid type, see
-    `_check_contribution_key`) names `unit`. A unit key names itself; a unit
-    key that is not a unit at hand (its id not in `live`, the ids of the
-    units at hand: a stale auxiliary that its owner rebuilt) names the unit
-    of the same `_id_path` instead. A tuple key names every unit of that
+    `_check_contribution_key`) names `unit`, with owners along `_parent`
+    (`owners`, see `_held_owners`). A unit key names itself; a unit key
+    that is not a unit at hand (its id not in `live`, the ids of the units
+    at hand: a stale auxiliary that its owner rebuilt) names the unit of
+    the same `_id_path` instead. A tuple key names every unit of that
     `_unit_name` (every auxiliary of that ID under that top owner, at any
     depth) and a str key the unit of that ID without an owner.
     """
     if isinstance(key, bst.Unit):
         if key is unit: return True
-        return id(key) not in live and _id_path(key) == _id_path(unit)
-    if isinstance(key, tuple): return key == _unit_name(unit)
-    return key == unit.ID and unit.owner is unit
+        return (id(key) not in live
+                and _id_path(key, owners) == _id_path(unit, owners))
+    if isinstance(key, tuple): return key == _unit_name(unit, owners)
+    return key == unit.ID and _parent(unit, owners) is None
 
-def _contribution_key_level(key, unit, live=()):
-    """The number of steps along the owner chain of `unit` (`unit`,
-    ``unit._owner``, ...) to the first unit that `key` names (see
-    `_names_unit`, which takes `live`), or None."""
+def _contribution_key_level(key, unit, live=(), owners=None):
+    """The number of steps along the owner chain of `unit` (`unit`, its
+    owner, ..., along `_parent` with `owners`) to the first unit that `key`
+    names (see `_names_unit`, which takes `live`), or None."""
     level = 0
     while unit is not None:
-        if _names_unit(key, unit, live): return level
-        unit = getattr(unit, '_owner', None)
+        if _names_unit(key, unit, live, owners): return level
+        unit = _parent(unit, owners)
         level += 1
     return None
 
@@ -835,98 +880,153 @@ def _check_contribution_key(key):
                     '(str) or (owner.ID, unit.ID) tuples, not '
                     f'{type(key).__name__!r} ({key!r})')
 
-def _owner_chains(units):
-    """Every unit on the owner chains of `units`, once each."""
+def _owner_chains(units, owners=None):
+    """Every unit on the owner chains of `units` (along `_parent` with
+    `owners`), once each."""
     found = {}
     for unit in units:
         while unit is not None and id(unit) not in found:
             found[id(unit)] = unit
-            unit = getattr(unit, '_owner', None)
+            unit = _parent(unit, owners)
     return list(found.values())
 
-def _names_unbuilt_auxiliary(key, universe, live):
+def _key_universe(units):
+    """The units that keys may name, given the units at hand `units`:
+    ``(universe, live, owners)``, the owner chains of `units` (see
+    `_owner_chains`) along the owners they give the auxiliaries they hold
+    (`owners`, see `_held_owners`), and the ids of the universe (`live`)."""
+    owners = _held_owners(units)
+    universe = _owner_chains(units, owners)
+    return universe, {id(u) for u in universe}, owners
+
+def _auxiliary_slots(key, universe, owners=None):
+    """
+    Where the units of `universe` hold the auxiliary unit of the tuple key
+    `key` by the ID that `biosteam.Unit.auxiliary` gives an auxiliary:
+    ``(owner.ID, 'name[k]')`` for the k-th of a list under the attribute
+    `name`, ``(owner.ID, name)`` for a single one, with `name` one of the
+    `auxiliary_unit_names` of a unit under the top owner ``owner.ID``
+    (along `_parent` with `owners`). Yields ``(unit, held)`` for each such
+    unit whose attribute takes that form or holds nothing (None or
+    missing), with `held` the `biosteam.Unit` there, or None if there is
+    none (nothing, an object that is not a unit, or a list too short).
+    """
+    owner_ID, ID = key
+    match = re.fullmatch(r'(.+)\[(0|[1-9]\d*)\]', ID)
+    name = match[1] if match else ID
+    for unit in universe:
+        if (_top(unit, owners).ID != owner_ID
+                or name not in getattr(unit, 'auxiliary_unit_names', ())):
+            continue
+        held = getattr(unit, name, None)
+        if held is not None and isinstance(held, list) != bool(match):
+            continue
+        if match and held is not None:
+            k = int(match[2])
+            held = held[k] if k < len(held) else None
+        yield unit, held if isinstance(held, bst.Unit) else None
+
+def _names_unbuilt_auxiliary(key, universe, live, owners=None):
     """
     Whether the key `key` (of a valid type, see `_check_contribution_key`),
     which names no unit of `universe` (see `_names_unit`; `live` holds the
-    ids of `universe`), names an auxiliary unit that a unit of `universe`
-    may build but does not hold now, as a `biosteam.HXutilities` builds one
-    exchanger per agent it needs: an old auxiliary object whose top owner is
-    in `universe` (rebuilt with fewer auxiliaries), or ``(owner.ID, ID)``
-    for the ID that biosteam gives an auxiliary, with `name` one of the
-    `auxiliary_unit_names` of a unit of `universe` under that top owner:
-    ``name[k]`` if that unit's attribute `name` holds a list of auxiliaries
-    (e.g. ``('X1', 'heat_exchangers[2]')``), ``name`` if it holds a single
-    one, and either while it holds none (None or missing). Such a key is
-    valid but names nothing.
+    ids of `universe`, `owners` the owners of `_parent`), names an
+    auxiliary unit that a unit of `universe` may build but does not hold
+    now, as a `biosteam.HXutilities` builds one exchanger per agent it
+    needs: an old auxiliary object whose top owner is in `universe`
+    (rebuilt with fewer auxiliaries), or a tuple key of the ID that biosteam
+    gives an auxiliary (see `_auxiliary_slots`) where a unit of `universe`
+    holds no unit, or holds the unit of that ID: ``('X1',
+    'heat_exchangers[2]')`` while the list ``X1.heat_exchangers`` is
+    shorter, say. Such a key is valid but names nothing. A slot that holds
+    a unit of another ID (``T1.heat_exchanger`` of a
+    `biosteam.EnzymeTreatment` T1 is ``('T1', '')``) does not make its key
+    valid (see `_unknown_key_hints`).
     """
     if isinstance(key, bst.Unit):
-        top = key.owner
+        top = _top(key, owners)
         return top is not key and id(top) in live
     if not isinstance(key, tuple): return False
-    owner_ID, ID = key
-    match = re.fullmatch(r'(.+)\[\d+\]', ID)
-    name = match[1] if match else ID
-    for unit in universe:
-        if (unit.owner.ID != owner_ID
-                or name not in getattr(unit, 'auxiliary_unit_names', ())):
-            continue
-        # biosteam's ID of an auxiliary under `name`: 'name[k]' while the
-        # attribute holds a list, else 'name' (either while it holds nothing)
-        held = getattr(unit, name, None)
-        if held is None or isinstance(held, list) == bool(match):
-            return True
-    return False
+    return any(held is None or held.ID == key[1]
+               for _, held in _auxiliary_slots(key, universe, owners))
 
-def _unknown_keys(keys, universe):
+def _unknown_keys(keys, universe, owners=None):
     """The keys of `keys` (units, str or pairs of str) that name neither a
-    unit of `universe` (see `_names_unit`) nor an auxiliary unit that one of
-    them may build (see `_names_unbuilt_auxiliary`)."""
+    unit of `universe` (see `_names_unit`, with owners along `_parent`)
+    nor an auxiliary unit that one of them may build (see
+    `_names_unbuilt_auxiliary`)."""
     live = {id(u) for u in universe}
     return [key for key in keys
-            if not any(_names_unit(key, u, live) for u in universe)
-            and not _names_unbuilt_auxiliary(key, universe, live)]
+            if not any(_names_unit(key, u, live, owners) for u in universe)
+            and not _names_unbuilt_auxiliary(key, universe, live, owners)]
+
+def _unknown_key_hints(keys, universe, owners=None):
+    """
+    Hints for the unknown keys `keys` (see `_unknown_keys`) that name a
+    unit of `universe` (owners along `_parent` with `owners`) by another
+    key: for a str key, each auxiliary unit of that ID (``"'condenser' is
+    ('D1', 'condenser')"``), and for a tuple key of the ID that biosteam
+    gives an auxiliary (see `_auxiliary_slots`), each unit held there under
+    another ID (``"T1.heat_exchanger is ('T1', '')"``). Returns them as
+    ``'; <hint>'`` each, joined ('' if none).
+    """
+    hints = {}
+    for key in keys:
+        if isinstance(key, str):
+            for unit in universe:
+                if unit.ID == key and _parent(unit, owners) is not None:
+                    hints[f'; {key!r} is {_unit_name(unit, owners)!r}'] = None
+        elif isinstance(key, tuple):
+            for unit, held in _auxiliary_slots(key, universe, owners):
+                if held is not None and held.ID != key[1]:
+                    hints[f'; {unit.ID}.{key[1]} is '
+                          f'{_unit_name(held, owners)!r}'] = None
+    return ''.join(hints)
 
 def _mapping_contributions(hus, mapping, units):
     """
     `_stream_contributions` of a mapping from keys naming units to
     contributions: checks the types of keys and values, then that every key
     names a unit of the universe (the owner chains of the units of `hus`
-    and of `units`, the units at hand of `_names_unit`) or an auxiliary
-    unit that one of them may build but does not hold now (see
-    `_names_unbuilt_auxiliary`: such a key names nothing), then that no two
-    keys of the same level for a unit of the universe give it different
-    values (None and nan are equal); then each heat utility takes the value
-    of the key of the lowest level on its unit's owner chain (None without
-    one).
+    and of `units`, the units at hand of `_names_unit`, along the owners
+    they give the auxiliaries they hold without one, see `_key_universe`)
+    or an auxiliary unit that one of them may build but does not hold now
+    (see `_names_unbuilt_auxiliary`: such a key names nothing), then that
+    no two keys of the same level for a unit of the universe give it
+    different values (None and nan are equal); then each heat utility takes
+    the value of the key of the lowest level on its unit's owner chain
+    (None without one).
     """
     items = []
     for key, value in mapping.items():
         _check_contribution_key(key)
         items.append((key, _contribution_value(value, f'key {key!r}')))
-    universe = _owner_chains([hu.unit for hu in hus] + list(units or ()))
-    live = {id(u) for u in universe}
-    unknown = _unknown_keys([key for key, _ in items], universe)
+    universe, live, owners = _key_universe([hu.unit for hu in hus]
+                                           + list(units or ()))
+    unknown = _unknown_keys([key for key, _ in items], universe, owners)
     if unknown:
         raise ValueError('approach_contributions keys that name no unit: '
                          f"{', '.join(map(repr, unknown))} (a key is a unit, "
                          'the ID of a unit without an owner, or (owner.ID, '
-                         'unit.ID))')
+                         'unit.ID)'
+                         f'{_unknown_key_hints(unknown, universe, owners)})')
     for unit in universe:
         first = {} # level -> (key, value)
         for key, value in items:
-            level = _contribution_key_level(key, unit, live)
+            level = _contribution_key_level(key, unit, live, owners)
             if level is None: continue
             other, other_value = first.setdefault(level, (key, value))
             if other_value != value:
                 raise ValueError(
                     f'approach_contributions keys {other!r} and {key!r} '
-                    f'give unit {_unit_message_name(unit)} different values '
-                    f'at the same level: {other_value!r} and {value!r}')
+                    f'give unit {_unit_message_name(unit, owners)} different '
+                    f'values at the same level: {other_value!r} and '
+                    f'{value!r}')
     values = []
     for hu in hus:
         best = None # (level, value) of the nearest key
         for key, value in items:
-            level = _contribution_key_level(key, hu.unit, live)
+            level = _contribution_key_level(key, hu.unit, live, owners)
             if level is not None and (best is None or level < best[0]):
                 best = (level, value)
         values.append(None if best is None else best[1])

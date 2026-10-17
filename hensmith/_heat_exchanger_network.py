@@ -291,11 +291,19 @@ class HeatExchangerNetwork(bst.Facility):
     reboiler of column D1 and ``('D1', 'condenser')`` overrides it for the
     condenser; a None or nan value is an explicit default that wins at its
     level like any other, and two keys of the same level for a unit must
-    agree. ID keys are the robust form: a unit that rebuilds its auxiliary
-    units at every simulation (e.g. `biosteam.HXutilities`) leaves a key
-    holding an old auxiliary, which then names the auxiliary that took its
-    place (the one of the same ID under owners of the same IDs), if any
-    (heat utility keys are rejected, since BioSTEAM replaces them at every
+    agree. A unit's owner is its `owner` or, for an auxiliary that a unit
+    available to the network holds without setting its owner, that unit:
+    a `biosteam.MultistageCompressor` K1 builds its compressors and
+    intercoolers anew whenever `pr` or `n_stages` changes, without an
+    owner, and ``'K1'`` still covers the intercoolers and ``('K1',
+    'K1_H1')`` names one in every simulation (the bare ``'K1_H1'`` names
+    nothing; user objects are not changed). ID keys are the robust form: a
+    unit that rebuilds its auxiliary units at every simulation (e.g.
+    `biosteam.HXutilities`) leaves a key holding an old auxiliary, which
+    then names the auxiliary that took its place (the one of the same ID
+    under owners of the same IDs), if any; an old auxiliary that never had
+    an owner (an old intercooler of K1) names none, and raises (heat
+    utility keys are rejected, since BioSTEAM replaces them at every
     simulation). The keys and values are checked against every unit
     available to the network and its nested auxiliary units before the
     heat utilities are taken: a key that names none of them, a bad value
@@ -305,13 +313,17 @@ class HeatExchangerNetwork(bst.Facility):
     no effect, so that, e.g., Monte Carlo samples do not fail. A key of an
     auxiliary that a unit may build but does not hold in a simulation is
     valid too, and has no effect: an old auxiliary object of the unit that
-    none took the place of, or the ID biosteam gives an auxiliary under a
-    name of the `auxiliary_unit_names` of the owner or of one of its
-    auxiliaries: ``(owner.ID, 'name[k]')`` where the attribute `name` holds a
-    list of auxiliaries (e.g. ``('X1', 'heat_exchangers[2]')`` while a
+    none took the place of, or the ID that `biosteam.Unit.auxiliary` gives
+    an auxiliary under a name of the `auxiliary_unit_names` of the owner or
+    of one of its auxiliaries, unless that place holds a unit of another
+    ID: ``(owner.ID, 'name[k]')`` where the attribute `name` holds a list of
+    auxiliaries (e.g. ``('X1', 'heat_exchangers[2]')`` while a
     `biosteam.HXutilities` X1, which builds one exchanger per agent it needs,
     needs fewer), and ``(owner.ID, name)`` where it holds a single one (so
-    ``('X1', 'heat_exchangers')`` raises). A callable is
+    ``('X1', 'heat_exchangers')`` raises). Not every unit gives its
+    auxiliaries that ID: the heater of a `biosteam.EnzymeTreatment` T1 has
+    the ID '', so ``('T1', 'heat_exchanger')`` raises, with a message that
+    gives the heater's key, ``('T1', '')``. A callable is
     called once per heat utility at every simulation (also to check a
     cached network, and again if a failed cache synthesizes anew), in the
     order of the facility's heat utilities: it should be pure. After a

@@ -280,11 +280,19 @@ the value of the key nearest to its unit along the unit's chain of owners,
 so ``'D1'`` covers a column's condenser and reboiler and
 ``('D1', 'condenser')`` overrides it for the condenser. A None or nan value
 is an explicit default that wins at its level like any value, and two keys
-of the same level for a unit must agree. ID keys are the robust form: a
-unit that rebuilds its auxiliary units at every simulation
-(``biosteam.HXutilities``, for one) leaves a key holding an old auxiliary
-object, which then names the auxiliary that took its place: the one of the
-same ID under owners of the same IDs, if any. Heat utilities cannot be keys,
+of the same level for a unit must agree. A unit's owner is its ``owner``,
+or, for an auxiliary that a unit available to the network holds without
+setting its owner, that unit (the user's objects are left as they are):
+``biosteam.MultistageCompressor`` builds its compressors and intercoolers
+anew, without an owner, whenever ``pr`` or ``n_stages`` changes, and
+``'K1'`` still covers the intercoolers of compressor K1 and ``('K1',
+'K1_H1')`` names one in every sample, while ``'K1_H1'`` names nothing. ID
+keys are the robust form: a unit that rebuilds its auxiliary units at every
+simulation (``biosteam.HXutilities``, for one) leaves a key holding an old
+auxiliary object, which then names the auxiliary that took its place: the
+one of the same ID under owners of the same IDs, if any (an old intercooler
+of K1, which never had an owner, names none and raises). Heat utilities
+cannot be keys,
 because BioSTEAM replaces them at every simulation; a value per heat
 utility is given by a callable
 ``f(hu)`` instead, which is called once per heat utility at every simulation
@@ -300,15 +308,20 @@ valid key whose unit holds no heat utility in a simulation (no duty,
 which a unit falls idle does not fail. The same holds for an auxiliary that a
 unit may build but does not hold in a sample: ``biosteam.HXutilities``, for
 one, builds one exchanger per agent it needs, so a lower outlet temperature
-drops ``('X1', 'heat_exchangers[2]')``. A key of the ID that BioSTEAM gives an
-auxiliary under a name of the ``auxiliary_unit_names`` of the owner or of one
-of its auxiliaries is valid whether or not that auxiliary is built, as is an
-old auxiliary object of a unit at hand that none took the place of; while the
-auxiliary is missing, the key has no effect. That ID is ``(owner.ID,
-'name[k]')`` where the attribute ``name`` holds a list of auxiliaries (as
-``heat_exchangers`` of ``HXutilities`` does) and ``(owner.ID, name)`` where it
-holds a single one, so ``('X1', 'heat_exchangers')`` or ``('D1',
-'condenser[0]')`` still raise.
+drops ``('X1', 'heat_exchangers[2]')``. A key of the ID that BioSTEAM's
+``Unit.auxiliary`` gives an auxiliary under a name of the
+``auxiliary_unit_names`` of the owner or of one of its auxiliaries is valid
+whether or not that auxiliary is built, as is an old auxiliary object of a
+unit at hand that none took the place of; while the auxiliary is missing,
+the key has no effect. That ID is ``(owner.ID, 'name[k]')`` where the
+attribute ``name`` holds a list of auxiliaries (as ``heat_exchangers`` of
+``HXutilities`` does) and ``(owner.ID, name)`` where it holds a single one,
+so ``('X1', 'heat_exchangers')`` or ``('D1', 'condenser[0]')`` still raise.
+Not every unit gives its auxiliaries that ID, and where the attribute holds
+a unit of another ID, the key raises: the heater of a
+``biosteam.EnzymeTreatment`` T1 has the ID ``''``, so ``('T1',
+'heat_exchanger')`` raises, with a message that gives the heater's key,
+``('T1', '')`` (``'T1'`` covers it too).
 
 **The cache.** With ``cache_network=True``, a cached network is reused only
 while the explicit contributions resolve to the same value for every stream

@@ -31,8 +31,8 @@ from ._curves import _T_EQ, _copy
 from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
-    _contribution_key_level, _owner_chains, _unknown_keys,
-    _unit_message_name)
+    _contribution_key_level, _key_universe, _unknown_keys,
+    _unknown_key_hints, _unit_message_name)
 
 __all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
            'plot_composite_curves', 'plot_grand_composite_curve',
@@ -1774,12 +1774,13 @@ class PinchTargets:
         it the same value. Unit keys may also name `key_units` (and their
         owners) and the auxiliaries that units may build but do not hold
         now, as approach contribution keys of the facility may, and then
-        have no effect.
+        have no effect. An auxiliary that a unit at hand holds without an
+        owner is that unit's (see `hensmith.hxn_synthesis._key_universe`).
         """
         N = self.is_hot.size
         units = self.units or ()
-        universe = _owner_chains([*units, *(self.key_units or ())])
-        live = {id(u) for u in universe}
+        universe, live, owners = _key_universe(
+            [*units, *(self.key_units or ())])
         items = []
         unknown = []
         for key, value in h.items():
@@ -1797,7 +1798,7 @@ class PinchTargets:
                 raise TypeError('h keys must be stream indices (int), units, '
                                 'unit IDs (str) or (owner.ID, unit.ID) tuples, '
                                 f'not {type(key).__name__!r} ({key!r})')
-            elif _unknown_keys([key], universe):
+            elif _unknown_keys([key], universe, owners):
                 unknown.append(key)
             items.append((key, _film_value(value, f'h of key {key!r}')))
         if unknown:
@@ -1805,19 +1806,21 @@ class PinchTargets:
                              f"{', '.join(map(repr, unknown))} (a key is a "
                              'stream index or, for targets of heat utilities, '
                              'a unit, the ID of a unit without an owner, or '
-                             '(owner.ID, unit.ID))')
+                             '(owner.ID, unit.ID)'
+                             f'{_unknown_key_hints(unknown, universe, owners)}'
+                             ')')
         unit_items = [(k, v) for k, v in items if not isinstance(k, Integral)]
         for unit in universe:
             first = {} # level -> (key, value)
             for key, value in unit_items:
-                level = _contribution_key_level(key, unit, live)
+                level = _contribution_key_level(key, unit, live, owners)
                 if level is None: continue
                 other, other_value = first.setdefault(level, (key, value))
                 if other_value != value:
                     raise ValueError(
                         f'h keys {other!r} and {key!r} give unit '
-                        f'{_unit_message_name(unit)} different values at the '
-                        f'same level: {other_value!r} and {value!r}')
+                        f'{_unit_message_name(unit, owners)} different values '
+                        f'at the same level: {other_value!r} and {value!r}')
         values = np.full(N, _H_DEFAULT)
         for j in range(N):
             best = None # (level, value) of the nearest key
@@ -1825,7 +1828,8 @@ class PinchTargets:
                 if isinstance(key, Integral):
                     level = -1 if key == j else None
                 else:
-                    level = _contribution_key_level(key, units[j], live)
+                    level = _contribution_key_level(key, units[j], live,
+                                                    owners)
                 if level is not None and (best is None or level < best[0]):
                     best = (level, value)
             if best is not None: values[j] = best[1]
