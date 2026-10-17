@@ -499,7 +499,9 @@ of ``T_min_app`` values, reusing the streams' curves (nothing is flashed
 again), and then refines the grid around the least total annualized cost. The
 cost is not smooth -- the units target jumps, the double pipe switches to a
 shell and tube, the pinch moves -- so the refinement only narrows a bracket,
-and ``at_bound`` flags an optimum at an end of the sweep. With approach
+and ``at_bound`` flags an optimum at an end of the sweep. A sweep with no
+finite total cost (an unserved utility everywhere, say) warns that its
+optimum is meaningless. With approach
 contributions, only the unspecified streams follow ``T_min_app``;
 ``scale_contributions=True`` scales the specified ones with it, the
 contribution scaling of Ahmad, Linnhoff & Smith (1990).

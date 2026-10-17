@@ -44,7 +44,7 @@ from hensmith import (HeatExchangerNetwork, PinchTargets, Supertargets, supertar
                       network_report, plot_composite_curves, plot_grand_composite_curve,
                       plot_supertargets)
 from hensmith.hxn_synthesis import _problem_table, temperature_interval_pinch_analysis
-from hensmith.targeting import _exchanger_costs, _economics, _profile_area
+from hensmith.targeting import _exchanger_costs, _economics, _lmtd, _profile_area
 from test_hxn import (build_system, cp_units, KEMP, simulate_HXN, simulate_strictly,
                       _gid_artists)
 from test_hxn_contributions import classic_cascade
@@ -654,6 +654,67 @@ def test_sensible_line_constant_cp():
     assert min_vertical_gap(*curves) == pytest.approx(dT, abs=1e-6)
     assert 0. < t.area_target([u]) < math.inf
 
+def sensible_line_sweep(t, agents, T_min_apps):
+    """``{T_min_app: utility targets}`` over a sweep of `t`, asserting that
+    the balanced composite curves keep min(T_min_app, dT) apart (no warning,
+    a finite area that falls with T_min_app)."""
+    dT, sweep, areas = bst.HeatUtility.dT, {}, []
+    for T_min_app in T_min_apps:
+        at = t.at(T_min_app)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter('always')
+            utilities = at.utility_targets(*agents)
+            areas.append(at.area_target(utilities))
+        assert not [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        curves = at.balanced_composite_curves(utilities)
+        assert min_driving_force(*curves) >= min(T_min_app, dT) - 1e-9
+        sweep[T_min_app] = utilities
+    assert np.all(np.isfinite(areas)) and np.all(np.diff(areas) < 0.)
+    return sweep
+
+def test_sensible_line_process_in_stretch():
+    # a process stream of the other kind inside a sensible agent's stretch:
+    # the line must keep dT from the process where the agent has taken little
+    # of its duty, not only at the stretch's warm end (cooling) or cold end
+    # (heating), which crossed the curves (area inf at any T_min_app)
+    dT, T_min_apps = bst.HeatUtility.dT, (1., 2., 3., 5., 8., 10.)
+    # chilled water serves H1 from 312.372 K (the utility pinch of cooling
+    # water) to 287.372 K, but C1, from 297 K, takes most of H1's heat above
+    # 297 K + T_min_app: the bound is there
+    t = targets('test_targeting_line_cold_in', [('H1', 518.9, 272.3, 4.99),
+                                                ('C1', 297., 450.3, 4.85)], 10.)
+    CHW = agent('chilled_water')
+    for T_min_app, utilities in sensible_line_sweep(t, (), T_min_apps).items():
+        assert [u.ID for u in utilities] == ['cooling_water', 'chilled_water',
+                                             'chilled_brine']
+        u = utilities[1]
+        T_C1 = 297. + T_min_app # H1 where C1 starts
+        below = 4.99 * kW * (T_C1 - u.T_out) # H1's heat below it
+        T_out = min(CHW.T_limit, CHW.T + (T_C1 - dT - CHW.T) * u.duty / below)
+        assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
+        priced = fresh_price(-u.duty, min(u.T_in, T_out + dT), u.T_out, CHW)[0]
+        assert u.cost == pytest.approx(priced, rel=1e-12)
+        if T_min_app <= 5.: assert T_out < CHW.T_limit - 2.
+    # its mirror: a hot oil (500 K, down to 300 K at most) serves C1 from 290
+    # K, but H1, up to 450 K, gives most of C1's heat below 450 K - T_min_app
+    t = targets('test_targeting_line_hot_in', [('C1', 290., 470., 5.),
+                                               ('H1', 450., 320., 4.85)], 10.)
+    oil = bst.UtilityAgent('test_targeting_hot_oil_in', Water=1, T=500., P=5e6,
+                           phase='l', thermo=bst.HeatUtility.thermo_water,
+                           T_limit=300., heat_transfer_price=1e-6)
+    q = (5. * 180. - 4.85 * 130.) * kW
+    for T_min_app, utilities in sensible_line_sweep(t, ([oil], []), T_min_apps).items():
+        (u,) = utilities
+        assert (u.T_in, u.T_out) == (pytest.approx(290., abs=1e-9),
+                                     pytest.approx(470., abs=1e-9))
+        assert u.duty == pytest.approx(q, rel=1e-12)
+        T_H1 = 450. - T_min_app # C1 where H1 starts
+        above = 5. * kW * (470. - T_H1) # C1's heat above it
+        T_out = oil.T - (oil.T - dT - T_H1) * q / above
+        assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
+        assert u.cost == pytest.approx(fresh_price(u.duty, T_out - dT, u.T_out, oil)[0],
+                                       rel=1e-12)
+
 def test_pricing_temperatures():
     dT = bst.HeatUtility.dT
     # the hot stream's top, 445 K shifted, is above every cold stream: medium
@@ -853,6 +914,42 @@ def test_exchanger_costs_match_biosteam(kemp_hxn):
     with pytest.raises(ValueError, match='material must be one of'):
         _exchanger_costs(500., material='steel')
 
+@pytest.mark.parametrize('A, P_psi, kind, material', [
+    (1., 14.7, 'Floating head', 'Carbon steel/carbon steel'), # F_l < 1
+    (2.1718, 150., 'Fixed head', 'Carbon steel/carbon steel'),
+    (149.999, 600., 'Floating head', 'Stainless steel/stainless steel'),
+    (150., 600., 'U tube', 'Stainless steel/stainless steel'),
+    (150., 14.7, 'Floating head', 'Carbon steel/carbon steel'),
+    (2000., 150., 'Fixed head', 'Carbon steel/brass'),
+    (5000., 600., 'Kettle vaporizer', 'Monel/Monel'),
+    (1e4, 14.7, 'Double pipe', 'Titanium/titanium')])
+def test_exchanger_costs_match_biosteam_design(A, P_psi, kind, material):
+    # biosteam's own costing of an exchanger with these design results
+    with bst.Flowsheet('test_targeting_costs'):
+        hx = bst.HXprocess('test_targeting_costs_hx', thermo=bst.HeatUtility.thermo_water,
+                           heat_exchanger_type=kind, material=material)
+        hx.isfurnace = False
+        hx.design_results.update({'Area': A, 'Total tube length': 20,
+                                  'Operating pressure': P_psi})
+        hx._cost()
+        hx._load_costs()
+    purchase, installed, kind = _exchanger_costs(A, P_psi * 101325 / 14.7, kind, material)
+    assert list(hx.purchase_costs) == [kind]
+    assert purchase == pytest.approx(hx.purchase_cost, rel=1e-12)
+    assert installed == pytest.approx(hx.installed_cost, rel=1e-12)
+
+def test_lmtd_nearly_equal():
+    from decimal import Decimal, localcontext
+    d2 = np.array([10., 10., 10., 10., 10., 10., 10., 1e-3, 7.])
+    d1 = d2 * np.array([1., 1. + 3e-12, 1. + 1e-10, 1. - 1e-7, 1. + 1e-3, 1.4, .6,
+                        1e6, 1e-6])
+    with localcontext() as context:
+        context.prec = 60
+        exact = [float(a) if a == b else float((a - b) / (a / b).ln())
+                 for a, b in zip(map(Decimal, d1), map(Decimal, d2))]
+    assert_allclose(_lmtd(d1, d2), exact, rtol=4e-16, atol=0)
+    assert_allclose(_lmtd(d2, d1), exact, rtol=4e-16, atol=0)
+
 def test_capital_target_formula():
     from biosteam.units.heat_exchange import compute_furnace_purchase_cost
     t = targets('test_targeting_capital', REF_A, 10.)
@@ -868,6 +965,17 @@ def test_capital_target_formula():
     assert capital['furnace_duty'] == 0.
     # a higher pressure costs more
     assert t.capital_cost_target(utilities, P=20e5)['installed_cost'] > capital['installed_cost']
+    assert t.capital_cost_target(utilities, P=np.float64(101325))['installed_cost'] == (
+        capital['installed_cost'])
+    finite = 'P must be a finite number'
+    for P, message in ((math.nan, finite), (math.inf, finite), (True, finite),
+                       ('2 bar', finite), (0., 'P must be > 0'), (-1e6, 'P must be > 0')):
+        with pytest.raises(ValueError, match=message):
+            t.capital_cost_target(utilities, P=P)
+        with pytest.raises(ValueError, match=message):
+            t.summary(P=P)
+        with pytest.raises(ValueError, match=message):
+            _exchanger_costs(500., P)
     # the furnace: one for all fuel, costed on the utility duty
     t = targets('test_targeting_capital_furnace', FURNACE, 10.)
     utilities = t.utility_targets()
@@ -1021,9 +1129,24 @@ def test_sweep(monkeypatch):
             (dict(dT=5.), TypeError, 'unexpected options'),
             (dict(h={'H9': 1.}), ValueError, 'name no stream'),
             (dict(h_utilities={'steam': 1.}), ValueError, 'name no agent'),
-            (dict(material='steel'), ValueError, 'material must be')):
+            (dict(material='steel'), ValueError, 'material must be'),
+            (dict(P=math.nan), ValueError, 'P must be a finite number'),
+            (dict(P='2 bar'), ValueError, 'P must be a finite number'),
+            (dict(P=True), ValueError, 'P must be a finite number'),
+            (dict(P=0.), ValueError, 'P must be > 0'),
+            (dict(P=-1e6), ValueError, 'P must be > 0')):
         with pytest.raises(error, match=message):
             supertarget(t, **kwargs)
+    # no finite TAC anywhere (the cooling is unserved): the optimum is
+    # meaningless, and the sweep says so
+    with pytest.warns(RuntimeWarning, match='no minimum approach temperature of the '
+                      'sweep has a finite TAC'):
+        unserved = supertarget(t, [5., 10.], refine=1, cooling_agents=[])
+    assert np.all(np.isnan(unserved['TAC'])) and unserved.T_min_app == 5.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        supertarget(t, [5., 10.], refine=0)
+    assert not [w for w in caught if 'finite TAC' in str(w.message)]
     # every stream with an approach contribution: T_min_app changes nothing
     # unless the contributions scale with it
     monkeypatch.undo()

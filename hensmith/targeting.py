@@ -403,10 +403,21 @@ def _bath(hot, cold):
         warn('vertical heat transfer at a non-positive driving force between '
              f'H = {x[k]:.6g} and {y[k]:.6g} kJ/hr', RuntimeWarning)
         return math.inf
-    with np.errstate(divide='ignore', invalid='ignore'):
-        LMTD = np.where(np.abs(d1 - d2) <= 1e-12 * np.maximum(d1, d2), d1,
-                        (d1 - d2) / np.log(d1 / d2))
+    LMTD = _lmtd(d1, d2)
     return float(np.sum((y - x) * (hot[4][i] + cold[4][j]) / 3600. / LMTD))
+
+def _lmtd(d1, d2):
+    """
+    Log-mean temperature differences [K] of the positive driving forces `d1`
+    and `d2` (arrays), to machine precision when they are nearly equal: the
+    log of their ratio is ``log1p((d1 - d2) / d2)`` for a ratio between 0.5
+    and 1.5 (where the difference is exact), and the LMTD is `d1` at
+    equality.
+    """
+    with np.errstate(divide='ignore', invalid='ignore'):
+        r = (d1 - d2) / d2
+        log = np.where(np.abs(r) < .5, np.log1p(r), np.log(d1 / d2))
+        return np.where(r == 0., d1, (d1 - d2) / log)
 
 def _check_exchanger(heat_exchanger_type, material):
     """Raise a ValueError unless biosteam knows the shell and tube
@@ -438,6 +449,7 @@ def _exchanger_costs(A, P=101325., heat_exchanger_type='Floating head',
         compute_shell_and_tube_material_factor,
         shell_and_tube_material_factor_coefficients)
     _check_exchanger(heat_exchanger_type, material)
+    P = _pressure(P)
     if math.isnan(A): return math.nan, math.nan, None
     if math.isinf(A): return math.inf, math.inf, None
     P_psi = P * 14.7 / 101325
@@ -483,6 +495,13 @@ def _real(x, name):
         value = float(x)
         if math.isfinite(value): return value
     raise ValueError(f'{name} must be a finite number, not {x!r}')
+
+def _pressure(P):
+    """``float(P)`` of the exchangers' pressure `P` [Pa], a finite number
+    > 0 (not a bool); a ValueError naming P otherwise."""
+    P = _real(P, 'P')
+    if P <= 0.: raise ValueError(f'P must be > 0 Pa, not {P!r}')
+    return P
 
 def _economics(interest=None, years=None, operating_hours=None, tea=None):
     """
@@ -684,13 +703,16 @@ class PinchTargets:
     one furnace for all fuel) [Linnhoff90]_ and costs each with biosteam's
     correlations at one pressure (biosteam takes each exchanger's highest
     inlet pressure: its pressure factor is up to about 12 % higher for
-    high pressure steam heaters): a double pipe below 150 ft² (whose cost
-    jumps from 3,208 to 20,516 USD at 150 ft²; the floating head
-    correlation, not monotone below about 126 ft², is not used there), a
-    shell and tube of any area above. The furnace is costed on the fuel's
-    utility duty. `summary` adds the total annualized cost, the installed
-    (bare module) cost times the capital recovery factor plus the utility
-    cost times the operating hours: no Lang factor and no working capital.
+    high pressure steam heaters): a double pipe below 150 ft² (at
+    biosteam's default CE of 567.5 and 1 atm, its base purchase cost of
+    about 3,211 USD just below 150 ft² jumps to 20,516 USD for a floating
+    head at 150 ft², and the installed cost from about 8,055 to 64,658 USD;
+    the floating head correlation, not monotone below about 126 ft², is not
+    used there), a shell and tube of any area above. The furnace is costed
+    on the fuel's utility duty. `summary` adds the total annualized cost,
+    the installed (bare module) cost times the capital recovery factor plus
+    the utility cost times the operating hours: no Lang factor and no
+    working capital.
 
     Examples
     --------
@@ -1521,6 +1543,7 @@ class PinchTargets:
         """`capital_cost_target` with resolved film coefficients (see
         `_area`), and the units target."""
         _check_exchanger(heat_exchanger_type, material)
+        P = _pressure(P)
         A = self._area(utilities, h, h_utilities)
         N = self.units_target(utilities)['total']
         fuel = [u for u in utilities if u.agent is not None and u.agent.isfuel]
@@ -1560,7 +1583,7 @@ class PinchTargets:
         h, h_utilities : optional
             Film coefficients, as `area_target` takes them.
         P : float, optional
-            Pressure of every shell [Pa]. Defaults to 101325.
+            Pressure of every shell [Pa], > 0. Defaults to 101325.
         heat_exchanger_type : str, optional
             biosteam's type of the shell and tube exchangers ('Floating
             head', 'Fixed head', 'U tube', 'Kettle vaporizer' or 'Double
@@ -1600,6 +1623,7 @@ class PinchTargets:
                    get('tea'))
         _check_exchanger(get('heat_exchanger_type', 'Floating head'),
                          get('material', 'Carbon steel/carbon steel'))
+        _pressure(get('P', 101325.))
         self._film_coefficients(get('h'))
         _utility_films((), get('h_utilities'),
                        [*(get('heating_agents') or ()),
@@ -1694,6 +1718,13 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     Returns
     -------
     Supertargets
+
+    Warns
+    -----
+    RuntimeWarning
+        If no minimum approach temperature of the sweep has a finite TAC
+        (each has an unserved utility or an infinite area): the optimum is
+        then the smallest one, and meaningless.
 
     Notes
     -----
@@ -1794,7 +1825,12 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
         for x in np.linspace(lo, hi, n_refine + 2)[1:-1]:
             if np.abs(evaluated - x).min() > 1e-12:
                 records.append(evaluate(float(x)))
-    return Supertargets(targets, records, options, scale_contributions)
+    sweep = Supertargets(targets, records, options, scale_contributions)
+    if not np.isfinite(sweep['TAC']).any():
+        warn('no minimum approach temperature of the sweep has a finite TAC '
+             '(each has an unserved utility or an infinite area), so its '
+             'optimum, the smallest, is meaningless', RuntimeWarning)
+    return sweep
 
 
 class Supertargets:
@@ -1882,10 +1918,7 @@ def _profile_area(x, dT, inv_U, ID):
         warn(f'{ID} transfers heat at a driving force of {dT.min():.6g} K',
              RuntimeWarning)
         return math.inf
-    d1, d2 = dT[:-1], dT[1:]
-    with np.errstate(divide='ignore', invalid='ignore'):
-        LMTD = np.where(np.abs(d1 - d2) <= 1e-12 * np.maximum(d1, d2), d1,
-                        (d1 - d2) / np.log(d1 / d2))
+    LMTD = _lmtd(dT[:-1], dT[1:])
     return float(np.sum(np.diff(x) / LMTD)) * inv_U / 3600.
 
 def _stage_profile(curve, H0, sign, f, Q):
