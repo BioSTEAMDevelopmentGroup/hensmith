@@ -1066,6 +1066,50 @@ def test_crf_and_tea():
     with pytest.raises(ValueError, match='years must be > 0'):
         t.summary(years=-1)
 
+def test_T_min_app_validated(kemp_hxn):
+    # supertarget's rule everywhere: finite and >= 0 (> 0 with approach
+    # contributions), before any target is computed
+    t = targets('test_targeting_T_min_app', REF_A, 10.)
+    units, HXN = kemp_hxn
+    for x, message in ((math.nan, 'a finite number'), (math.inf, 'a finite number'),
+                       (-10., '>= 0 K'), ('5', 'a finite number'),
+                       (True, 'a finite number')):
+        for build in (lambda: PinchTargets(t.streams_inlet, t.streams_quenched,
+                                           t.is_hot, x, curves=t.curves),
+                      lambda: PinchTargets.from_heat_utilities(t.heat_utilities, x),
+                      lambda: t.at(x), lambda: HXN.targets(x)):
+            with pytest.raises(ValueError, match=f'T_min_app must be {message}'):
+                build()
+    # 0 K is the limit (an infinite area); with contributions it is not allowed
+    assert t.at(0.).Q_hot == pytest.approx(40. * 3600., rel=1e-9)
+    with pytest.raises(ValueError, match='T_min_app must be finite and > 0'):
+        PinchTargets(t.streams_inlet, t.streams_quenched, t.is_hot, 0., [1., None])
+    # the system's sums by agent belong to no exchanger
+    with pytest.raises(ValueError, match=r'must belong to a heat exchanger \(hu.unit\)'):
+        PinchTargets.from_heat_utilities(HXN.system.heat_utilities, 10.)
+
+def test_agents_by_ID():
+    # the agents of utility_targets, summary and supertarget may be the IDs
+    # of biosteam's agents
+    t = targets('test_targeting_agent_IDs', REF_A, 10.)
+    heating = ['low_pressure_steam', 'high_pressure_steam']
+    cooling = ['cooling_water', 'chilled_water']
+    by_ID = dict(heating_agents=heating, cooling_agents=cooling)
+    agents = dict(heating_agents=[agent(i) for i in heating],
+                  cooling_agents=[agent(i) for i in cooling])
+    utilities = t.utility_targets(**by_ID)
+    assert [u.ID for u in utilities] == heating + cooling
+    assert utilities == t.utility_targets(**agents)
+    assert t.summary(**by_ID) == t.summary(**agents)
+    sweep = supertarget(t, [10.], refine=0, **by_ID)
+    assert sweep.options['heating_agents'] == agents['heating_agents']
+    with pytest.raises(ValueError, match="no heating agent 'cooling_water'"):
+        t.utility_targets(['cooling_water'])
+    with pytest.raises(ValueError, match="no cooling agent 'steam'"):
+        t.summary(cooling_agents=['steam'])
+    with pytest.raises(TypeError, match='heating_agents must be a sequence'):
+        t.utility_targets('low_pressure_steam')
+
 def test_optimum_T_min_app_closed_form():
     from biosteam.units.heat_exchange import (compute_double_pipe_purchase_cost,
                                               compute_floating_head_purchase_cost, p2)
@@ -1172,6 +1216,7 @@ def test_sweep(monkeypatch):
                       'sweep has a finite TAC'):
         unserved = supertarget(t, [5., 10.], refine=1, cooling_agents=[])
     assert np.all(np.isnan(unserved['TAC'])) and unserved.T_min_app == 5.
+    assert len(unserved.records) == 2 # not refined around nan
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter('always')
         supertarget(t, [5., 10.], refine=0)
@@ -1284,6 +1329,33 @@ def test_facility_targets_replaced_callable():
     assert HXN.targets().approach_contributions == (None, None, 2., None)
     HXN.approach_contributions = {'H2': 3.}
     assert HXN.targets().approach_contributions == (None, None, 3., None)
+
+def test_facility_targets_operating_hours(kemp_hxn):
+    # the facility's targets price over its system's operating hours (read
+    # at call time), as the report does, unless operating_hours or tea is
+    # given
+    units, HXN = kemp_hxn
+    sys = HXN.system
+    previous = sys.operating_hours
+    try:
+        sys.operating_hours = None
+        t = HXN.targets()
+        assert t.system is sys and t.at(20.).system is sys
+        s = t.summary()
+        assert s['operating_cost'] == 8000. * s['utility_cost']
+        sys.operating_hours = 8760.
+        s = t.summary()
+        assert s['operating_cost'] == 8760. * s['utility_cost']
+        assert network_report(HXN)['targets'] == pytest.approx(s, rel=1e-12)
+        for r in supertarget(t, [5., 10.], refine=0).records:
+            assert r['operating_cost'] == 8760. * r['utility_cost']
+        assert t.summary(operating_hours=100.)['operating_cost'] == 100. * s['utility_cost']
+        tea = types.SimpleNamespace(IRR=.1, duration=(0, 10), operating_hours=7920.)
+        assert t.summary(tea=tea)['operating_cost'] == 7920. * s['utility_cost']
+        t.system = None # settable: the default 8000 h again
+        assert t.summary()['operating_cost'] == 8000. * s['utility_cost']
+    finally:
+        sys.operating_hours = previous
 
 #: Keys of `network_report`.
 REPORT_KEYS = ['T_min_app', 'targets_T_min_app', 'status', 'applied', 'Q_hot', 'Q_cold',

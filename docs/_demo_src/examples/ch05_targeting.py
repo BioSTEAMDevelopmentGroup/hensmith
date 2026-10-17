@@ -111,7 +111,7 @@ def main():
         print('units:', targets.units_target(utilities))
         capital = targets.capital_cost_target(utilities)
         print(f"{capital['N_shells']} shells of {capital['shell_area']:.4g} m2, {capital['type']}")
-        summary = targets.summary()     # 8000 h/yr, 10 % interest over 10 years
+        summary = targets.summary()     # 10 % over 10 years; 8000 h/yr (no system hours)
         for key, value in summary.items():
             print(f'{key:<24} {value:.6g}')
         # [end:supertargets]
@@ -122,8 +122,9 @@ def main():
         print('T_min_app  Q_hot      Q_cold     area    units  installed  capital    operating  TAC')
         print('[K]        [kJ/hr]    [kJ/hr]    [m2]           [USD]      [USD/yr]   [USD/yr]   [USD/yr]')
         optimum = sweep.optimum
+        after = sweep.records[sweep.records.index(optimum) + 1]     # the next point evaluated
         for r in sweep.records:
-            if r['T_min_app'] in (1., 2., 5., 10., 15., 20., 25., 30.) or r is optimum:
+            if r['T_min_app'] in (1., 2., 5., 10., 15., 20., 25., 30.) or r is optimum or r is after:
                 print(f"{r['T_min_app']:<9.4g}  {r['Q_hot']:<9.4g}  {r['Q_cold']:<9.4g}  "
                       f"{r['area']:<6.0f}  {r['N_units']:<5d}  {r['installed_cost']:<9.4g}  "
                       f"{r['annualized_capital_cost']:<9.4g}  {r['operating_cost']:<9.4g}  {r['TAC']:.0f}")

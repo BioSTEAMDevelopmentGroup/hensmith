@@ -492,17 +492,24 @@ years at interest :math:`i`,
    \qquad \mathrm{CRF} = \frac{i (1 + i)^n}{(1 + i)^n - 1},
 
 with :math:`i` = 10 %, :math:`n` = 10 years and :math:`t_{op}` = 8000 h/yr
-by default, or taken from a BioSTEAM TEA (``tea=``). It counts the bare module
-cost of the exchangers only: no Lang factor and no working capital.
+by default, or taken from a BioSTEAM TEA (``tea=``). The targets of a facility
+(``HXN.targets()``) take :math:`t_{op}` from its system when the system has
+operating hours (a TEA sets them), as the network report does. It counts the
+bare module cost of the exchangers only: no Lang factor and no working capital.
 
 **The sweep.** :func:`~hensmith.supertarget` evaluates the targets over a grid
 of ``T_min_app`` values, reusing the streams' curves (nothing is flashed
 again), and then refines the grid around the least total annualized cost. The
 cost is not smooth -- the units target jumps, the double pipe switches to a
 shell and tube, the pinch moves -- so the refinement only narrows a bracket,
-and ``at_bound`` flags an optimum at an end of the sweep. A sweep with no
-finite total cost (an unserved utility everywhere, say) warns that its
-optimum is meaningless. With approach
+and ``at_bound`` flags an optimum at an end of the sweep. Where the targets do
+not depend on ``T_min_app`` -- below the threshold of a threshold problem, the
+utilities and the balanced composite curves stay the same -- the costs differ
+only by the discretization of the curves, by a tiny relative amount (4e-7
+of the total cost for the quickstart system), so the optimum is an arbitrary
+point of that flat stretch. A sweep with no finite
+total cost (an unserved utility everywhere, say) is not refined and warns that
+its optimum is meaningless. With approach
 contributions, only the unspecified streams follow ``T_min_app``;
 ``scale_contributions=True`` scales the specified ones with it, the
 contribution scaling of Ahmad, Linnhoff & Smith (1990).

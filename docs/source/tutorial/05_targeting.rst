@@ -206,7 +206,9 @@ targets the rest of the cost of a network.
   (1.47169e+07 USD/yr: 8000 h/yr by default). It counts the bare module cost
   of the exchangers only, no Lang factor and no working capital.
   ``interest=``, ``years=`` and ``operating_hours=`` change the economics, or
-  ``tea=`` takes them from a biosteam TEA.
+  ``tea=`` takes them from a biosteam TEA. The facility's targets know their
+  system: if it has operating hours (a TEA sets them), the summary and the
+  sweep below use them instead of 8000 h/yr. The quickstart system has none.
 
 Supertargeting: the least total annualized cost
 -----------------------------------------------
@@ -228,15 +230,18 @@ each ``T_min_app``, then refines the grid around the least TAC.
 The quickstart system is dominated by steam: its operating cost, 1.454e+07 to
 1.654e+07 USD/yr over the sweep, is about forty times its annualized capital
 cost, so the TAC follows the utility cost and falls as ``T_min_app`` does. Below
-2 K the system becomes a threshold problem -- at 1 and 1.848 K it needs no
-cold utility at all -- so the hot utility no longer changes and only the
-area, which shrinks as the approach grows, still moves the TAC. The least
-TAC is therefore at the threshold: the refinement places it at 1.848 K, the
-last point evaluated before the cold utility appears (it is inside the
-sweep, not at its bound), 6 USD/yr below the TAC at 1 K. From 2 K on, the
-cold utility needs a unit of its own (6 units), and between 10 and 15 K,
-where chapter 4's sweep saw the pinch move to the column condenser's vapor
-inlet, the units target jumps to 9.
+about 1.85 K the system is a threshold problem: it needs no cold utility at
+all, so the hot utility, its steam and the balanced composite curves no longer
+change with ``T_min_app``, and neither does any target. The TACs at 1 and at
+1.848 K differ by less than 7 USD/yr, 4e-7 of the TAC, which is no physical
+effect: the problem table's grid moves with ``T_min_app`` over the curved
+(vapor-liquid) profiles of the streams, and the area follows by 2e-5 of
+itself. Every ``T_min_app`` of that flat stretch is an optimum; the refinement
+happens to report the last one it evaluated, 1.848 K (inside the sweep, not at
+its bound). The real step comes at the next point, 1.853 K: the cold utility
+appears and needs a unit of its own (6 units), which adds about 12000 USD/yr
+to the TAC. Between 10 and 15 K, where chapter 4's sweep saw the pinch move to
+the column condenser's vapor inlet, the units target jumps to 9.
 
 .. figure:: /_static/images/examples/tutorial_05_supertargets.png
    :class: white-bg
@@ -247,7 +252,8 @@ inlet, the units target jumps to 9.
    the operating cost (red) plus the annualized capital cost (blue); the
    circle and the dashed line mark the least TAC, 1.494e+07 USD/yr at 1.848 K.
    Capital is a small fraction of the TAC, so the optimum has the least
-   utility and, of the approaches that share it, the least area.
+   utility: it is on the flat stretch below 1.85 K, where no cold utility (and
+   no unit for it) is needed, and any point of that stretch would do.
 
 A trade-off between capital and energy needs a system whose capital
 matters. The two streams below, a hot and a cold one of 100 kW/K each, are
@@ -324,7 +330,9 @@ network:
   larger area into equal shells. Neither is a bound on the other.
 
 The report's ``'targets'`` is :meth:`~hensmith.PinchTargets.summary` with the
-same options; ``exchanger_areas`` gives both areas of each exchanger, which is
+same options, and the network and its targets are priced over the same
+operating hours (the system's, if it has them, else 8000 h/yr);
+``exchanger_areas`` gives both areas of each exchanger, which is
 where a gap between the network and its target can be traced. The
 synthesis itself does not optimize area, capital or total cost: it reaches
 MER first and then keeps the number of exchangers low. Supertargeting is how

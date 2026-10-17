@@ -965,14 +965,17 @@ class HeatExchangerNetwork(bst.Facility):
         Parameters
         ----------
         T_min_app : float, optional
-            Minimum approach temperature [K]. Defaults to the facility's
-            `T_min_app`.
+            Minimum approach temperature [K], finite and >= 0 (> 0 with
+            approach contributions). Defaults to the facility's `T_min_app`.
 
         Returns
         -------
         PinchTargets
             The targets, with the facility's `approach_contributions` and
-            `force_ideal_thermo`.
+            `force_ideal_thermo`, and its `system`, whose operating hours
+            (if it has them, a TEA's for instance) `PinchTargets.summary`
+            and `hensmith.targeting.supertarget` then use by default, as
+            `hensmith.targeting.network_report` does.
 
         Raises
         ------
@@ -1056,17 +1059,21 @@ class HeatExchangerNetwork(bst.Facility):
             else:
                 # by unit only, which the network never changes
                 contributions = self._network_contributions(hus)
-            return PinchTargets._from_exchangers(
+            targets = PinchTargets._from_exchangers(
                 hxs, [i not in cold for i in range(len(hxs))], T_min_app,
                 contributions, self.force_ideal_thermo, None, hus)
+            targets.system = self.system
+            return targets
         if self.system is None and not self.units:
             raise RuntimeError('simulate the system (or give the facility its '
                                'units) before targeting')
         hx_utils = self._get_original_heat_utilties()
         hx_utils.sort(key=lambda x: x.duty) # as `_cost` sorts them
-        return PinchTargets.from_heat_utilities(
+        targets = PinchTargets.from_heat_utilities(
             hx_utils, T_min_app, self._network_contributions(hx_utils),
             self.force_ideal_thermo, self.sort_hus_by_T)
+        targets.system = self.system
+        return targets
 
     def get_original_hxs_associated_with_streams(self): # pragma: no cover
         original_units = self.system.units

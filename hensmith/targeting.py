@@ -503,6 +503,36 @@ def _pressure(P):
     if P <= 0.: raise ValueError(f'P must be > 0 Pa, not {P!r}')
     return P
 
+def _check_T_min_app(T_min_app):
+    """A ValueError naming `T_min_app` unless it is a finite number >= 0
+    [K] (not a bool), the rule of `supertarget`; > 0 with approach
+    contributions is checked with them (`_given_contributions`)."""
+    if _real(T_min_app, 'T_min_app') < 0.:
+        raise ValueError(f'T_min_app must be >= 0 K, not {T_min_app!r}')
+
+def _agents(agents, heating):
+    """`agents` as a list (None stays None: biosteam's lists, read when
+    used), each ID resolved among ``bst.HeatUtility.heating_agents`` (or
+    ``cooling_agents``) as they are now; a ValueError for an unknown ID."""
+    if agents is None: return None
+    kind = 'heating' if heating else 'cooling'
+    if isinstance(agents, (str, bst.UtilityAgent)):
+        raise TypeError(f'{kind}_agents must be a sequence of agents (or '
+                        f'their IDs), not {type(agents).__name__!r}')
+    known = bst.HeatUtility.heating_agents if heating else bst.HeatUtility.cooling_agents
+    resolved = []
+    for agent in agents:
+        if isinstance(agent, str):
+            match = [a for a in known if a.ID == agent]
+            if not match:
+                raise ValueError(
+                    f'no {kind} agent {agent!r} in bst.HeatUtility.{kind}_'
+                    f"agents ({', '.join(a.ID for a in known)}); pass the "
+                    'UtilityAgent itself for another one')
+            agent = match[0]
+        resolved.append(agent)
+    return resolved
+
 def _economics(interest=None, years=None, operating_hours=None, tea=None):
     """
     ``(crf, hours)``: the capital recovery factor [1/yr] and the operating
@@ -550,7 +580,8 @@ class PinchTargets:
     is_hot : Sequence[bool]
         True where the stream is cooled.
     T_min_app : float, optional
-        Minimum approach temperature [K]. Defaults to 5.
+        Minimum approach temperature [K], a finite number >= 0 (> 0 with
+        approach contributions), or a ValueError is raised. Defaults to 5.
     approach_contributions : Sequence[float or None], optional
         Approach temperature contribution of each stream [K], in stream
         order, as `problem_table` takes them: None or nan (unspecified:
@@ -603,6 +634,10 @@ class PinchTargets:
     force_ideal_thermo : bool
         Whether the stream copies use ideal thermodynamics (False when built
         from streams).
+    system : System or None
+        The system of the facility of `HeatExchangerNetwork.targets`, else
+        None (settable). If it has operating hours, `summary` (and so
+        `supertarget`) uses them unless `operating_hours` or `tea` is given.
 
     Notes
     -----
@@ -822,6 +857,7 @@ class PinchTargets:
         if is_hot.shape != (N,):
             raise ValueError(f'{is_hot.size} is_hot values given for {N} '
                              'streams')
+        _check_T_min_app(T_min_app)
         x = approach_contributions
         if x is not None:
             if (not isinstance(x, (Sequence, np.ndarray))
@@ -861,6 +897,7 @@ class PinchTargets:
         self.heat_utilities = None
         self.units = None
         self.force_ideal_thermo = False
+        self.system = None
         #: Grid index of the pinch.
         self._k_pinch = int(np.flatnonzero(table.Ts == table.pinch_T)[0])
         #: Threshold of every heat comparison [kJ/hr], the table's own.
@@ -878,10 +915,13 @@ class PinchTargets:
         Parameters
         ----------
         hus : Iterable[HeatUtility]
-            Heat utilities of heat exchangers (``hu.unit``). Zero-duty ones
-            are dropped.
+            Heat utilities of heat exchangers (``hu.unit``), such as
+            ``[hu for u in sys.units for hu in u.heat_utilities]``, not
+            ``sys.heat_utilities`` (sums by agent, of no unit). Zero-duty
+            ones are dropped.
         T_min_app : float, optional
-            Minimum approach temperature [K]. Defaults to 5.
+            Minimum approach temperature [K], finite and >= 0 (> 0 with
+            approach contributions). Defaults to 5.
         approach_contributions : Mapping, Sequence or callable, optional
             Approach temperature contributions [K] in any form
             `synthesize_network` takes (a sequence is aligned with `hus` as
@@ -901,6 +941,13 @@ class PinchTargets:
 
         """
         hus = list(hus)
+        _check_T_min_app(T_min_app)
+        if any(hu.unit is None for hu in hus):
+            raise ValueError('every heat utility must belong to a heat '
+                             'exchanger (hu.unit): take those of the units, '
+                             '[hu for u in sys.units for hu in '
+                             'u.heat_utilities], not System.heat_utilities '
+                             '(sums by agent, of no unit)')
         values = _explicit_contributions(hus, approach_contributions, T_min_app)
         arranged, N_heating = _arrange_heat_utilities(hus, sort_hus_by_T)
         if values is None:
@@ -919,6 +966,7 @@ class PinchTargets:
         """Targets of the process streams of the exchangers `hxs` (stream
         order, contributions resolved in stream order), labeled by unit by
         default."""
+        _check_T_min_app(T_min_app)
         streams_inlet, streams_quenched = _process_streams(hxs, force_ideal_thermo)
         if labels is None: labels = [_unit_label(hx) for hx in hxs]
         self = cls(streams_inlet, streams_quenched, is_hot, T_min_app,
@@ -936,7 +984,8 @@ class PinchTargets:
         Parameters
         ----------
         T_min_app : float
-            Minimum approach temperature [K].
+            Minimum approach temperature [K], finite and >= 0 (> 0 with
+            approach contributions).
         scale_contributions : bool, optional
             Scale the specified approach contributions by ``T_min_app /
             self.T_min_app`` (the contribution scaling of contribution-based
@@ -947,7 +996,8 @@ class PinchTargets:
         Returns
         -------
         PinchTargets
-            With the same streams, curves, labels, units and heat utilities.
+            With the same streams, curves, labels, units, heat utilities and
+            system.
 
         """
         c = self.approach_contributions
@@ -960,6 +1010,7 @@ class PinchTargets:
         new.heat_utilities = self.heat_utilities
         new.units = self.units
         new.force_ideal_thermo = self.force_ideal_thermo
+        new.system = self.system
         return new
 
     def __repr__(self):
@@ -1162,12 +1213,14 @@ class PinchTargets:
 
         Parameters
         ----------
-        heating_agents : Sequence[UtilityAgent], optional
-            Heating agents in order of preference; fuel agents (``isfuel``)
+        heating_agents : Sequence[UtilityAgent or str], optional
+            Heating agents in order of preference, or the IDs of agents of
+            ``bst.HeatUtility.heating_agents``; fuel agents (``isfuel``)
             take the remainder, the first one only. Defaults to
             ``bst.HeatUtility.heating_agents`` (read at call time).
-        cooling_agents : Sequence[UtilityAgent], optional
-            Cooling agents in order of preference. Defaults to
+        cooling_agents : Sequence[UtilityAgent or str], optional
+            Cooling agents in order of preference, or the IDs of agents of
+            ``bst.HeatUtility.cooling_agents``. Defaults to
             ``bst.HeatUtility.cooling_agents``.
 
         Returns
@@ -1183,10 +1236,10 @@ class PinchTargets:
             If no agent can serve part of the hot or cold utility target.
 
         """
-        if heating_agents is None: heating_agents = bst.HeatUtility.heating_agents
-        if cooling_agents is None: cooling_agents = bst.HeatUtility.cooling_agents
-        heating_agents = list(heating_agents)
-        cooling_agents = list(cooling_agents)
+        heating_agents = _agents(heating_agents, True)
+        cooling_agents = _agents(cooling_agents, False)
+        if heating_agents is None: heating_agents = list(bst.HeatUtility.heating_agents)
+        if cooling_agents is None: cooling_agents = list(bst.HeatUtility.cooling_agents)
         tol = self._tol
         heat, remaining = self._allocate(
             self._levels([a for a in heating_agents if not a.isfuel], True),
@@ -1610,15 +1663,21 @@ class PinchTargets:
                              heat_exchanger_type, material)[0]
 
     def _check_options(self, options):
-        """The options of `summary` (agents as lists), after raising for
-        any that `summary` would reject, before pricing anything."""
+        """The options of `summary` (agents as lists of agents, the
+        operating hours of `system` filled in if it has them and neither
+        `operating_hours` nor `tea` is given), after raising for any that
+        `summary` would reject, before pricing anything."""
         unknown = [i for i in options if i not in _SUMMARY_OPTIONS]
         if unknown:
             raise TypeError(f"unexpected options: {', '.join(map(repr, unknown))} "
                             f'(the options are {", ".join(_SUMMARY_OPTIONS)})')
         options = dict(options)
         for key in ('heating_agents', 'cooling_agents'):
-            if options.get(key) is not None: options[key] = list(options[key])
+            if options.get(key) is not None:
+                options[key] = _agents(options[key], key == 'heating_agents')
+        if options.get('operating_hours') is None and options.get('tea') is None:
+            hours = getattr(self.system, 'operating_hours', None)
+            if hours is not None: options['operating_hours'] = hours
         get = options.get
         _economics(get('interest'), get('years'), get('operating_hours'),
                    get('tea'))
@@ -1646,7 +1705,11 @@ class PinchTargets:
             `years` (default 10) and `operating_hours` (per year, default
             8000), each taken from `tea` when not given and `tea` is (its
             `IRR`, ``duration[1] - duration[0]`` and `operating_hours`
-            unless None).
+            unless None). Without `operating_hours` and `tea`, the
+            operating hours are those of `system` if it has them, as for
+            targets of `HeatExchangerNetwork.targets` in a system with
+            operating hours (a TEA's, for instance), so that they match
+            `network_report`.
 
         Returns
         -------
@@ -1724,8 +1787,8 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     -----
     RuntimeWarning
         If no minimum approach temperature of the sweep has a finite TAC
-        (each has an unserved utility or an infinite area): the optimum is
-        then the smallest one, and meaningless.
+        (each has an unserved utility or an infinite area): the sweep is
+        then not refined, and its optimum is the smallest one, meaningless.
 
     Notes
     -----
@@ -1744,6 +1807,17 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     rounds the spacing is the grid's times (2/9)**r for the defaults. A
     least TAC at the smallest or largest temperature evaluated is flagged
     (`Supertargets.at_bound`).
+
+    Where the targets do not depend on the minimum approach temperature
+    (below the threshold of a threshold problem, where neither the utilities
+    nor the balanced composite curves change), the TACs differ only by the
+    discretization of the streams' curves on the problem table's grid, by
+    a tiny relative amount, and the optimum is an arbitrary point of that
+    flat stretch: compare the TACs of its neighbors before reading anything
+    into its position.
+
+    Unless `operating_hours` or `tea` is given, the operating hours are
+    those of ``targets.system`` if it has them (see `PinchTargets.summary`).
 
     Examples
     --------
@@ -1817,6 +1891,8 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
         return targets.at(T_min_app, scale_contributions).summary(**options)
     records = [evaluate(float(x)) for x in np.unique(T)]
     for _ in range(refine):
+        if not any(math.isfinite(r['TAC']) for r in records):
+            break # nothing to refine around
         records.sort(key=lambda r: r['T_min_app'])
         i = _least_TAC(records)
         lo = records[max(i - 1, 0)]['T_min_app']
@@ -1829,8 +1905,9 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     sweep = Supertargets(targets, records, options, scale_contributions)
     if not np.isfinite(sweep['TAC']).any():
         warn('no minimum approach temperature of the sweep has a finite TAC '
-             '(each has an unserved utility or an infinite area), so its '
-             'optimum, the smallest, is meaningless', RuntimeWarning)
+             '(each has an unserved utility or an infinite area), so it is '
+             'not refined and its optimum, the smallest, is meaningless',
+             RuntimeWarning)
     return sweep
 
 
