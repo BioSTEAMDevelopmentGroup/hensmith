@@ -30,7 +30,8 @@ from ._curves import _T_EQ, _copy
 from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
-    _contribution_key_level, _names_unit, _owner_chains, _unit_name)
+    _contribution_key_level, _names_unit, _owner_chains,
+    _unit_message_name)
 
 __all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
            'plot_composite_curves', 'plot_grand_composite_curve',
@@ -1438,6 +1439,7 @@ class PinchTargets:
         N = self.is_hot.size
         units = self.units or ()
         universe = _owner_chains(units)
+        live = {id(u) for u in universe}
         items = []
         unknown = []
         for key, value in h.items():
@@ -1455,7 +1457,7 @@ class PinchTargets:
                 raise TypeError('h keys must be stream indices (int), units, '
                                 'unit IDs (str) or (owner.ID, unit.ID) tuples, '
                                 f'not {type(key).__name__!r} ({key!r})')
-            elif not any(_names_unit(key, u) for u in universe):
+            elif not any(_names_unit(key, u, live) for u in universe):
                 unknown.append(key)
             items.append((key, _film_value(value, f'h of key {key!r}')))
         if unknown:
@@ -1468,14 +1470,14 @@ class PinchTargets:
         for unit in universe:
             first = {} # level -> (key, value)
             for key, value in unit_items:
-                level = _contribution_key_level(key, unit)
+                level = _contribution_key_level(key, unit, live)
                 if level is None: continue
                 other, other_value = first.setdefault(level, (key, value))
                 if other_value != value:
                     raise ValueError(
                         f'h keys {other!r} and {key!r} give unit '
-                        f'{_unit_name(unit)!r} different values at the same '
-                        f'level: {other_value!r} and {value!r}')
+                        f'{_unit_message_name(unit)} different values at the '
+                        f'same level: {other_value!r} and {value!r}')
         values = np.full(N, _H_DEFAULT)
         for j in range(N):
             best = None # (level, value) of the nearest key
@@ -1483,7 +1485,7 @@ class PinchTargets:
                 if isinstance(key, Integral):
                     level = -1 if key == j else None
                 else:
-                    level = _contribution_key_level(key, units[j])
+                    level = _contribution_key_level(key, units[j], live)
                 if level is not None and (best is None or level < best[0]):
                     best = (level, value)
             if best is not None: values[j] = best[1]

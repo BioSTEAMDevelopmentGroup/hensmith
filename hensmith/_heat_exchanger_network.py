@@ -282,16 +282,20 @@ class HeatExchangerNetwork(bst.Facility):
     agent as usual. A key names a unit: the unit itself, the ID of a unit
     without an owner (e.g. ``'D1'``), or ``(owner.ID, unit.ID)`` for an
     auxiliary unit (e.g. ``('D1', 'condenser')``; a bare auxiliary ID names
-    nothing). A heat utility takes the value of the key nearest to its unit
-    along the unit's chain of owners, so ``'D1'`` covers the condenser and
-    the reboiler of column D1 and ``('D1', 'condenser')`` overrides it for
-    the condenser; a None or nan value is an explicit default that wins at
-    its level like any other, and two keys of the same level for a unit
-    must agree. ID keys are the robust form: a unit that rebuilds its
-    auxiliary units at every simulation (e.g. `biosteam.HXutilities`)
-    leaves a key holding an old auxiliary to match by its owner's ID and
-    its own (heat utility keys are rejected, since BioSTEAM replaces them at
-    every simulation). The keys and values are checked against every unit
+    nothing). ``owner`` is the top owner, so the pair names every auxiliary
+    of that ID under it: the heaters of two auxiliary flash drums of one
+    unit, say, are told apart by keying the heater objects or the drums. A
+    heat utility takes the value of the key nearest to its unit along the
+    unit's chain of owners, so ``'D1'`` covers the condenser and the
+    reboiler of column D1 and ``('D1', 'condenser')`` overrides it for the
+    condenser; a None or nan value is an explicit default that wins at its
+    level like any other, and two keys of the same level for a unit must
+    agree. ID keys are the robust form: a unit that rebuilds its auxiliary
+    units at every simulation (e.g. `biosteam.HXutilities`) leaves a key
+    holding an old auxiliary, which then names the auxiliary that took its
+    place (the one of the same ID under owners of the same IDs; heat
+    utility keys are rejected, since BioSTEAM replaces them at every
+    simulation). The keys and values are checked against every unit
     available to the network and its nested auxiliary units before the
     heat utilities are taken: a key that names none of them, a bad value
     or two conflicting keys raise a ValueError, even while their unit is
@@ -498,24 +502,26 @@ class HeatExchangerNetwork(bst.Facility):
             units = sys.units
         return units
 
-    def _candidate_units(self):
+    def _candidate_units(self, units=None):
         """The units that approach contribution keys may name: each unit of
-        `_get_units` followed by its nested auxiliary units, whether or not
-        it holds a heat utility the network takes."""
+        `units` (defaults to `_get_units`) followed by its nested auxiliary
+        units, whether or not it holds a heat utility the network takes."""
+        if units is None: units = self._get_units()
         candidates = []
-        for unit in self._get_units():
+        for unit in units:
             candidates.append(unit)
             candidates.extend([i for i in unit.nested_auxiliary_units
                                if isinstance(i, bst.Unit)])
         return candidates
 
-    def _network_contributions(self, hx_utils):
+    def _network_contributions(self, hx_utils, units=None):
         """
         The explicit approach contributions of `hx_utils` (aligned with
         it; None where unspecified), or None if none is given (see
         `hensmith.hxn_synthesis._explicit_contributions`). The keys are
-        checked against every candidate unit (`_candidate_units`), so a bad
-        key or value raises even while its unit holds no heat utility.
+        checked against every candidate unit (`_candidate_units` of `units`,
+        the units `hx_utils` were taken from if given), so a bad key or
+        value raises even while its unit holds no heat utility.
         """
         x = self.approach_contributions
         if x is None: return None
@@ -526,10 +532,10 @@ class HeatExchangerNetwork(bst.Facility):
                             f'has nothing to align with), not '
                             f'{type(x).__name__!r}')
         return _explicit_contributions(hx_utils, x, self.T_min_app,
-                                       units=self._candidate_units())
+                                       units=self._candidate_units(units))
 
-    def _get_original_heat_utilties(self):
-        units = self._get_units()
+    def _get_original_heat_utilties(self, units=None):
+        if units is None: units = self._get_units()
         ignored = self.ignored
         if ignored:
             if callable(ignored): ignored = ignored()
@@ -603,10 +609,13 @@ class HeatExchangerNetwork(bst.Facility):
         flowsheet = bst.Flowsheet(sys.ID + '_HXN')
         with flowsheet.temporary():
             self._restore_unit_heat_utilities()
-        hx_utils = self._get_original_heat_utilties()
+        # once per simulation, for both the heat utilities and the keys (a
+        # callable `units` is called, an iterable read, once)
+        units = list(self._get_units())
+        hx_utils = self._get_original_heat_utilties(units)
         # the explicit approach contributions by heat utility (resolved
         # once per simulation; None without any)
-        values = self._network_contributions(hx_utils)
+        values = self._network_contributions(hx_utils, units)
         value_of = (None if values is None
                     else {id(hu): v for hu, v in zip(hx_utils, values)})
         use_cached_network = False
@@ -1067,10 +1076,11 @@ class HeatExchangerNetwork(bst.Facility):
         if self.system is None and not self.units:
             raise RuntimeError('simulate the system (or give the facility its '
                                'units) before targeting')
-        hx_utils = self._get_original_heat_utilties()
+        units = list(self._get_units())
+        hx_utils = self._get_original_heat_utilties(units)
         hx_utils.sort(key=lambda x: x.duty) # as `_cost` sorts them
         targets = PinchTargets.from_heat_utilities(
-            hx_utils, T_min_app, self._network_contributions(hx_utils),
+            hx_utils, T_min_app, self._network_contributions(hx_utils, units),
             self.force_ideal_thermo, self.sort_hus_by_T)
         targets.system = self.system
         return targets

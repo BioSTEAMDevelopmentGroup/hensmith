@@ -769,26 +769,52 @@ def _pinch_cut(table):
     return 'below' if arriving[k] <= table.residual[k] else 'above'
 
 def _unit_name(unit):
-    """``(owner.ID, unit.ID)``: how messages name a unit (``(ID, ID)`` for
-    a unit without an owner)."""
+    """``(owner.ID, unit.ID)``, with the top owner (``(ID, ID)`` for a unit
+    without an owner): the unit's tuple key."""
     return unit.owner.ID, unit.ID
 
-def _names_unit(key, unit):
-    """Whether the approach contribution key `key` (of a valid type, see
-    `_check_contribution_key`) names `unit`: the unit itself, or one with
-    its owner's ID and its ID (a stale auxiliary that its owner rebuilt);
-    ``(owner.ID, unit.ID)``; or the ID of a unit without an owner."""
+def _id_path(unit):
+    """The IDs of `unit` and of its owners in turn, ``(unit.ID,
+    unit._owner.ID, ..., top.ID)``, which tell apart auxiliary units of the
+    same ID under different owners."""
+    path = []
+    while unit is not None:
+        path.append(unit.ID)
+        unit = getattr(unit, '_owner', None)
+    return tuple(path)
+
+def _unit_message_name(unit):
+    """How messages name a unit: its tuple key (`_unit_name`), followed by
+    its owners below the top one when there are any (the tuple key of an
+    auxiliary of an auxiliary is shared by its namesakes)."""
+    path = _id_path(unit)
+    label = repr(_unit_name(unit))
+    if len(path) <= 2: return label
+    return f"{label} (of {' of '.join(map(repr, path[1:-1]))})"
+
+def _names_unit(key, unit, live=()):
+    """
+    Whether the approach contribution key `key` (of a valid type, see
+    `_check_contribution_key`) names `unit`. A unit key names itself; a unit
+    key that is not a unit at hand (its id not in `live`, the ids of the
+    units at hand: a stale auxiliary that its owner rebuilt) names the unit
+    of the same `_id_path` instead. A tuple key names every unit of that
+    `_unit_name` (every auxiliary of that ID under that top owner, at any
+    depth) and a str key the unit of that ID without an owner.
+    """
     if isinstance(key, bst.Unit):
-        return key is unit or _unit_name(key) == _unit_name(unit)
+        if key is unit: return True
+        return id(key) not in live and _id_path(key) == _id_path(unit)
     if isinstance(key, tuple): return key == _unit_name(unit)
     return key == unit.ID and unit.owner is unit
 
-def _contribution_key_level(key, unit):
+def _contribution_key_level(key, unit, live=()):
     """The number of steps along the owner chain of `unit` (`unit`,
-    ``unit._owner``, ...) to the first unit that `key` names, or None."""
+    ``unit._owner``, ...) to the first unit that `key` names (see
+    `_names_unit`, which takes `live`), or None."""
     level = 0
     while unit is not None:
-        if _names_unit(key, unit): return level
+        if _names_unit(key, unit, live): return level
         unit = getattr(unit, '_owner', None)
         level += 1
     return None
@@ -823,18 +849,20 @@ def _mapping_contributions(hus, mapping, units):
     `_stream_contributions` of a mapping from keys naming units to
     contributions: checks the types of keys and values, then that every key
     names a unit of the universe (the owner chains of the units of `hus`
-    and of `units`), then that no two keys of the same level for a unit of
-    the universe give it different values (None and nan are equal); then
-    each heat utility takes the value of the key of the lowest level on its
-    unit's owner chain (None without one).
+    and of `units`, the units at hand of `_names_unit`), then that no two
+    keys of the same level for a unit of the universe give it different
+    values (None and nan are equal); then each heat utility takes the value
+    of the key of the lowest level on its unit's owner chain (None without
+    one).
     """
     items = []
     for key, value in mapping.items():
         _check_contribution_key(key)
         items.append((key, _contribution_value(value, f'key {key!r}')))
     universe = _owner_chains([hu.unit for hu in hus] + list(units or ()))
+    live = {id(u) for u in universe}
     unknown = [key for key, _ in items
-               if not any(_names_unit(key, u) for u in universe)]
+               if not any(_names_unit(key, u, live) for u in universe)]
     if unknown:
         raise ValueError('approach_contributions keys that name no unit: '
                          f"{', '.join(map(repr, unknown))} (a key is a unit, "
@@ -843,19 +871,19 @@ def _mapping_contributions(hus, mapping, units):
     for unit in universe:
         first = {} # level -> (key, value)
         for key, value in items:
-            level = _contribution_key_level(key, unit)
+            level = _contribution_key_level(key, unit, live)
             if level is None: continue
             other, other_value = first.setdefault(level, (key, value))
             if other_value != value:
                 raise ValueError(
                     f'approach_contributions keys {other!r} and {key!r} '
-                    f'give unit {_unit_name(unit)!r} different values at the '
-                    f'same level: {other_value!r} and {value!r}')
+                    f'give unit {_unit_message_name(unit)} different values '
+                    f'at the same level: {other_value!r} and {value!r}')
     values = []
     for hu in hus:
         best = None # (level, value) of the nearest key
         for key, value in items:
-            level = _contribution_key_level(key, hu.unit)
+            level = _contribution_key_level(key, hu.unit, live)
             if level is not None and (best is None or level < best[0]):
                 best = (level, value)
         values.append(None if best is None else best[1])
@@ -887,7 +915,8 @@ def _stream_contributions(hus, approach_contributions, units=None):
         return [_contribution_value(v, f'heat utility {k}')
                 for k, v in enumerate(values)]
     if callable(x):
-        return [_contribution_value(x(hu), f'unit {_unit_name(hu.unit)!r}')
+        return [_contribution_value(x(hu),
+                                    f'unit {_unit_message_name(hu.unit)}')
                 for hu in hus]
     raise TypeError('approach_contributions must be a mapping, a sequence or '
                     f'a callable, not {type(x).__name__!r}')
@@ -2055,12 +2084,17 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         / 2``) or a finite number > 0 (`T_min_app` must then be finite and
         > 0 too). Given as one of:
 
-        - a mapping ``{key: value}`` whose keys name units: a unit (the
-          same object, or one with the same ID and owner's ID: a stale
-          auxiliary that its owner rebuilt), ``(owner.ID, unit.ID)`` (the
-          unit's own ID twice for a unit without an owner) or the ID of a
-          unit without an owner (a bare auxiliary ID such as
-          ``'condenser'`` names nothing). A heat utility takes the value of
+        - a mapping ``{key: value}`` whose keys name units: a unit (that
+          very object; a stale auxiliary that its owner rebuilt, no longer
+          among the units of `hus` and their owners, names the one of the
+          same ID under owners of the same IDs instead),
+          ``(owner.ID, unit.ID)`` with the top owner (the unit's own ID
+          twice for a unit without an owner; it names every auxiliary of
+          that ID under that owner, at any depth, so the heaters of two
+          auxiliary flash drums are told apart by keying the drums or the
+          heater objects) or the ID of a unit without an owner (a bare
+          auxiliary ID such as ``'condenser'`` names nothing). A heat
+          utility takes the value of
           the key nearest to its unit along the unit's chain of owners: a
           unit's own key beats its owner's, which beats the owner's owner's
           (e.g. ``'D1'`` covers the condenser and the reboiler of column

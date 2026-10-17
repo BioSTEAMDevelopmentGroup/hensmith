@@ -38,8 +38,9 @@ C. Non-uniform contributions against INDEPENDENT references: a closed-form
    stream's pinch temperature is the shifted pinch plus its own shift.
 D. Keys and validation: the value domain (None or nan, else a finite
    number > 0); the mapping, sequence and callable forms; keys naming
-   units, auxiliary units through their owners (the nearest key wins) and
-   stale auxiliaries; unknown keys, conflicting keys and bad values,
+   units, auxiliary units through their owners (the nearest key wins),
+   auxiliaries of one ID under different owners and stale auxiliaries, and
+   the units option; unknown keys, conflicting keys and bad values,
    checked before any stream is flashed and, in the facility, even for
    idle units.
 E. The ``cache_network`` rule: a cached network is reused while the
@@ -51,7 +52,7 @@ import numpy as np
 import pytest
 import biosteam as bst
 from numpy.testing import assert_allclose
-from hensmith import hxn_synthesis, HeatExchangerNetwork
+from hensmith import hxn_synthesis, HeatExchangerNetwork, PinchTargets
 from hensmith import _planner as P
 from hensmith.hxn_synthesis import problem_table, synthesize_network, _pinch_cut
 from test_hxn import (cp_units, KEMP, R002 as R002_UNITS, planned_split,
@@ -762,6 +763,104 @@ def test_contribution_keys_on_auxiliary_units():
     assert hxn_synthesis._stream_contributions(stale_hus, {old: 2., 'U': 3.}) \
         == [2.] + [3.] * (len(stale_hus) - 1)
 
+class TwoFlash(bst.Unit):
+    """Two auxiliary flash drums, each with its own auxiliary heater: both
+    heaters have the tuple key ``(ID, 'heat_exchanger')``."""
+    _N_ins = 2
+    _N_outs = 4
+    auxiliary_unit_names = ('flash_a', 'flash_b')
+
+    def _init(self):
+        self.auxiliary('flash_a', bst.Flash, ins=self.ins[0],
+                       outs=self.outs[:2], V=0.5, P=101325)
+        self.auxiliary('flash_b', bst.Flash, ins=self.ins[1],
+                       outs=self.outs[2:], V=0.3, P=101325)
+
+    def _run(self):
+        self.flash_a.simulate()
+        self.flash_b.simulate()
+
+    def _design(self): pass
+    def _cost(self): pass
+
+class NestedHeaters(bst.Unit):
+    """A `biosteam.HXutilities` as an auxiliary unit: its exchangers, rebuilt
+    at every simulation, are auxiliaries of an auxiliary."""
+    _N_ins = 1
+    _N_outs = 1
+    auxiliary_unit_names = ('hxs',)
+
+    def _init(self):
+        self.auxiliary('hxs', bst.HXutilities, ins=self.ins[0],
+                       outs=self.outs[0], T=500., rigorous=False)
+
+    def _run(self): self.hxs.simulate()
+    def _design(self): pass
+    def _cost(self): pass
+
+def test_contribution_keys_on_nested_auxiliary_units():
+    # a unit key names that very unit, not a namesake under another owner;
+    # a tuple key names every auxiliary of that ID under the top owner
+    bst.main_flowsheet.set_flowsheet('contributions_nested')
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    a = bst.Stream('a', Water=100., Ethanol=20., units='kmol/hr', T=300.)
+    b = bst.Stream('b', Water=150., Ethanol=10., units='kmol/hr', T=300.)
+    U = TwoFlash('U', ins=(a, b))
+    hot = bst.Stream('hot', Water=400., units='kmol/hr', T=430., P=6e5)
+    C1 = bst.HXutility('C1', ins=hot, T=320., rigorous=False)
+    bst.System.from_units('contributions_nested', units=[U, C1]).simulate()
+    ha, hb = U.flash_a.heat_exchanger, U.flash_b.heat_exchanger
+    hus = bst.process_tools.heat_exchanger_utilities_from_units([U, C1])
+    assert [hu.unit for hu in hus] == [ha, hb, C1]
+    assert ha.ID == hb.ID == 'heat_exchanger'
+
+    def resolve(x):
+        return hxn_synthesis._stream_contributions(hus, x)
+
+    assert resolve({ha: 2.}) == [2., None, None]
+    assert resolve({ha: 2., hb: 6.}) == [2., 6., None]
+    assert resolve({('U', 'flash_b'): 6., ha: 2.}) == [2., 6., None]
+    assert resolve({('U', 'flash_a'): 2., ('U', 'flash_b'): 6.}) == [
+        2., 6., None]
+    assert resolve({('U', 'heat_exchanger'): 2.}) == [2., 2., None]
+    assert resolve({'U': 3., ha: 2.}) == [2., 3., None]
+    # a conflict names the unit with its owners below the top one
+    with pytest.raises(ValueError, match=r"give unit \('U', 'heat_exchanger'"
+                                         r"\) \(of 'flash_b'\) different"):
+        resolve({('U', 'heat_exchanger'): 2., hb: 6.5, ha: 2.})
+    with pytest.raises(ValueError, match=r"unit \('U', 'heat_exchanger'\) "
+                                         r"\(of 'flash_a'\) must be"):
+        resolve(lambda hu: 0. if hu.unit is ha else None)
+    # film coefficient keys of targets resolve the same way
+    t = PinchTargets.from_heat_utilities(hus, 10.)
+    j = next(j for j, unit in enumerate(t.units) if unit is ha)
+    area = t.area_target(h={ha: 2.})
+    assert area == t.area_target(h={j: 2.})
+    assert area != t.area_target(h={('U', 'heat_exchanger'): 2.})
+    # in the facility
+    HXN = HeatExchangerNetwork('HXN', T_min_app=10.)
+    sys = bst.System.from_units('contributions_nested_facility',
+                                units=[U, C1, HXN])
+    for x, given in [({ha: 2.}, {ha: 2.}), ({ha: 2., hb: 6.}, {ha: 2., hb: 6.})]:
+        HXN.approach_contributions = x
+        sys.simulate()
+        assert [given.get(hx, 5.) for hx in HXN.original_heat_exchangers] == (
+            HXN.synthesis_info['approach_contributions'].tolist())
+    # a stale auxiliary of an auxiliary names the one that took its place,
+    # and only that one
+    bst.settings.set_thermo(['Water'], cache=True)
+    water = bst.Stream('water', Water=100., T=300., P=5e6, units='kmol/hr')
+    V = NestedHeaters('V', ins=water)
+    V.simulate()
+    old = V.hxs.heat_exchangers[0]
+    V.simulate()
+    stale_hus = bst.process_tools.heat_exchanger_utilities_from_units([V])
+    assert len(stale_hus) > 1
+    assert all(hu.unit is not old for hu in stale_hus)
+    assert stale_hus[0].unit.ID == old.ID
+    assert hxn_synthesis._stream_contributions(
+        stale_hus, {old: 2., 'V': 3.}) == [2.] + [3.] * (len(stale_hus) - 1)
+
 def test_contribution_keys_in_the_facility():
     # the facility, simulated twice: every key resolves to the hand values
     D1, D1_H1, D1_H2, F1 = quickstart('contributions_keys_facility')
@@ -901,6 +1000,33 @@ def test_invalid_contributions_in_the_facility():
         simulate_strictly(sys)
         assert network_record(HXN) == reference
         assert HXN._resolved_contributions is None
+
+def test_contribution_keys_with_the_units_option():
+    # keys may name the units of the units option and their auxiliary units,
+    # idle or not, but no other unit; a callable option is called once per
+    # simulation, and a one-shot iterable is read once
+    D1, D1_H1, D1_H2, F1 = quickstart('contributions_units_option')
+    calls = []
+    def listed():
+        calls.append(None)
+        return [D1, D1_H1, F1]
+    x = {'D1': 1., F1: 1., 'D1_H1': 4.}
+    hand = {'condenser': 1., 'reboiler': 1., 'heat_exchanger': 1., 'D1_H1': 4.}
+    for k, option in enumerate([[D1, D1_H1, F1], listed,
+                                iter([D1, D1_H1, F1])]):
+        HXN = HeatExchangerNetwork(f'HXN_{k}', T_min_app=5., units=option,
+                                   approach_contributions=x | {D1.pump: 2.})
+        sys = bst.System.from_units(f'contributions_units_option_{k}',
+                                    units=[D1, D1_H1, D1_H2, F1, HXN])
+        simulate_strictly(sys)
+        assert HXN.synthesis_info['status'] == 'mer' # observed
+        assert HXN.synthesis_info['approach_contributions'].tolist() == [
+            hand[hx.ID] for hx in HXN.original_heat_exchangers]
+        if isinstance(option, list):
+            HXN.approach_contributions = x | {'D1_H2': 2.}
+            with pytest.raises(ValueError, match=r"name no unit: 'D1_H2'"):
+                sys.simulate()
+    assert len(calls) == 1
 
 # ---------------------------------------------------------------------------
 # E. Cache

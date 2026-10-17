@@ -268,20 +268,25 @@ contribution.
 
 **Keys in the facility.** :class:`~hensmith.HeatExchangerNetwork` takes a
 mapping or a callable, since the order of its streams is internal. A mapping's
-keys name units: a unit object (matched by identity, or by its owner's ID
-and its own), the ID of a unit without an owner (``'D1'``), or
-``(owner.ID, unit.ID)`` for an auxiliary unit (``('D1', 'condenser')``; a
-bare auxiliary ID such as ``'condenser'`` names nothing). A heat utility
-takes the value of
-the key nearest to its unit along the unit's chain of owners, so ``'D1'``
-covers a column's condenser and reboiler and ``('D1', 'condenser')``
-overrides it for the condenser. A None or nan value is an explicit default
-that wins at its level like any value, and two keys of the same level for a
-unit must agree. ID keys are the robust form: a unit that rebuilds its
-auxiliary units at every simulation (``biosteam.HXutilities``, for one)
-leaves a key holding an old auxiliary object to be matched by its owner's ID
-and its own. Heat utilities cannot be keys, because BioSTEAM replaces them
-at every simulation; a value per heat utility is given by a callable
+keys name units: a unit object (matched by identity), the ID of a unit
+without an owner (``'D1'``), or ``(owner.ID, unit.ID)`` for an auxiliary
+unit (``('D1', 'condenser')``; a bare auxiliary ID such as ``'condenser'``
+names nothing). The ``owner`` of a pair is the top owner, so a pair names
+every auxiliary of that ID under it, at any depth: if a unit holds two
+auxiliary flash drums, each with its own ``heat_exchanger``, the pair
+``('U', 'heat_exchanger')`` names both heaters, and the heater objects
+or the drums (``('U', 'flash_a')``) tell them apart. A heat utility takes
+the value of the key nearest to its unit along the unit's chain of owners,
+so ``'D1'`` covers a column's condenser and reboiler and
+``('D1', 'condenser')`` overrides it for the condenser. A None or nan value
+is an explicit default that wins at its level like any value, and two keys
+of the same level for a unit must agree. ID keys are the robust form: a
+unit that rebuilds its auxiliary units at every simulation
+(``biosteam.HXutilities``, for one) leaves a key holding an old auxiliary
+object, which then names the auxiliary that took its place: the one of the
+same ID under owners of the same IDs. Heat utilities cannot be keys,
+because BioSTEAM replaces them at every simulation; a value per heat
+utility is given by a callable
 ``f(hu)`` instead, which is called once per heat utility at every simulation
 and should therefore be pure (after a simulation, ``HXN.targets()`` takes the
 values that simulation resolved instead of calling it again, since
