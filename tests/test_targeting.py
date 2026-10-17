@@ -24,9 +24,14 @@ C. Supertargets: the area target against closed forms and an independent
 D. The facility and the report: the facility's targets equal the
    synthesis's bit for bit (before and after a simulation, with approach
    contributions and with replaced heat utilities), the report's areas
-   against terminal log-mean temperature differences, and no side effects
-   on the flowsheet, the agents' stream dumps or a later synthesis.
-E. Plots: stable gids whose data equal the curves.
+   against terminal log-mean temperature differences and against an
+   independent integration on the network's own streams (branches of a
+   split, phase changes), the report at the units' current states only
+   (a cached network re-simulated, stale states detected, also with ideal
+   thermodynamics), and no side effects on the flowsheet, the agents'
+   stream dumps or a later synthesis.
+E. Plots: stable gids whose data equal the curves, and readable labels
+   and markers.
 
 Reference A: H1 400 -> 300 K and C1 330 -> 440 K, both 1 kW/K, at
 T_min_app = 10 K: 50 kW hot and 40 kW cold utility, shifted pinch 390 K.
@@ -43,6 +48,7 @@ from numpy.testing import assert_allclose
 from hensmith import (HeatExchangerNetwork, PinchTargets, Supertargets, supertarget,
                       network_report, plot_composite_curves, plot_grand_composite_curve,
                       plot_supertargets)
+from hensmith._curves import _copy
 from hensmith.hxn_synthesis import _problem_table, temperature_interval_pinch_analysis
 from hensmith.targeting import _exchanger_costs, _economics, _lmtd, _profile_area
 from test_hxn import (build_system, cp_units, KEMP, simulate_HXN, simulate_strictly,
@@ -225,13 +231,36 @@ def kemp_hxn_replaced():
     return units, HXN
 
 @pytest.fixture(scope='module')
-def quickstart():
-    """The targets of the documentation's quickstart system at 5 K (two
-    auxiliary exchangers of the column D0)."""
+def quickstart_hxn():
+    """The documentation's quickstart system simulated with its facility at
+    5 K (two auxiliary exchangers of the column D0, a boiling and a
+    condensing stream): ``(sys, HXN)``."""
     sys, HXN, _ = build_system()
     sys.simulate()
-    hus = sorted(HXN.original_heat_utils, key=lambda hu: hu.duty)
+    return sys, HXN
+
+@pytest.fixture(scope='module')
+def quickstart(quickstart_hxn):
+    """The targets of the documentation's quickstart system at 5 K."""
+    hus = sorted(quickstart_hxn[1].original_heat_utils, key=lambda hu: hu.duty)
     return PinchTargets.from_heat_utilities(hus, 5.)
+
+def liquids(name, **kwargs):
+    """The liquids of the second example of `HeatExchangerNetwork` (and of
+    `network_report`) simulated with a facility at 10 K with the options
+    `kwargs`: ``(sys, HXN, units)``."""
+    bst.main_flowsheet.set_flowsheet(name)
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    def process_stream(ID, T_in, T_out, P, **kmol_hr):
+        inlet = bst.Stream(ID + '_in', T=T_in, P=P, phase='l',
+                           units='kmol/hr', **kmol_hr)
+        return bst.HXutility(ID, ins=inlet, T=T_out, rigorous=False)
+    units = [process_stream('H1', 400., 320., 5e5, Water=60.),
+             process_stream('H2', 390., 330., 5e5, Ethanol=30.),
+             process_stream('C1', 310., 410., 5e5, Water=150.),
+             process_stream('H3', 360., 300., 101325., Water=200.)]
+    sys, HXN = simulate_HXN(units, 10., **kwargs)
+    return sys, HXN, units
 
 # %% Composites and grand composite curve
 
@@ -1353,6 +1382,131 @@ def test_network_report(kemp_hxn):
         assert _profile_area(np.array([0., 1.]), np.array([5., 0.]), 2., 'HX') == math.inf
     assert _profile_area(np.array([0., kW]), np.array([5., 5.]), 2., 'HX') == 2. / 5.
 
+def flashed_T(stream, H):
+    """Temperature [K] of a copy of `stream` at equilibrium at the enthalpy
+    `H` [kJ/hr] and its own pressure."""
+    s = _copy(stream)
+    s.vle(H=H, P=s.P)
+    return s.T
+
+def independent_area(hx, n=41):
+    """
+    Area [m2] of an exchanger of a network with films of 1 kW/m2/K on both
+    sides, integrated independently of the targets: the process duty in n -
+    1 equal parts, the temperatures of its streams at each boundary from
+    flashes of copies of its own outlet and inlet streams (on a branch,
+    the branch's flow), log-mean in between; a utility's temperature linear
+    in the duty from its inlet (at the process outlet) to its outlet.
+    """
+    if isinstance(hx, bst.HXprocess):
+        hot = 0 if hx.ins[0].H > hx.outs[0].H else 1
+        hot_in, cold_out = hx.ins[hot], hx.outs[1 - hot]
+        x = np.linspace(0., hot_in.H - hx.outs[hot].H, n)
+        dT = np.array([flashed_T(hot_in, hot_in.H - q) - flashed_T(cold_out, cold_out.H - q)
+                       for q in x])
+    else:
+        hu = hx.heat_utilities[0]
+        s_in, s_out = hx.ins[0], hx.outs[0]
+        heating = s_out.H > s_in.H
+        x = np.linspace(0., abs(s_out.H - s_in.H), n)
+        T = np.array([flashed_T(s_out, s_out.H - q if heating else s_out.H + q) for q in x])
+        T_a, T_b = hu.inlet_utility_stream.T, hu.outlet_utility_stream.T
+        T_u = T_a + (T_b - T_a) * x / x[-1]
+        dT = T_u - T if heating else T - T_u
+    d1, d2 = dT[:-1], dT[1:]
+    LMTD = np.where(np.abs(d1 - d2) <= 1e-9 * d1, d1, (d1 - d2) / np.log(d1 / d2))
+    return float(np.sum(np.diff(x) / LMTD)) * 2. / kW
+
+def changes_phase(hx):
+    """Whether a stream of `hx` leaves it at another vapor fraction."""
+    return any(abs(s_in.vapor_fraction - s_out.vapor_fraction) > 1e-6
+               for s_in, s_out in zip(hx.ins, hx.outs))
+
+def test_network_report_independent_areas(quickstart_hxn):
+    # The report integrates each exchanger along the curves of its streams
+    # in the targets; an independent integration on the network's own
+    # streams agrees, across the breakpoints of a phase change inside an
+    # exchanger and on the branches of a split (a branch stage takes its
+    # fraction of the whole stream's curve). The quickstart network boils
+    # and condenses streams in process and utility exchangers alike.
+    _, split, _ = liquids('test_targeting_report_split', stream_splitting=True)
+    branches = {st.unit.ID: st.fraction for lc in split.stream_life_cycles
+                for st in lc.life_cycle if st.fraction != 1.}
+    assert sorted(branches) == ['HX_0_2_hs', 'HX_0_3_hs']
+    assert_allclose(sorted(branches.values()), [0.4799, 0.5201], atol=1e-4)
+    for HXN, rtol in ((split, 1e-4), (quickstart_hxn[1], 1e-3)):
+        report = network_report(HXN)
+        exchangers = {hx.ID: hx for hx in HXN.new_HXs + HXN.new_HX_utils}
+        areas = report['exchanger_areas']
+        assert len(areas) == report['N_units']
+        for ID, (area, _) in areas.items():
+            assert area == pytest.approx(independent_area(exchangers[ID]), rel=rtol), ID
+        if HXN is not split:
+            boiling = [ID for ID in areas if changes_phase(exchangers[ID])]
+            assert any(ID.startswith('HX_') for ID in boiling)
+            assert any(ID.startswith('Util_') for ID in boiling)
+
+def test_network_report_current_states():
+    # With cache_network, the network re-simulated at changed states is
+    # reported at those states
+    units = cp_units('test_targeting_report_cache', KEMP, K)
+    sys, HXN = simulate_HXN(units, 10., cache_network=True)
+    network = HXN.HXN_sys
+    C1 = units[0]
+    inlet = C1.ins[0]
+    inlet.F_mass *= 1.05
+    simulate_strictly(sys)
+    assert HXN.HXN_sys is network
+    report = network_report(HXN)
+    assert report['targets'] == HXN.targets().summary()
+    # (the reused structure no longer reaches the energy targets)
+    assert report['Q_hot'] > report['targets']['Q_hot'] * (1 + 1e-3)
+    exchangers = {hx.ID: hx for hx in HXN.new_HXs + HXN.new_HX_utils}
+    for ID, (area, _) in report['exchanger_areas'].items():
+        assert area == pytest.approx(terminal_area(exchangers[ID]), rel=1e-9), ID
+    # a stream changed since the facility's last simulation (or its unit
+    # simulated alone): the network is not of the current states
+    T, F = inlet.T, inlet.F_mass
+    for change in ('T', 'F', 'unit'):
+        if change == 'F': inlet.F_mass = 1.5 * F
+        else: inlet.T = T + 15.
+        if change == 'unit': C1.simulate()
+        with pytest.raises(ValueError, match='not of the current states of C1.*simulate the system'):
+            network_report(HXN)
+        inlet.T, inlet.F_mass = T, F
+        C1.simulate()
+        assert network_report(HXN) == report
+    # an inlet at the enthalpy reference (298.15 K) has no enthalpy at any
+    # flow: the flows are compared too
+    rows = [('H1', 400., 320., 1.), ('C1', 298.15, 370., 1.)]
+    sys, HXN = simulate_HXN(cp_units('test_targeting_report_reference', rows), 10.)
+    inlet = HXN.original_heat_exchangers[0].ins[0]
+    assert inlet.ID == 'C1_in' and inlet.H == 0.
+    targets = HXN.targets()
+    inlet.F_mass *= 2.
+    assert inlet.H == 0.
+    with pytest.raises(ValueError, match='targets are not of the current states of C1'):
+        network_report(HXN, targets)
+    with pytest.raises(ValueError, match='simulate the system'):
+        network_report(HXN)
+    # with ideal thermodynamics, on the curves' basis: stale targets, and a
+    # network older than the targets
+    sys, HXN, units = liquids('test_targeting_report_ideal', force_ideal_thermo=True)
+    stale = HXN.targets()
+    inlet = units[0].ins[0]
+    inlet.T += 10.
+    simulate_strictly(sys)
+    with pytest.raises(ValueError, match='targets are not of the current states of H1'):
+        network_report(HXN, stale)
+    targets = HXN.targets()
+    assert network_report(HXN, targets)['targets'] == network_report(HXN)['targets']
+    inlet.T -= 10.
+    units[0].simulate()
+    with pytest.raises(ValueError, match='simulate the system'):
+        network_report(HXN)
+    with pytest.raises(ValueError, match='targets are not of the current states of H1'):
+        network_report(HXN, targets)
+
 def test_no_side_effects(kemp_hxn):
     units, HXN = kemp_hxn
     # the furnace case of test_capital_target_formula: the network heats C1
@@ -1473,6 +1627,82 @@ def test_plot_gcc_gids():
     fig, ax = plot_grand_composite_curve(t, utilities=False)
     try:
         assert not _gid_artists(ax, 'Utility:') and not _gid_artists(ax, 'Label:')
+    finally:
+        plt.close(fig)
+
+def test_plot_readability():
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    def boxes(fig, artists):
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        return [a.get_window_extent(renderer) for a in artists]
+    # fuel above high pressure steam: the label of the furnace sits above
+    # that of the top flat, which ends where the finite hot curve does
+    furnace = targets('test_targeting_plot_readable_fuel', FURNACE, 10.)
+    fig, ax = plot_composite_curves(furnace, kind='balanced')
+    try:
+        fuel, = _gid_artists(ax, 'Fuel')
+        steam, = _gid_artists(ax, 'Utility:high_pressure_steam')
+        assert fuel.xy == pytest.approx(steam.xy, rel=1e-9)
+        fuel, steam, frame = boxes(fig, [fuel, steam, ax])
+        assert not fuel.overlaps(steam) and fuel.y0 >= steam.y1 - 1.
+        assert frame.y1 >= fuel.y1
+    finally:
+        plt.close(fig)
+    # the pinch is marked only where the shifted composites touch: not for a
+    # threshold problem whose composites end apart, nor for hot streams
+    # only (whose empty cold composite stays out of the legend); a balanced
+    # pair touches at the top without any utility
+    threshold = targets('test_targeting_plot_threshold', [('H1', 400., 300., 2.),
+                                                          ('C1', 330., 380., 1.)], 10.)
+    hot = targets('test_targeting_plot_hot', [('H1', 400., 300., 1.),
+                                              ('H2', 380., 320., 1.)], 10.)
+    pair = targets('test_targeting_plot_pair', PAIR, 10.)
+    assert threshold.Q_hot == hot.Q_hot == pair.Q_hot == 0.
+    for t, pinch, legend in ((threshold, False, ['heat recovered', 'hot composite', 'cold composite']),
+                             (hot, False, ['hot composite']),
+                             (pair, True, ['heat recovered', 'hot composite', 'cold composite', 'pinch'])):
+        fig, ax = plot_composite_curves(t, kind='shifted')
+        try:
+            assert len(_gid_artists(ax, 'Pinch')) == pinch
+            assert [x.get_text() for x in ax.get_legend().get_texts()] == legend
+        finally:
+            plt.close(fig)
+    # the unserved remainders, without which the balanced curves end apart
+    t = targets('test_targeting_plot_unserved', REF_A, 10.)
+    with pytest.warns(RuntimeWarning, match='left unserved'):
+        utilities = t.utility_targets([agent('low_pressure_steam')], [agent('cooling_water')])
+    fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
+    try:
+        label, = _gid_artists(ax, 'Utility:unserved')
+        assert label.get_text() == ('unserved heating 1.18E5 kJ/hr (not drawn)\n'
+                                    'unserved cooling 4.45E4 kJ/hr (not drawn)')
+    finally:
+        plt.close(fig)
+    # the grand composite curve at its default size: heats of six digits
+    # [kJ/hr] in scientific notation, whose tick labels do not run together,
+    # and every label off the curve (which meets the end of a step)
+    t = targets('test_targeting_plot_readable_gcc', REF_A, 10.)
+    fig, ax = plot_grand_composite_curve(t)
+    try:
+        lo, hi = ax.get_xlim()
+        ticks = [x for x in ax.get_xticklabels() if lo <= x.get_position()[0] <= hi]
+        assert ax.get_xticks()[-1] > 1e5
+        labels = _gid_artists(ax, 'Label:')
+        assert len(labels) == 4
+        boxed = boxes(fig, ticks + labels)
+        tick_boxes, label_boxes = boxed[:len(ticks)], boxed[len(ticks):]
+        assert ax.xaxis.get_offset_text().get_text() == '1e5'
+        assert all(not a.overlaps(b) for a, b in zip(tick_boxes, tick_boxes[1:]))
+        gcc, = _gid_artists(ax, 'GCC')
+        xy = ax.transData.transform(np.column_stack(gcc.get_data()))
+        curve = np.concatenate([np.linspace(a, b, 500) for a, b in zip(xy, xy[1:])])
+        for box, label in zip(label_boxes, labels):
+            inside = ((curve[:, 0] >= box.x0) & (curve[:, 0] <= box.x1)
+                      & (curve[:, 1] >= box.y0) & (curve[:, 1] <= box.y1))
+            assert not inside.any(), label.get_text()
     finally:
         plt.close(fig)
 

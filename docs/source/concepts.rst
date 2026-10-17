@@ -513,8 +513,10 @@ the target sizes them (the same film coefficients, a correction factor of 1,
 the integrated driving force along the exact stream profiles and the process
 side duty), so it is comparable with the target; ``'area_biosteam'`` is
 BioSTEAM's own sizing, which includes its correction factor, the terminal
-log-mean temperature difference and the utility side duty. The comparison has
-limits:
+log-mean temperature difference and the utility side duty. The report checks
+that its targets and the network's streams are both of the units' current
+states: after a stream or a unit changes, it raises a ``ValueError`` until the
+system is simulated again. The comparison has limits:
 
 - the Bath target bounds the area only with equal film coefficients and the
   same utilities;

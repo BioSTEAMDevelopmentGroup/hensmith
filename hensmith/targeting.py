@@ -26,7 +26,7 @@ from numbers import Integral, Real
 from warnings import warn
 import numpy as np
 import biosteam as bst
-from ._curves import _T_EQ
+from ._curves import _T_EQ, _copy
 from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
@@ -1932,6 +1932,25 @@ def _stage_profile(curve, H0, sign, f, Q):
     return (knots[(knots > 0.) & (knots < Q)],
             lambda x: np.interp((H0 + sign * x) / f, curve.H, curve.T))
 
+def _flows(stream):
+    """Molar flow rate of each chemical of `stream` [kmol/hr], an array."""
+    mol = stream.mol
+    return mol.to_array() if hasattr(mol, 'to_array') else np.asarray(mol)
+
+def _same_ends(curve, s_in, s_out):
+    """Whether the streams `s_in` and `s_out` are at the end states of
+    `curve` (on the curve's thermodynamic basis): the same enthalpies (to
+    1e-6 of its duty at the outlet, which flashes reach), and the same
+    pressure and flows at the inlet (an inlet at the enthalpy reference
+    has the same enthalpy at any flow)."""
+    span = abs(curve.H_out - curve.H_in)
+    a, b = _flows(curve.stream_in), _flows(s_in)
+    return (abs(curve.H_in - s_in.H) <= 1e-9 * (abs(curve.H_in) + span)
+            and abs(curve.H_out - s_out.H) <= 1e-6 * span
+            and abs(curve.P - s_in.P) <= 1e-9 * curve.P
+            and a.shape == b.shape
+            and np.abs(a - b).max(initial=0.) <= 1e-9 * np.abs(a).max(initial=0.))
+
 def _check_targets(HXN, targets):
     """Raise a ValueError unless `targets` are those of the process
     streams of `HXN`'s network, in its stream order and current states."""
@@ -1942,18 +1961,36 @@ def _check_targets(HXN, targets):
         raise ValueError("targets must be of the network's process streams "
                          "(the units of HXN.original_heat_exchangers, in that "
                          'order), as HXN.targets() makes them')
-    if targets.force_ideal_thermo != bool(HXN.force_ideal_thermo):
-        raise ValueError(f'targets have force_ideal_thermo='
-                         f'{targets.force_ideal_thermo}, the network '
-                         f'{bool(HXN.force_ideal_thermo)}')
-    if targets.force_ideal_thermo: return
+    ideal = targets.force_ideal_thermo
+    if ideal != bool(HXN.force_ideal_thermo):
+        raise ValueError(f'targets have force_ideal_thermo={ideal}, the '
+                         f'network {bool(HXN.force_ideal_thermo)}')
     for c, hx in zip(targets.curves, hxs):
-        H_in, H_out = hx.ins[0].H, hx.outs[0].H
-        if (abs(c.H_in - H_in) > 1e-9 * abs(H_in)
-                or abs(c.H_out - H_out) > 1e-6 * abs(c.H_out - c.H_in)):
+        s_in, s_out = hx.ins[0], hx.outs[0]
+        if ideal: # the curves' basis: copies with ideal thermodynamics
+            s_in = _copy(s_in, s_in.thermo.ideal())
+            s_out = _copy(s_out, s_out.thermo.ideal())
+        if not _same_ends(c, s_in, s_out):
             raise ValueError(f'targets are not of the current states of '
                              f'{_unit_label(hx)} (simulated since?): make '
                              'them again with HXN.targets()')
+
+def _check_network(HXN, targets):
+    """Raise a ValueError unless every stream of `HXN`'s network enters and
+    leaves it at the end states of its curve in `targets` (which are of the
+    units' current states): its copy of the real inlet where it enters the
+    network, and the outlet of its last stage (the network's copies share
+    the curves' thermodynamic basis)."""
+    for life_cycle, c, label in zip(HXN.stream_life_cycles, targets.curves,
+                                    targets.labels):
+        entry = life_cycle.entry
+        if entry is None: s_in = life_cycle.life_cycle[0].s_in
+        else: s_in = entry.unit.ins[entry.index]
+        if not _same_ends(c, s_in, life_cycle.life_cycle[-1].s_out):
+            raise ValueError(f'the network of {HXN.ID} is not of the current '
+                             f'states of {label} (changed since the '
+                             "facility's last simulation?): simulate the "
+                             'system')
 
 def _network_areas(HXN, targets, h, h_utilities, agents):
     """
@@ -2017,7 +2054,8 @@ def network_report(HXN, targets=None, **options):
     Parameters
     ----------
     HXN : HeatExchangerNetwork
-        A simulated facility.
+        A simulated facility, whose network is of the units' current states
+        (simulate the system again after changing a unit or a stream).
     targets : PinchTargets, optional
         Targets of the facility's process streams, as
         `HeatExchangerNetwork.targets` makes them (the same units in the
@@ -2035,8 +2073,9 @@ def network_report(HXN, targets=None, **options):
     Returns
     -------
     dict
-        'T_min_app' and 'targets_T_min_app' [K], of the facility and of the
-        targets; 'status' (``HXN.synthesis_info['status']``); 'applied',
+        'T_min_app' and 'targets_T_min_app' [K], of the facility (its
+        attribute as it is now: a reused cached network keeps the one it
+        was synthesized at) and of the targets; 'status' (``HXN.synthesis_info['status']``); 'applied',
         whether the network has a process exchanger; 'Q_hot' and 'Q_cold',
         the heat of the network's heating and cooling utilities [kJ/hr],
         process side (`HXN.actual_heat_util_load` is utility side);
@@ -2058,7 +2097,10 @@ def network_report(HXN, targets=None, **options):
         If the facility was not simulated.
     ValueError
         If `targets` are not those of the facility's process streams in
-        their current states, or for an invalid option.
+        their current states (enthalpies at both ends, and pressure and
+        flows at the inlet), if the network's streams do not enter and
+        leave it at those states (a unit or a stream changed since the
+        facility's last simulation), or for an invalid option.
     TypeError
         For an unknown option.
 
@@ -2156,6 +2198,7 @@ def network_report(HXN, targets=None, **options):
                            'reporting on it')
     if targets is None: targets = HXN.targets()
     else: _check_targets(HXN, targets)
+    _check_network(HXN, targets)
     options = dict(options)
     if options.get('operating_hours') is None and options.get('tea') is None:
         hours = getattr(getattr(HXN, 'system', None), 'operating_hours', None)
@@ -2199,6 +2242,19 @@ def network_report(HXN, targets=None, **options):
     }
 
 
+def _legend(label, H):
+    """`label` for the legend if a curve of heats `H` has points, else none
+    (a label starting with '_' stays out of the legend)."""
+    return label if H.size else '_' + label
+
+def _sci_ticks(axis):
+    """Scientific tick labels from 10⁴ on the matplotlib `axis` (six-digit
+    heats run together on a narrow figure); left alone unless it has a
+    plain scalar formatter."""
+    from matplotlib.ticker import ScalarFormatter
+    formatter = axis.get_major_formatter()
+    if type(formatter) is ScalarFormatter: formatter.set_powerlimits((-3, 4))
+
 def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                           file=None, dpi=300):
     """
@@ -2233,8 +2289,13 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     Temperatures are shown in degC. Artists carry stable gids: 'Hot
     composite' and 'Cold composite' (or 'Hot balanced composite' and 'Cold
     balanced composite'), 'Heat recovered', 'Hot utility', 'Cold utility',
-    'Pinch', 'Fuel' and 'Utility:<agent ID>'. Fuel, at infinite temperature
-    on the balanced curves, is labeled rather than drawn.
+    'Pinch', 'Fuel' and 'Utility:<agent ID>'. The pinch is marked where the
+    shifted composites touch: not for a threshold problem whose composites
+    end apart, nor without streams on one side (whose empty composite stays
+    out of the legend). Fuel, at infinite temperature on the balanced
+    curves, is labeled rather than drawn, and so is an unserved remainder
+    ('Utility:unserved', in the upper left corner), without which the
+    balanced curves end at different heats.
 
     Examples
     --------
@@ -2276,20 +2337,23 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         finite = np.isfinite(hot_T)
         hot_T, hot_H = hot_T[finite], hot_H[finite]
         ax.plot(hot_H, hot_T - 273.15, color=hot_color, lw=2,
-                label='hot balanced composite', gid='Hot balanced composite')
+                label=_legend('hot balanced composite', hot_H),
+                gid='Hot balanced composite')
         ax.plot(cold_H, cold_T - 273.15, color=cold_color, lw=2,
-                label='cold balanced composite', gid='Cold balanced composite')
+                label=_legend('cold balanced composite', cold_H),
+                gid='Cold balanced composite')
+        above = [] # anchors of the labels above a heating flat
+        fuels = []
+        unserved = []
         for u in utilities:
-            if u.agent is None: continue
-            label = f'{u.ID} {_format_H(u.duty)} kJ/hr'
-            if u.agent.isfuel: # at the end of the finite hot curve
-                x = hot_H[-1] if hot_H.size else 0.
-                y = (hot_T[-1] if hot_T.size else targets.grid['Ts'][0]) - 273.15
-                ax.annotate(f'{u.ID} (furnace) {_format_H(u.duty)} kJ/hr',
-                            xy=(x, y), xytext=(0, 4), textcoords='offset points',
-                            ha='right', va='bottom', color=hot_color, gid='Fuel',
-                            **text_kwargs)
+            if u.agent is None:
+                unserved.append(f"unserved {'heating' if u.heating else 'cooling'} "
+                                f'{_format_H(u.duty)} kJ/hr (not drawn)')
                 continue
+            if u.agent.isfuel:
+                fuels.append(u)
+                continue
+            label = f'{u.ID} {_format_H(u.duty)} kJ/hr'
             T, H = (hot_T, hot_H) if u.heating else (cold_T, cold_H)
             if u.agent.T_limit is None:
                 # above a heating flat, ending at its warm end (left of it the
@@ -2303,6 +2367,7 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                     i = np.searchsorted(T, T_u - 1e-6)
                     offset, ha, va = (2, -2), 'left', 'top'
                 x = H[min(max(i, 0), H.size - 1)]
+                if u.heating: above.append((x, T_u))
             else: # beside the middle of a sensible agent's line
                 T_u = 0.5 * (u.T_utility_in + u.T_utility_out)
                 x = np.interp(T_u, T, H)
@@ -2312,7 +2377,23 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                         textcoords='offset points', ha=ha, va=va,
                         color=hot_color if u.heating else cold_color,
                         gid='Utility:' + u.ID, **text_kwargs)
-        ax.margins(y=0.1) # headroom for a label above the top flat
+        stacked = False
+        for u in fuels: # at the end of the finite hot curve
+            x = hot_H[-1] if hot_H.size else 0.
+            y = hot_T[-1] if hot_T.size else targets.grid['Ts'][0]
+            # above the label of the top flat if that ends there too
+            stacked = any(abs(x - a) <= 1e-9 * (abs(x) + abs(a)) + 1e-12
+                          and abs(y - b) <= 1e-6 for a, b in above)
+            ax.annotate(f'{u.ID} (furnace) {_format_H(u.duty)} kJ/hr',
+                        xy=(x, y - 273.15), xytext=(-2, 14) if stacked else (0, 4),
+                        textcoords='offset points', ha='right', va='bottom',
+                        color=hot_color, gid='Fuel', **text_kwargs)
+        if unserved: # the curves end apart: say why
+            ax.text(0.02, 0.97, '\n'.join(unserved), transform=ax.transAxes,
+                    ha='left', va='top', color='0.45', gid='Utility:unserved',
+                    **text_kwargs)
+        # headroom for a label (or two) above the top flat
+        ax.margins(y=0.16 if stacked else 0.1)
         ax.set_ylabel('T [°C]')
     else:
         shifted = kind == 'shifted'
@@ -2321,9 +2402,9 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
             ax.axvspan(cold_H[0], hot_H[-1], color='0.92', lw=0, zorder=0,
                        label='heat recovered', gid='Heat recovered')
         ax.plot(hot_H, hot_T - 273.15, color=hot_color, lw=2,
-                label='hot composite', gid='Hot composite')
+                label=_legend('hot composite', hot_H), gid='Hot composite')
         ax.plot(cold_H, cold_T - 273.15, color=cold_color, lw=2,
-                label='cold composite', gid='Cold composite')
+                label=_legend('cold composite', cold_H), gid='Cold composite')
         T_all = np.concatenate([hot_T, cold_T]) - 273.15
         H_hot_end = hot_H[-1] if hot_H.size else 0.
         H_cold_end = cold_H[-1] if cold_H.size else targets.Q_cold
@@ -2334,14 +2415,20 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         ax.text(0.5 * targets.Q_cold, T_all.min() - 1.,
                 f'cold utility {_format_H(targets.Q_cold)} kJ/hr', ha='left',
                 va='top', gid='Cold utility', **text_kwargs)
-        if shifted:
+        pinch_T = targets.pinch_T
+        tol = 1e-9 * pinch_T
+        if shifted and all(T.size and T.min() - tol <= pinch_T <= T.max() + tol
+                           for T in (hot_T, cold_T)):
             # where the composites touch: the cold utility plus the cold
-            # streams' heat below the pinch
+            # streams' heat below the pinch, if both composites reach the
+            # pinch temperature (not for streams of one side, nor for a
+            # threshold problem whose composites end apart)
             below = targets._side_heat()[1]
             x = targets.Q_cold + below[~targets.is_hot].sum()
-            ax.plot([x], [targets.pinch_T - 273.15], 'o', mfc='w', mec='k',
+            ax.plot([x], [pinch_T - 273.15], 'o', mfc='w', mec='k',
                     ms=7, zorder=4, label='pinch', gid='Pinch')
         ax.set_ylabel('shifted T [°C]' if shifted else 'T [°C]')
+    _sci_ticks(ax.xaxis)
     ax.set_xlabel('H [kJ·h$^{-1}$]')
     ax.legend(loc='lower right', fontsize=8)
     ax.grid(alpha=0.3)
@@ -2378,9 +2465,11 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
     ascending level from the temperature axis, each a horizontal segment at
     its level as long as its duty, joined by dotted verticals; cooling
     utilities likewise by descending level. Fuel is drawn dashed at the top
-    of the grid and an unserved remainder in gray. Artists carry stable
-    gids: 'GCC', 'Pinch', 'Utility:<agent ID>' (the segments,
-    'Utility:unserved' for a remainder) and 'Label:<agent ID>'.
+    of the grid and an unserved remainder in gray. Each label sits at the
+    end of its segment, below it for heating and above it for cooling, off
+    the curve where a level touches it. Artists carry stable gids: 'GCC',
+    'Pinch', 'Utility:<agent ID>' (the segments, 'Utility:unserved' for a
+    remainder) and 'Label:<agent ID>'.
 
     Examples
     --------
@@ -2431,8 +2520,12 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
                          key=lambda u: u.level)
         cooling = sorted((u for u in utilities if not u.heating),
                          key=lambda u: -u.level)
-        for steps, color, end in ((heating, hot_color, Ts[0]),
-                                  (cooling, cold_color, Ts[-1])):
+        # each label beside the end of its step, where a level touches the
+        # curve: below it for heating (the curve rises to the right above
+        # the pinch) and above it for cooling (it falls to the right below)
+        for steps, color, end, (dy, va) in (
+                (heating, hot_color, Ts[0], (-2, 'top')),
+                (cooling, cold_color, Ts[-1], (2, 'bottom'))):
             x = 0.
             previous = None
             for u in steps:
@@ -2446,10 +2539,12 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
                             ls=':', lw=0.8)
                 ax.plot([x, x + u.duty], [y, y], lw=1.5, gid='Utility:' + ID,
                         **style)
-                ax.text(x + u.duty, y, ' ' + ID, ha='left', va='center',
-                        fontsize=7, color=style['color'], gid='Label:' + ID)
+                ax.annotate(ID, xy=(x + u.duty, y), xytext=(3, dy),
+                            textcoords='offset points', ha='left', va=va,
+                            fontsize=7, color=style['color'], gid='Label:' + ID)
                 x += u.duty
                 previous = y
+    _sci_ticks(ax.xaxis)
     ax.set_xlabel('heat cascaded [kJ·h$^{-1}$]')
     ax.set_ylabel('shifted T [°C]')
     ax.grid(alpha=0.3)
