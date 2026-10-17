@@ -2576,11 +2576,24 @@ def _check_targets(HXN, targets):
                              'them again with HXN.targets()')
 
 def _check_network(HXN, targets):
-    """Raise a ValueError unless every stream of `HXN`'s network enters and
-    leaves it at the end states of its curve in `targets` (which are of the
-    units' current states): its copy of the real inlet where it enters the
-    network, and the outlet of its last stage (the network's copies share
-    the curves' thermodynamic basis)."""
+    """Raise a ValueError unless every stream of `HXN`'s network is that of
+    an original exchanger still among the facility's units and their
+    nested auxiliaries (not one that its unit has rebuilt since, as a
+    `biosteam.MultistageCompressor` simulated alone after a change of `pr`
+    rebuilds its intercoolers, whose former objects keep their former,
+    consistent states), and enters and leaves the network at the end states
+    of its curve in `targets` (which are of the units' current states): its
+    copy of the real inlet where it enters the network, and the outlet of
+    its last stage (the network's copies share the curves' thermodynamic
+    basis)."""
+    at_hand = {id(unit) for unit in HXN._candidate_units()}
+    for hx, label in zip(HXN.original_heat_exchangers, targets.labels):
+        if id(hx) not in at_hand:
+            raise ValueError(f'the network of {HXN.ID} is of {label}, which is '
+                             "no longer one of the facility's units nor an "
+                             'auxiliary of one (rebuilt since the '
+                             "facility's last simulation?): simulate the "
+                             'system')
     for life_cycle, c, label in zip(HXN.stream_life_cycles, targets.curves,
                                     targets.labels):
         entry = life_cycle.entry
@@ -2706,8 +2719,11 @@ def network_report(HXN, targets=None, **options):
         If `targets` are not those of the facility's process streams in
         their current states (enthalpies at both ends, and pressure and
         flows at the inlet), if the network's streams do not enter and
-        leave it at those states (a unit or a stream changed since the
-        facility's last simulation), or for an invalid option.
+        leave it at those states or are of exchangers no longer among the
+        facility's units and their auxiliaries (a unit or a stream changed
+        since the facility's last simulation: a
+        `biosteam.MultistageCompressor` simulated alone after a change of
+        `pr`, say, rebuilds its intercoolers), or for an invalid option.
     TypeError
         For an unknown option.
 
@@ -2992,6 +3008,22 @@ class _At:
         from matplotlib.transforms import Affine2D
         return Affine2D().translate(*self.labels.spots(renderer)[self.index][0])
 
+class _Under:
+    """
+    The y `xycoords` of a note under the axes `ax`: the display box of the
+    axes and of the visible decorations of its x axis (tick labels, label
+    and offset text) as drawn, so that the note keeps below them at any
+    size (a class, so that the figure can still be pickled).
+    """
+    def __init__(self, ax):
+        self.ax = ax
+
+    def __call__(self, renderer):
+        from matplotlib.transforms import Bbox
+        ax = self.ax
+        box = ax.xaxis.get_tightbbox(renderer)
+        return ax.bbox if box is None else Bbox.union([ax.bbox, box])
+
 class _Leader(Patch):
     """
     A thin line from the anchor of the label `index` of the `_Labels`
@@ -3260,7 +3292,8 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         default agents.
     ax : matplotlib.axes.Axes, optional
         Axes to draw on; a new figure (with a constrained layout, which
-        keeps the axis labels in it) is created if not given.
+        keeps the axis labels and a note under the x axis in it) is created
+        if not given.
     file : str, optional
         If given, the figure is saved to this path.
     dpi : int, optional
@@ -3282,10 +3315,11 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     (whose empty composite stays out of the legend). Fuel, at infinite
     temperature on the balanced curves, is labeled rather than drawn,
     above the hot end of the cold balanced composite (at the top of both),
-    whose top its heat closes, and so is an unserved remainder
-    ('Utility:unserved', in the upper left corner): the cold balanced
-    composite starts at the unserved cooling, and the hot one ends short of
-    the cold one by the unserved heating. A label of a latent agent sits by
+    whose top its heat closes, and so is an unserved remainder, in a note
+    under the x axis ('Utility:unserved', clear of the curves, of their
+    labels and of the legend): the cold balanced composite starts at the
+    unserved cooling, and the hot one ends short of the cold one by the
+    unserved heating. A label of a latent agent sits by
     its flat, above left of the warm end of a heating one and below right
     of the cold end of a cooling one, and a sensible agent's off the middle
     of its line, above left for heating and below right for cooling. When
@@ -3430,10 +3464,13 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
             placement.add(annotation, (-2, 4), leader='Leader:' + u.ID)
         for annotation, offset, ID in cooling:
             placement.add(annotation, offset, leader='Leader:' + ID)
-        if unserved: # the curves end apart: say why
-            ax.text(0.02, 0.97, '\n'.join(unserved), transform=ax.transAxes,
-                    ha='left', va='top', color='0.45', gid='Utility:unserved',
-                    **text_kwargs)
+        if unserved:
+            # the curves end apart: say why, in a note under the x axis,
+            # clear of the curves, of their labels and of the legend
+            ax.annotate('\n'.join(unserved), xy=(0., 0.),
+                        xycoords=('axes fraction', _Under(ax)), xytext=(0, -4),
+                        textcoords='offset points', ha='left', va='top',
+                        color='0.45', gid='Utility:unserved', **text_kwargs)
         # headroom for the labels above the top of the curves, and more
         # where they need it to stack in columns
         ax.margins(y=0.16 if stacked else 0.1)

@@ -1059,7 +1059,12 @@ class HeatExchangerNetwork(bst.Facility):
         would take, prepared as the synthesis prepares them, and a callable
         is called once per heat utility.
         Nothing is stored: with `cache_network`, the targets follow the
-        units' current states, not those of the network's synthesis.
+        units' current states, not those of the network's synthesis. A
+        unit that rebuilds its auxiliaries when simulated alone (K1 above,
+        after a change of its `pr`) leaves the streams on its former
+        stages, which are no longer in the process and keep their former
+        states, until the system is simulated again
+        (`hensmith.targeting.network_report` raises meanwhile).
 
         Examples
         --------

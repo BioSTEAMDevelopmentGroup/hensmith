@@ -2571,6 +2571,46 @@ def test_network_report_current_states():
     with pytest.raises(ValueError, match='targets are not of the current states of H1'):
         network_report(HXN, targets)
 
+def test_network_report_rebuilt_stages():
+    # A MultistageCompressor simulated alone after a change of pr rebuilds
+    # its intercoolers: the network is of the former ones, no longer in the
+    # process, whose states are consistent but stale; the report raises (by
+    # default and with explicit targets) until the system is simulated
+    bst.main_flowsheet.set_flowsheet('test_targeting_report_rebuilt')
+    bst.settings.set_thermo(['Water', 'Methane'], cache=True)
+    gas = bst.Stream('gas', Methane=100., units='kmol/hr', T=300.,
+                     P=101325., phase='g')
+    K1 = bst.MultistageCompressor('K1', ins=gas, pr=2., n_stages=3, eta=0.7)
+    cold = bst.Stream('cold', Water=200., units='kmol/hr', T=290., P=5e5)
+    C1 = bst.HXutility('C1', ins=cold, T=350., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
+    sys = bst.System.from_units('test_targeting_report_rebuilt',
+                                units=[K1, C1, HXN])
+    simulate_strictly(sys)
+    report = network_report(HXN)
+    former = list(K1.hxs)
+    assert set(HXN.original_heat_exchangers) == {C1, *former}
+    assert report['targets']['Q_hot'] > 0.
+    K1.pr = 3.
+    K1.simulate()
+    assert not set(K1.hxs) & set(former)
+    targets = HXN.targets() # still of the former stages, labeled by K1
+    assert set(targets.units) == {C1, *former}
+    message = (r"the network of HXN is of K1 - K1_H\d, which is no longer one "
+               r"of the facility's units nor an auxiliary of one \(rebuilt "
+               r".*\): simulate the system")
+    with pytest.raises(ValueError, match=message):
+        network_report(HXN)
+    with pytest.raises(ValueError, match=message):
+        network_report(HXN, targets)
+    # simulated again: the network and the report are of the new stages
+    # (hotter, whose heat now covers the cold stream's)
+    simulate_strictly(sys)
+    assert set(HXN.original_heat_exchangers) == {C1, *K1.hxs}
+    report = network_report(HXN)
+    assert report['targets'] == HXN.targets().summary()
+    assert report['targets']['Q_hot'] == 0. and report['targets']['Q_cold'] > 0.
+
 @pytest.mark.parametrize('contributions', [None, {'H1': 3., 'C1': 2.}])
 def test_network_report_cached_split_network(contributions):
     # A split network the facility reuses (cache_network) with its
@@ -2853,14 +2893,41 @@ def test_plot_readability(quickstart):
     texts = {True: ('unserved heating 1.18E5 kJ/hr (not drawn)\n'
                     'unserved cooling 4.45E4 kJ/hr (not drawn)'),
              False: 'unserved cooling 4.45E4 kJ/hr (not drawn)'}
-    for LP_only in (True, False):
+    def noted(fig, ax):
+        """The note on the unserved remainders inside the figure, under the
+        axes and the decorations of the x axis, and clear of the labels and
+        of the legend."""
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        note, = _gid_artists(ax, 'Utility:unserved')
+        box = note.get_window_extent(renderer)
+        page = fig.bbox
+        assert (page.x0 <= box.x0 and box.x1 <= page.x1
+                and page.y0 <= box.y0 and box.y1 <= page.y1)
+        above = [ax, ax.xaxis.label, ax.xaxis.get_offset_text(),
+                 *[x for x in ax.get_xticklabels() if x.get_text()]]
+        assert all(box.y1 < a.get_window_extent(renderer).y0 for a in above)
+        others = [a for a in _gid_artists(ax, 'Utility:') + _gid_artists(ax, 'Fuel')
+                  if a is not note] + [ax.get_legend()]
+        assert len(others) >= 3
+        for a in others:
+            assert not box.overlaps(a.get_window_extent(renderer)), a
+    for LP_only, size in ((True, None), (False, None), (False, (4.5, 4.2))):
         heating = [agent('low_pressure_steam')] if LP_only else None
         with pytest.warns(RuntimeWarning, match='left unserved'):
             utilities = t.utility_targets(heating, [agent('cooling_water')])
-        fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
+        if size is None:
+            fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
+        else:
+            # of a figure of the user's, where a label of the steam at the
+            # top of the curves, moved inside the left edge, reaches the
+            # upper left corner
+            fig, ax = plt.subplots(figsize=size, layout='constrained')
+            plot_composite_curves(t, kind='balanced', utilities=utilities, ax=ax)
         try:
             label, = _gid_artists(ax, 'Utility:unserved')
             assert label.get_text() == texts[LP_only]
+            noted(fig, ax)
             hot_curve, = _gid_artists(ax, 'Hot balanced composite')
             cold_curve, = _gid_artists(ax, 'Cold balanced composite')
             (hot_H, hot_T), (cold_H, cold_T) = hot_curve.get_data(), cold_curve.get_data()
@@ -2869,6 +2936,23 @@ def test_plot_readability(quickstart):
                 bst.HeatUtility.dT, abs=1e-6)
         finally:
             plt.close(fig)
+    # at the default size, where the labels of both steams, kept off the
+    # tall riser of the hot curve under their span, rise to the upper left
+    # corner of the axes
+    short = targets('test_targeting_plot_unserved_steam',
+                    [('H0', 634.16, 621.99, 1.101), ('C1', 401.54, 412.56, 2.498),
+                     ('C2', 552.11, 649.10, 1.515)], 10.)
+    with pytest.warns(RuntimeWarning, match='left unserved'):
+        utilities = short.utility_targets(
+            [agent('low_pressure_steam'), agent('high_pressure_steam')],
+            [agent('chilled_brine'), agent('propane')])
+    fig, ax = plot_composite_curves(short, kind='balanced', utilities=utilities)
+    try:
+        label, = _gid_artists(ax, 'Utility:unserved')
+        assert label.get_text() == 'unserved heating 4.81E5 kJ/hr (not drawn)'
+        noted(fig, ax)
+    finally:
+        plt.close(fig)
     def readable(fig, ax, labels, curves, legend=True):
         """Every one of the `labels` and the legend (if `legend`) inside the
         axes and off the `curves` (and the legend off the labels), and the
@@ -3150,10 +3234,14 @@ def test_plot_labels_placed_once(monkeypatch):
                         calls.append(None) or place(self, *args, **kwargs))
     fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
     try:
+        # a few passes at the first draw, one per layout; at most as many at
+        # the next (none where the layout is the same to the bit)
+        counts = []
         for _ in range(2):
             calls.clear()
             fig.canvas.draw()
-            assert 1 <= len(calls) <= 4
+            counts.append(len(calls))
+        assert 1 <= counts[0] <= 4 and counts[1] <= 4
         renderer = fig.canvas.get_renderer()
         frame = ax.get_window_extent(renderer)
         labels = sorted(_gid_artists(ax, 'Utility:test_targeting_plot_steam'),
