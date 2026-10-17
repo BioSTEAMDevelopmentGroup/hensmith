@@ -199,7 +199,12 @@ targets the rest of the cost of a network.
   streams that balances on its own needs fewer units.
 - **Capital**: the area divided into as many shells of equal area as there
   are units, here 6 floating head shells of 991 m², each costed with
-  biosteam's own correlations: 2.28172e+06 USD installed.
+  biosteam's own correlations: 2.28172e+06 USD installed. When the equal
+  shells would fall below 150 ft² (14 m²), where biosteam's double pipe costs
+  a fraction of a shell and tube, the target keeps the shell and tubes the
+  area fills if they cost more (see :doc:`../concepts`);
+  ``'N_area_shells'``, ``'shell_area'`` and ``'shell_type'`` say which shells
+  carry the area.
 - **Total annualized cost** (TAC), 1.50882e+07 USD/yr: the installed cost
   times the capital recovery factor (371339 USD/yr: 10 % interest over 10
   years by default) plus the utility cost times the operating hours
@@ -286,6 +291,16 @@ classic supertargeting curve.
    The sweep of the two-stream problem: the capital cost (blue) falls and the
    operating cost (red) rises with ``T_min_app``, and their sum (black) has
    its minimum, 9.164e+04 USD/yr, at 21.59 K.
+
+The shells of this pair are large, so the capital cost falls smoothly. With
+small streams it falls in steps: about one shell and tube each time the
+shrinking area fills one fewer of 150 ft², or when the last one goes and
+double pipes take the area. The least TAC then often lies just past such a
+step, at the first ``T_min_app`` evaluated beyond it, and says more about
+biosteam's 150 ft² than about a trade-off of energy and capital; the sweep's
+``'N_area_shells'`` and ``'shell_type'`` (``sweep.to_frame()``) show where the
+steps are. A network has such steps too, but where its own exchangers cross
+150 ft².
 
 The network against its targets
 -------------------------------

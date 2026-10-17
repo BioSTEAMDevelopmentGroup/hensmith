@@ -110,10 +110,11 @@ def main():
         # [start:supertargets]
         print('units:', targets.units_target(utilities))
         capital = targets.capital_cost_target(utilities)
-        print(f"{capital['N_shells']} shells of {capital['shell_area']:.4g} m2, {capital['type']}")
+        print(f"{capital['N_area_shells']} of {capital['N_shells']} shells share the area: "
+              f"{capital['shell_area']:.4g} m2 each, {capital['type']}")
         summary = targets.summary()     # 10 % over 10 years; 8000 h/yr (no system hours)
-        for key, value in summary.items():
-            print(f'{key:<24} {value:.6g}')
+        for key, value in summary.items():  # numbers, and the shell type
+            print(f'{key:<24} {value}' if isinstance(value, str) else f'{key:<24} {value:.6g}')
         # [end:supertargets]
     with capturing('ch05_sweep'):
         # [start:sweep]

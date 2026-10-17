@@ -483,16 +483,33 @@ grand composite curve -- the process pinch and every utility pinch --,
 acting in it. It is an estimate, **S - 1 per region, assuming one component**:
 a subset of streams that balances on its own needs fewer units.
 
-**Capital.** The area is divided into as many shells of equal area as the
-units target, :math:`N`, less one furnace for all the fuel, and every shell is
-costed with BioSTEAM's own correlations, :math:`N \cdot C(A / N)`; the furnace
-is costed on the fuel's utility duty. BioSTEAM's specifics carry over: a
-double pipe exchanger below 150 ft², whose cost jumps at 150 ft² to that of a
-shell and tube (the floating head correlation is not monotone below about
-126 ft², which the double pipe hides), and no largest shell area. All shells
-are costed at one pressure, ``P``, whereas BioSTEAM takes each exchanger's
-highest inlet pressure; for high pressure steam heaters its pressure factor is
-up to about 12 % higher.
+**Capital.** The area is put in as many shells as the units target,
+:math:`N`, less one furnace for all the fuel, and every shell is costed with
+BioSTEAM's own correlations; the furnace is costed on the fuel's utility duty.
+Linnhoff & Ahmad (1990) divide the area equally, :math:`N \cdot C(A / N)`:
+with economies of scale (:math:`C = a + b A^c`) that is the costliest way to
+divide it, and every unit added adds cost. BioSTEAM's correlations are not of
+that form: a double pipe exchanger below 150 ft² costs at most about 8,100
+USD installed, a shell and tube at 150 ft² about 64,700 USD. An equal division
+can then put every shell below 150 ft², so that a utility of a few watts that
+adds units would cut the capital target by most of it (KEMP at 5.56 K: seven
+double pipes instead of four floating heads, a fifth of the cost), although a
+network just adds a small exchanger and keeps its large ones. So when the
+equal division puts the shells below 150 ft² and the area fills
+:math:`k = \lfloor A / 150\ \mathrm{ft^2} \rfloor \geq 1` shells of at least
+150 ft², the target is the costlier of the :math:`N` double pipes and of
+:math:`k` equal shell and tubes with :math:`N - k` shells of no area (each
+costed as BioSTEAM costs a vanishing double pipe, about 1,300 USD installed).
+This is the least change to the equal division that never falls when a unit
+is added; where it departs from it, it tends to be high (networks keep only
+part of their area in shell and tubes) as the equal division tends to be low.
+The summary's ``'N_area_shells'``, ``'shell_area'`` and ``'shell_type'`` say
+which shells carry the area. BioSTEAM's other specifics carry over: the
+floating head correlation is not monotone below about 126 ft², which the
+double pipe hides, and there is no largest shell area. All shells are costed
+at one pressure, ``P``, whereas BioSTEAM takes each exchanger's highest inlet
+pressure; for high pressure steam heaters its pressure factor is up to about
+12 % higher.
 
 **Total annualized cost.** With a capital recovery factor over :math:`n`
 years at interest :math:`i`,
@@ -513,7 +530,13 @@ of ``T_min_app`` values, reusing the streams' curves (nothing is flashed
 again), and then refines the grid around the least total annualized cost. The
 cost is not smooth -- the units target jumps, the double pipe switches to a
 shell and tube, the pinch moves -- so the refinement only narrows a bracket,
-and ``at_bound`` flags an optimum at an end of the sweep. Where the targets do
+and ``at_bound`` flags an optimum at an end of the sweep. The capital target
+drops by about a shell and tube wherever the shrinking area fills one fewer of
+150 ft², so the least cost often lies just past such a step rather than at a
+smooth trade-off of energy and capital: compare the ``'N_area_shells'`` and
+``'shell_type'`` of its neighbors (``sweep.to_frame()``). A network has such
+steps too, but where its own exchangers cross 150 ft², which the target's
+equal shells place only roughly. Where the targets do
 not depend on ``T_min_app`` -- below the threshold of a threshold problem, the
 utilities and the balanced composite curves stay the same -- the costs differ
 only by the discretization of the curves, by a tiny relative amount (4e-7
@@ -1072,9 +1095,13 @@ What it is not:
   ``hensmith.targeting`` are estimates: the area target bounds a network's
   area only with equal film coefficients and the same utilities, the units
   target can be wrong in both directions, the capital target assumes shells
-  of equal area at one pressure, and with approach contributions the utility
-  levels are conservative and their pricing temperatures approximate. The
-  optimum ``T_min_app`` is the optimum of these estimates.
+  of equal area at one pressure (keeping the shell and tubes the area fills
+  when an equal division would drop below 150 ft²), and with approach
+  contributions the utility levels are conservative and their pricing
+  temperatures approximate. The optimum ``T_min_app`` is the optimum of these
+  estimates, and often sits just past a step of the capital target where the
+  area fills one shell and tube fewer: a step a network shares, though not
+  at the same ``T_min_app``.
 
 References
 ----------

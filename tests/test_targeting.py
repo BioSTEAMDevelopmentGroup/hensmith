@@ -1100,10 +1100,17 @@ def test_capital_target_formula():
     N = t.units_target(utilities)['total']
     A = t.area_target(utilities)
     assert capital['area'] == A and capital['N_shells'] == N == 5
-    assert capital['shell_area'] == A / N
+    # five equal double pipes of 52 ft2 cost less to install than the one
+    # floating head that the 260 ft2 fill, with four shells of no area
     p, i, kind = _exchanger_costs(A * 10.763 / N)
+    assert kind == 'Double pipe' and A * 10.763 == pytest.approx(259.866, abs=1e-3)
+    p1, i1, kind1 = _exchanger_costs(A * 10.763)
+    p0, i0, _ = _exchanger_costs(0.)
+    assert p0 == 0. and i0 == pytest.approx(1304.568, abs=1e-3)
+    assert N * i < i1 + 4 * i0
+    assert capital['N_area_shells'] == 1 and capital['shell_area'] == A
     assert (capital['purchase_cost'], capital['installed_cost'], capital['type']) == (
-        N * p, N * i, kind)
+        p1 + 4 * p0, i1 + 4 * i0, 'Floating head')
     assert capital['furnace_duty'] == 0.
     # a higher pressure costs more
     assert t.capital_cost_target(utilities, P=20e5)['installed_cost'] > capital['installed_cost']
@@ -1130,12 +1137,17 @@ def test_capital_target_formula():
     capital = t.capital_cost_target(utilities)
     N = t.units_target(utilities)['total']
     assert capital['furnace_duty'] == fuel.utility_duty
-    assert capital['N_shells'] == N - 1
+    assert capital['N_shells'] == N - 1 == 6
     A = t.area_target(utilities)
-    p, i, _ = _exchanger_costs(A * 10.763 / (N - 1))
+    # 336 ft2: six equal double pipes, or the two floating heads they fill
+    # and four shells of no area, which cost more
+    assert int(A * 10.763 // 150) == 2 == capital['N_area_shells']
+    assert capital['shell_area'] == A / 2 and capital['type'] == 'Floating head'
+    p, i, _ = _exchanger_costs(A * 10.763 / 2)
+    assert 2 * i + 4 * i0 > 6 * _exchanger_costs(A * 10.763 / 6)[1]
     C_b = compute_furnace_purchase_cost(fuel.utility_duty * 0.947817, bst.CE)
-    assert capital['installed_cost'] == pytest.approx((N - 1) * i + C_b * 2.19, rel=1e-12)
-    assert capital['purchase_cost'] == pytest.approx((N - 1) * p + C_b, rel=1e-12)
+    assert capital['installed_cost'] == pytest.approx(2 * i + 4 * i0 + C_b * 2.19, rel=1e-12)
+    assert capital['purchase_cost'] == pytest.approx(2 * p + C_b, rel=1e-12)
     summary = t.summary()
     assert summary['utility_cost'] == pytest.approx(sum(u.cost for u in utilities), rel=1e-12)
     assert summary['installed_cost'] == capital['installed_cost']
@@ -1148,6 +1160,70 @@ def test_capital_target_formula():
     assert zero['Q_hot'] < t.Q_hot
     with pytest.raises(ValueError, match='heat_exchanger_type must be one of'):
         t.capital_cost_target(utilities, heat_exchanger_type='shell')
+
+def test_capital_target_split():
+    # the equal division, unless it puts the shells below 150 ft2 where the
+    # area fills k = A // 150 ft2 shell and tubes, which with the other
+    # shells of no area cost more: so a unit added always adds cost
+    from hensmith.targeting import _shell_split
+    p0, i0, _ = _exchanger_costs(0.)
+    for M in range(1, 12):
+        for A_ft2 in np.geomspace(1., 5000., 157):
+            A = A_ft2 / 10.763
+            p, i, k, kind = _shell_split(A, M)
+            pe, ie, kinde = _exchanger_costs(A_ft2 / M)
+            if A_ft2 / M >= 150. or A_ft2 < 150.:
+                assert k == M and kind == kinde
+                assert (p, i) == pytest.approx((M * pe, M * ie), rel=1e-12)
+            else:
+                ks = int(A_ft2 // 150.)
+                pk, ik, kindk = _exchanger_costs(A_ft2 / ks)
+                filled = ks * ik + (M - ks) * i0
+                assert i == pytest.approx(max(M * ie, filled), rel=1e-12)
+                if filled > M * ie:
+                    assert (k, kind) == (ks, kindk) and kind != 'Double pipe'
+                    assert p == pytest.approx(ks * pk + (M - ks) * p0, rel=1e-12)
+                else:
+                    assert (k, kind) == (M, 'Double pipe')
+            assert _shell_split(A, M + 1)[1] > i
+            assert _shell_split(A * 1.001, M)[1] >= i
+    assert _shell_split(math.inf, 3)[1:] == (math.inf, 3, None)
+    nan = _shell_split(math.nan, 3)
+    assert math.isnan(nan[1]) and nan[2:] == (3, None)
+
+def test_capital_target_keeps_shells():
+    # KEMP: with no hot utility up to 5.554 K, four floating heads of 202
+    # ft2; a few watts of steam at 5.560 K add three units, and an equal
+    # division would put the same area in seven double pipes for a fifth of
+    # the cost. The target keeps the shell and tubes the area fills
+    t = targets_of(cp_units('test_targeting_keeps_shells', KEMP, K), 10.)
+    before, after = t.at(5.554).summary(), t.at(5.56).summary()
+    assert (before['N_units'], after['N_units']) == (4, 7)
+    assert before['Q_hot'] == 0. < after['Q_hot'] < 0.1 * 3600
+    assert after['area'] == pytest.approx(before['area'], rel=1e-3)
+    assert 7 * _exchanger_costs(after['area'] * 10.763 / 7)[1] < 0.25 * before['installed_cost']
+    assert (before['N_area_shells'], before['shell_type']) == (4, 'Floating head')
+    assert (after['N_area_shells'], after['shell_type']) == (5, 'Floating head')
+    assert after['installed_cost'] > before['installed_cost']
+    assert after['TAC'] > before['TAC']
+    # so the least TAC is not where the steam appears: past a step of one
+    # shell, not of a factor of five
+    sweep = supertarget(t)
+    assert sweep.T_min_app > 10. and not sweep.at_bound
+    i = sweep.records.index(sweep.optimum)
+    below = sweep.records[i - 1]
+    assert below['N_area_shells'] == sweep.optimum['N_area_shells'] + 1
+    assert below['TAC'] < 1.3 * sweep.optimum['TAC']
+    # the pair of supertarget's example: one floating head of 215 ft2 at
+    # 9.9 K, kept with the two utility units of 10.05 K
+    t = targets('test_targeting_keeps_shells_pair', PAIR, 10.)
+    before, after = t.at(9.9).summary(), t.at(10.05).summary()
+    assert (before['N_units'], after['N_units']) == (1, 3)
+    assert before['installed_cost'] == _exchanger_costs(20. * 10.763)[1]
+    assert (after['N_area_shells'], after['shell_type']) == (1, 'Floating head')
+    assert after['installed_cost'] == pytest.approx(
+        _exchanger_costs(after['area'] * 10.763)[1] + 2 * _exchanger_costs(0.)[1], rel=1e-12)
+    assert after['installed_cost'] > before['installed_cost']
 
 def test_crf_and_tea():
     from biosteam._tea import solve_payment
@@ -1298,8 +1374,12 @@ def test_sweep(monkeypatch):
     frame = sweep.to_frame()
     assert frame.index.name == 'T_min_app' and list(frame.index) == list(T)
     assert list(frame.columns) == ['Q_hot', 'Q_cold', 'utility_cost', 'area', 'N_units',
-                                   'N_shells', 'purchase_cost', 'installed_cost',
+                                   'N_shells', 'N_area_shells', 'shell_area', 'shell_type',
+                                   'purchase_cost', 'installed_cost',
                                    'annualized_capital_cost', 'operating_cost', 'TAC']
+    capital = t.at(T[0]).capital_cost_target()
+    assert [sweep.records[0][key] for key in ('N_area_shells', 'shell_area', 'shell_type')] == [
+        capital[key] for key in ('N_area_shells', 'shell_area', 'type')]
     assert sweep.optimum['TAC'] == frame['TAC'].min()
     assert sweep.T_min_app == sweep.optimum['T_min_app']
     assert sweep.at_bound == (sweep.T_min_app in (T[0], T[-1]))
@@ -1310,6 +1390,8 @@ def test_sweep(monkeypatch):
     hours = supertarget(t, [5., 10.], refine=0, operating_hours=0.)
     assert np.all(hours['operating_cost'] == 0.)
     LP, MP = agent('low_pressure_steam'), agent('medium_pressure_steam')
+    assert supertarget(t, (x for x in [10., np.float64(5.), 5]), refine=0).records == (
+        supertarget(t, [5., 10.], refine=0).records)
     listed = supertarget(t, [5., 10.], refine=0, heating_agents=[MP, LP])
     assert listed.records == supertarget(t, [5., 10.], refine=0,
                                          heating_agents=iter([MP, LP])).records
@@ -1319,6 +1401,12 @@ def test_sweep(monkeypatch):
             (dict(T_min_apps=[]), ValueError, 'non-empty'),
             (dict(T_min_apps=[[5.]]), ValueError, 'non-empty'),
             (dict(T_min_apps=[5., math.nan]), ValueError, 'finite'),
+            (dict(T_min_apps=5.), ValueError, 'non-empty'),
+            # the rule of PinchTargets.at: no bools, no strings
+            (dict(T_min_apps=[True, 5.]), ValueError,
+             'each of T_min_apps must be a finite number, not True'),
+            (dict(T_min_apps=['10']), ValueError, "finite number, not '10'"),
+            (dict(T_min_apps=[None]), ValueError, 'finite number, not None'),
             (dict(T_min_apps=[-1., 5.]), ValueError, '>= 0 K'),
             (dict(refine=-1), ValueError, 'refine must be an int >= 0'),
             (dict(refine=1.), ValueError, 'refine must be an int >= 0'),

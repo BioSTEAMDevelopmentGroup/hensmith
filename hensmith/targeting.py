@@ -494,6 +494,32 @@ def _furnace_costs(Q):
     F_P = 0.986 - 0.0035 * S + 0.0175 * S * S
     return C_b * F_P, C_b * (bst.HX._F_BM_default['Furnace'] + F_P - 1.)
 
+def _shell_split(A, M, P=101325., heat_exchanger_type='Floating head',
+                 material='Carbon steel/carbon steel'):
+    """
+    ``(purchase, installed, k, type)`` [USD] of the area `A` [m²] in `M` >= 1
+    shells, k of them sharing it equally, each of biosteam's `type`
+    (`_exchanger_costs`): Linnhoff and Ahmad's k = `M`, unless that puts the
+    shells below 150 ft² where the area fills k = ``A // 150 ft²`` >= 1
+    shells of at least 150 ft² and these, with the ``M - k`` others of no
+    area (each costed as biosteam costs a vanishing double pipe), cost more
+    to install. k = `M` for an infinite or nan `A`.
+    """
+    def shells(k): # k shells of A / k
+        p, i, kind = _exchanger_costs(A / k * _FT2_PER_M2, P,
+                                      heat_exchanger_type, material)
+        return k * p, k * i, k, kind
+    equal = shells(M)
+    if not math.isfinite(A * _FT2_PER_M2): return equal
+    k = min(int(A * _FT2_PER_M2 // 150.), M)
+    while k and A / k * _FT2_PER_M2 < 150.: k -= 1 # rounding
+    if not k or k == M: return equal
+    p, i, k, kind = shells(k)
+    p0, i0, _ = _exchanger_costs(0., P, heat_exchanger_type, material)
+    p += (M - k) * p0
+    i += (M - k) * i0
+    return (p, i, k, kind) if i > equal[1] else equal
+
 def _real(x, name):
     """``float(x)`` of a finite real number (not a bool); a ValueError
     naming `name` otherwise."""
@@ -755,19 +781,37 @@ class PinchTargets:
     a bound: it assumes one component per region, and a balanced subset of
     streams needs fewer units.
 
-    *Capital and total annualized cost.* `capital_cost_target` divides the
-    area target into as many shells of equal area as the units target (less
-    one furnace for all fuel) [Linnhoff90]_ and costs each with biosteam's
-    correlations at one pressure (biosteam takes each exchanger's highest
-    inlet pressure: its pressure factor is up to about 12 % higher for
-    high pressure steam heaters): a double pipe below 150 ft² (for carbon
-    steel at 1 atm and biosteam's default CE of 567.5, the purchase cost
-    jumps from about 5,486 USD just below 150 ft² to 20,138 USD for a
-    floating head at 150 ft², and the installed cost, the one used here,
-    from about 8,055 to 64,658 USD; the floating head correlation, not
-    monotone below about 126 ft², is not used there), a shell and tube of
-    any area above. The furnace is costed
-    on the fuel's utility duty. `summary` adds the total annualized cost,
+    *Capital and total annualized cost.* `capital_cost_target` takes as
+    many shells as the units target (less one furnace for all fuel) and
+    costs each with biosteam's correlations at one pressure (biosteam takes
+    each exchanger's highest inlet pressure: its pressure factor is up to
+    about 12 % higher for high pressure steam heaters): a double pipe below
+    150 ft² (for carbon steel at 1 atm and biosteam's default CE of 567.5,
+    the purchase cost jumps from about 5,486 USD just below 150 ft² to
+    20,138 USD for a floating head at 150 ft², and the installed cost, the
+    one used here, from about 8,055 to 64,658 USD; the floating head
+    correlation, not monotone below about 126 ft², is not used there), a
+    shell and tube of any area above. Linnhoff and Ahmad divide the area
+    target equally over the shells [Linnhoff90]_: with a cost law of
+    economies of scale, such as a + bA^c, that is the costliest way to
+    divide it, and each added shell adds cost. biosteam's jump breaks this:
+    the equal division can bring every shell below 150 ft² although the area
+    would fill some shell and tubes, so that a utility of a few watts that
+    adds units would cut the target by most of it, where a network just adds
+    a small exchanger and keeps its large ones. So when the equal division
+    puts the N shells below 150 ft² and the area fills k = A // 150 ft² >= 1
+    shells of at least 150 ft², the target takes the costlier to install of
+    the N double pipes and of k equal shell and tubes with N - k shells of
+    no area (each costed as biosteam costs a vanishing double pipe, about
+    1,305 USD installed). This is the least change to the equal division
+    that never falls when a unit is added (or some area, except where
+    biosteam's correlations do: for shells beyond about 20,000 ft², whose
+    cost rises faster than their area, and for the 'Double pipe'
+    `heat_exchanger_type`, cheaper at 150 ft² than below). Where it departs
+    from the equal division it tends to be high, as networks keep only part
+    of their area in shell and tubes (the equal division tends to be low
+    there): an estimate, not a bound. The furnace is costed on the fuel's
+    utility duty. `summary` adds the total annualized cost,
     the installed (bare module) cost times the capital recovery factor plus
     the utility cost times the operating hours: no Lang factor and no
     working capital.
@@ -830,25 +874,34 @@ class PinchTargets:
     target (the balanced grand composite curve is zero at the utility
     pinches of low pressure steam and cooling water and from the pinch down
     to 330 K, which leaves five regions of two streams or utilities each),
-    and the capital cost target, five double pipes of equal area [USD]:
+    and the capital cost target [USD]. The 24.14 m² (260 ft²) fill one
+    floating head, which with four shells of no area costs more to install
+    than five equal double pipes of 52 ft² (about 34,000 USD), so the target
+    takes it:
 
     >>> round(targets.area_target(utilities), 2)
     24.14
     >>> targets.units_target(utilities)
     {'above': 2, 'below': 3, 'total': 5}
     >>> capital = targets.capital_cost_target(utilities)
-    >>> capital['N_shells'], capital['type'], round(capital['installed_cost'])
-    (5, 'Double pipe', 33991)
+    >>> capital['N_shells'], capital['N_area_shells'], capital['type']
+    (5, 1, 'Floating head')
+    >>> round(capital['installed_cost'])
+    72819
 
     All targets, with the total annualized cost [USD/yr] at 10 % interest
     over 10 years and 8000 operating hours a year:
 
-    >>> {key: round(value, 2) for key, value in targets.summary().items()}
+    >>> summary = targets.summary()
+    >>> summary['shell_type']
+    'Floating head'
+    >>> {key: round(value, 2) for key, value in summary.items()
+    ...  if key != 'shell_type'}
     {'T_min_app': 10.0, 'Q_hot': 180000.0, 'Q_cold': 144000.0,
      'utility_cost': 1.66, 'area': 24.14, 'N_units': 5, 'N_shells': 5,
-     'purchase_cost': 23150.38, 'installed_cost': 33991.4,
-     'annualized_capital_cost': 5531.94, 'operating_cost': 13247.77,
-     'TAC': 18779.71}
+     'N_area_shells': 1, 'shell_area': 24.14, 'purchase_cost': 21054.85,
+     'installed_cost': 72819.1, 'annualized_capital_cost': 11850.97,
+     'operating_cost': 13247.77, 'TAC': 25098.74}
 
     The same streams at another minimum approach temperature (the curves
     are reused):
@@ -1665,20 +1718,20 @@ class PinchTargets:
         if A > 0. and N_shells < 1: N_shells = 1
         elif A == 0.: N_shells = 0
         if N_shells:
-            shell_area = A / N_shells
-            purchase, installed, kind = _exchanger_costs(
-                shell_area * _FT2_PER_M2, P, heat_exchanger_type, material)
-            purchase *= N_shells
-            installed *= N_shells
+            purchase, installed, N_area_shells, kind = _shell_split(
+                A, N_shells, P, heat_exchanger_type, material)
+            shell_area = A / N_area_shells
         else: # no area, or nan
             shell_area = purchase = installed = A
+            N_area_shells = 0
             kind = None
         furnace_duty = sum((u.utility_duty for u in fuel), 0.)
         if fuel:
             furnace_purchase, furnace_installed = _furnace_costs(furnace_duty)
             purchase += furnace_purchase
             installed += furnace_installed
-        return {'area': A, 'N_shells': N_shells, 'shell_area': shell_area,
+        return {'area': A, 'N_shells': N_shells,
+                'N_area_shells': N_area_shells, 'shell_area': shell_area,
                 'type': kind, 'furnace_duty': furnace_duty,
                 'purchase_cost': purchase, 'installed_cost': installed}, N
 
@@ -1686,9 +1739,11 @@ class PinchTargets:
                             P=101325., heat_exchanger_type='Floating head',
                             material='Carbon steel/carbon steel'):
         """
-        The capital cost target: the area target in as many shells of equal
-        area as the units target (less a furnace), costed with biosteam's
-        correlations, plus a furnace for the fuel (see Notes of the class).
+        The capital cost target: the area target in as many shells as the
+        units target (less a furnace), split equally over all of them or
+        over fewer if that costs more (the others then have no area), costed
+        with biosteam's correlations, plus a furnace for the fuel (see Notes
+        of the class).
 
         Parameters
         ----------
@@ -1709,10 +1764,12 @@ class PinchTargets:
         Returns
         -------
         dict
-            'area' [m²]; 'N_shells', the number of shells; 'shell_area', the
-            area of each [m²]; 'type', biosteam's type of each ('Double pipe'
-            below 150 ft², None without shells or with an infinite area);
-            'furnace_duty', the utility duty of the fuel [kJ/hr];
+            'area' [m²]; 'N_shells', the number of shells; 'N_area_shells',
+            how many of them share the area equally (the others have none);
+            'shell_area', the area of each of those [m²]; 'type', biosteam's
+            type of each ('Double pipe' below 150 ft², None without shells
+            or with an infinite area); 'furnace_duty', the utility duty of
+            the fuel [kJ/hr];
             'purchase_cost' and 'installed_cost' (bare module) [USD]. inf
             with an infinite area, nan with an unserved utility.
 
@@ -1776,7 +1833,9 @@ class PinchTargets:
         dict
             'T_min_app' [K]; 'Q_hot' and 'Q_cold' [kJ/hr], process side;
             'utility_cost' [USD/hr]; 'area' [m²]; 'N_units', the units
-            target; 'N_shells'; 'purchase_cost' and 'installed_cost' [USD];
+            target; 'N_shells', 'N_area_shells', 'shell_area' [m²] and
+            'shell_type', the 'type' of `capital_cost_target`, as it gives
+            them; 'purchase_cost' and 'installed_cost' [USD];
             'annualized_capital_cost', the installed cost times the capital
             recovery factor, 'operating_cost', the utility cost times the
             operating hours, and their sum 'TAC' [USD/yr].
@@ -1803,6 +1862,9 @@ class PinchTargets:
                 'Q_cold': self.Q_cold, 'utility_cost': utility_cost,
                 'area': capital['area'], 'N_units': N,
                 'N_shells': capital['N_shells'],
+                'N_area_shells': capital['N_area_shells'],
+                'shell_area': capital['shell_area'],
+                'shell_type': capital['type'],
                 'purchase_cost': capital['purchase_cost'],
                 'installed_cost': capital['installed_cost'],
                 'annualized_capital_cost': annualized,
@@ -1868,6 +1930,15 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     least TAC at the smallest or largest temperature evaluated is flagged
     (`Supertargets.at_bound`).
 
+    The capital target drops by about a shell and tube wherever the
+    shrinking area fills one fewer of 150 ft² (see Notes of
+    `PinchTargets`), so the least TAC often lies just past such a step, at
+    the first temperature evaluated beyond it, rather than at a smooth
+    trade-off of energy and capital. The records' 'N_area_shells' and
+    'shell_type' show the steps (`Supertargets.to_frame`). A network has
+    such steps too, but where its own exchangers cross 150 ft², which the
+    target, with its equal shells, places only roughly.
+
     Where the targets do not depend on the minimum approach temperature
     (below the threshold of a threshold problem, where neither the utilities
     nor the balanced composite curves change), the TACs differ only by the
@@ -1884,8 +1955,10 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     One hot stream cooled 400 -> 300 K and one cold stream heated 290 ->
     390 K, both 1 kW/K. Up to 10 K they balance with no utility in a single
     exchanger of 20 m² (215 ft², a shell and tube); above it the utilities
-    add units, and three double pipes of less than 150 ft² each cost less,
-    so on a coarse grid the least total annualized cost (TAC) is at 15 K:
+    add two units, but the area still fills one shell and tube until it
+    falls below 150 ft² (13.94 m²) just below 15 K, where three double pipes
+    take it. So on a coarse grid the least total annualized cost (TAC) is at
+    15 K:
 
     >>> import biosteam as bst, thermosteam as tmo
     >>> from hensmith import PinchTargets, supertarget
@@ -1906,15 +1979,21 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     <Supertargets: 6 points, T_min_app 5-30 K, optimum 15 K (TAC 4.949e+03 USD/yr)>
     >>> sweep['N_units'], sweep['area'].round(2)
     (array([1, 1, 3, 3, 4, 4]), array([20.  , 20.  , 13.88, 11.07,  9.73,  9.17]))
+    >>> sweep['N_area_shells'], [r['shell_type'] for r in sweep.records[1:3]]
+    (array([1, 1, 3, 3, 4, 4]), ['Floating head', 'Double pipe'])
 
-    Refining around it finds the least TAC just above 10 K, with almost no
-    utility and the area already in three double pipes:
+    Refining around it finds the least TAC at the first temperature
+    evaluated past that step, where the TAC falls to under half that of its
+    neighbor below: the step decides the optimum, not a trade-off of energy
+    and capital.
 
     >>> sweep = supertarget(targets, grid)
     >>> sweep
-    <Supertargets: 30 points, T_min_app 5-30 K, optimum 10.05 K (TAC 3.510e+03 USD/yr)>
-    >>> sweep.optimum['N_shells'], round(sweep.optimum['area'], 2)
-    (3, 19.89)
+    <Supertargets: 29 points, T_min_app 5-30 K, optimum 14.94 K (TAC 4.930e+03 USD/yr)>
+    >>> i = sweep.records.index(sweep.optimum)
+    >>> [(r['shell_type'], round(r['area'], 2), round(r['TAC']))
+    ...  for r in sweep.records[i - 1:i + 1]]
+    [('Floating head', 13.95, 12572), ('Double pipe', 13.93, 4930)]
 
     References
     ----------
@@ -1924,12 +2003,15 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
 
     """
     if T_min_apps is None: T_min_apps = _T_MIN_APPS
-    T = np.asarray(T_min_apps, dtype=float)
-    if T.ndim != 1 or not T.size:
+    try:
+        values = list(T_min_apps)
+    except TypeError:
+        values = []
+    if not values or any(np.ndim(x) for x in values):
         raise ValueError('T_min_apps must be a non-empty sequence of '
                          'temperatures [K]')
-    if not np.all(np.isfinite(T)):
-        raise ValueError(f'T_min_apps must be finite, not {T_min_apps!r}')
+    # the rule of PinchTargets.at: finite numbers, not bools or strings
+    T = np.array([_real(x, 'each of T_min_apps') for x in values])
     contributions = targets.approach_contributions
     if contributions is None:
         if np.any(T < 0.):
@@ -2327,8 +2409,14 @@ def network_report(HXN, targets=None, **options):
     (50.62, 66.33, 70.3)
     >>> report['N_units'], targets['N_units']
     (7, 9)
-    >>> round(report['TAC']), round(targets['TAC'])  # USD/yr
-    (62041, 39396)
+
+    Its total annualized cost [USD/yr] is below the target's, which puts the
+    area target in five shell and tubes, where the network has one:
+
+    >>> round(report['TAC']), round(targets['TAC'])
+    (62041, 82120)
+    >>> targets['N_area_shells'], targets['shell_type']
+    (5, 'Floating head')
 
     """
     if not hasattr(HXN, 'new_HXs_hot_side'):
@@ -2734,7 +2822,7 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     ...     [H1.heat_utilities[0], C1.heat_utilities[0]], T_min_app=10.)
     >>> sweep = supertarget(targets)
     >>> sweep
-    <Supertargets: 63 points, T_min_app 1-40 K, optimum 3.905 K (TAC 1.818e+04 USD/yr)>
+    <Supertargets: 63 points, T_min_app 1-40 K, optimum 7.823 K (TAC 2.490e+04 USD/yr)>
     >>> fig, ax = plot_supertargets(sweep)
     >>> [line.get_gid() for line in ax.get_lines() if line.get_gid()]
     ['TAC', 'Capital', 'Operating', 'Optimum']
