@@ -395,7 +395,11 @@ heating goes to the first fuel agent, a furnace at the top of the curve; if
 there is none, or if some cooling remains, it is left unserved, with a
 ``RuntimeWarning`` and a nan cost. A level equal to a grid temperature
 serves that temperature's point loads; BioSTEAM's own rule is strict, and the
-two differ only at exact equality.
+two differ only at exact equality. The exception is a sensible agent whose
+line would have no driving force left there: with ``agent.dT`` of 0
+(``UtilityAgent``'s default), it could serve a point load at its limit only
+at its own inlet temperature, at an unbounded flow, so its level stays just
+short of that point load, which the next agent serves, as in BioSTEAM.
 
 **Served intervals and pricing.** Each agent is priced as one BioSTEAM heat
 utility over the stretch it serves: from its level, or from the end of the

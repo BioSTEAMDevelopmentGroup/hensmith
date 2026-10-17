@@ -896,6 +896,61 @@ def test_levels_of_streams_beyond_reach():
                                    pytest.approx(B.outs[0].T, abs=1e-9))
     assert u.duty + MP.duty == pytest.approx(t.Q_hot, rel=1e-12)
 
+def test_sensible_agent_without_driving_force():
+    # a sensible agent with agent.dT = 0 (UtilityAgent's default) has no
+    # driving force left at a point load at its limit, agent.T - dT
+    # (agent.T + dT for cooling): it would leave at its inlet temperature at
+    # an unbounded flow, and biosteam's rule, strict there, does not take
+    # it. Its level stays just short of the point load; it serves the rest
+    # at a finite flow and the next agent the point load.
+    dT = bst.HeatUtility.dT
+    water = bst.HeatUtility.thermo_water
+    test_hxn_targets.setup('test_targeting_stuck_boiler', ['Water'])
+    oil = bst.UtilityAgent('test_targeting_stuck_oil', Water=1, T=480., P=5e6,
+                           phase='l', thermo=water, T_limit=420.,
+                           regeneration_price=0.01)
+    B = water_boiler('B', oil.T - dT, 10.)
+    L = test_hxn_targets.utility_hx('L', 400., 5e6, 'l', 470., Water=50.)
+    T_b = B.ins[0].T
+    assert T_b == oil.T - oil.dT - dT and not B.outs[0].T + dT < oil.T - oil.dT
+    t = targets_of([B, L], 10.)
+    HP = agent('high_pressure_steam')
+    u, steam = t.utility_targets([oil, HP], None)
+    assert u.ID == oil.ID and T_b - 1e-8 < u.level < T_b
+    assert (u.T_utility_in, u.T_utility_out) == (oil.T, oil.T_limit)
+    assert u.duty == pytest.approx(L.heat_utilities[0].unit_duty, rel=1e-9)
+    assert u.cost == pytest.approx(fresh_price(u.duty, 400., 470., oil)[0], rel=1e-9)
+    assert steam.ID == HP.ID
+    assert steam.duty == pytest.approx(B.heat_utilities[0].unit_duty, rel=1e-9)
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        u, unserved = t.utility_targets([oil], None)
+    assert unserved.ID is None and unserved.duty == steam.duty
+    assert [str(x.message) for x in w] == [
+        f'no heating agent can serve {steam.duty:.6g} kJ/hr of the hot utility '
+        'target; it is left unserved']
+    # cooling: a condenser at a coolant's limit goes to the next coolant
+    test_hxn_targets.setup('test_targeting_stuck_condenser', ['Water'])
+    P = bst.settings.chemicals.Water.Psat(305.)
+    vapour = bst.Stream('test_targeting_stuck_vapour', Water=10., T=305., P=P,
+                        phase='g')
+    COND = bst.HXutility('COND', ins=vapour, V=0., rigorous=True)
+    COND.simulate()
+    H = test_hxn_targets.utility_hx('H', 340., 3e5, 'l', 310., Water=50.)
+    T_c = COND.outs[0].T
+    coolant = bst.UtilityAgent('test_targeting_stuck_coolant', Water=1,
+                               T=T_c - dT, P=101325., phase='l', thermo=water,
+                               T_limit=T_c - 1., regeneration_price=0.01)
+    t = targets_of([COND, H], 10.)
+    CHW = agent('chilled_water')
+    u, chilled = t.utility_targets(None, [coolant, CHW])
+    assert u.ID == coolant.ID and u.level > T_c - t.T_min_app
+    assert u.level - (T_c - t.T_min_app) < 1e-8
+    assert (u.T_utility_in, u.T_utility_out) == (coolant.T, coolant.T_limit)
+    assert u.duty == pytest.approx(-H.heat_utilities[0].unit_duty, rel=1e-9)
+    assert chilled.ID == CHW.ID
+    assert chilled.duty == pytest.approx(-COND.heat_utilities[0].unit_duty, rel=1e-9)
+
 # %% Area, units, capital and total annualized cost
 
 def test_bath_balanced_pair(quickstart):
@@ -1280,8 +1335,80 @@ def test_T_min_app_validated(kemp_hxn):
     with pytest.raises(ValueError, match='T_min_app must be finite and > 0'):
         PinchTargets(t.streams_inlet, t.streams_quenched, t.is_hot, 0., [1., None])
     # the system's sums by agent belong to no exchanger
-    with pytest.raises(ValueError, match=r'must belong to a heat exchanger \(hu.unit\)'):
+    with pytest.raises(ValueError, match=r'must belong to a heat exchanger \(hu.unit\)'
+                                         r'.*heat_exchanger_utilities_from_units'):
         PinchTargets.from_heat_utilities(HXN.system.heat_utilities, 10.)
+
+class HeatedMixer(bst.Unit):
+    """Two feeds mixed and heated to 360 K by a heat utility of its own
+    (``add_heat_utility``, so ``hxn_ok`` False): its first inlet and outlet
+    are not the stream it heats."""
+    _N_ins = 2
+    _N_outs = 1
+
+    def _run(self):
+        self.outs[0].mix_from(self.ins)
+        self.outs[0].T = 360.
+
+    def _design(self):
+        self.add_heat_utility(self.outs[0].H - sum([i.H for i in self.ins]),
+                              min([i.T for i in self.ins]), self.outs[0].T)
+
+def test_from_heat_utilities_takes_exchangers():
+    # a heat utility that is not a heat exchanger's (hxn_ok False) is
+    # refused, whatever its unit's first inlet and outlet: here they would
+    # be one feed of two and the mix, 30 % off the duty. biosteam's
+    # selection leaves it out, as the facility does, and gives the facility's
+    # targets.
+    test_hxn_targets.setup('test_targeting_non_exchanger')
+    M = HeatedMixer('M', ins=[bst.Stream('M_water', Water=500., T=300.),
+                              bst.Stream('M_ethanol', Ethanol=200., T=340.)])
+    H = bst.HXutility('H', ins=M-0, T=310., rigorous=False)
+    M.simulate(); H.simulate()
+    C = test_hxn_targets.utility_hx('C', 300., 101325., 'l', 340., Water=200.)
+    units = [M, H, C]
+    hus = [hu for u in units for hu in u.heat_utilities]
+    assert [(hu.unit, hu.hxn_ok) for hu in hus] == [(M, False), (H, True), (C, True)]
+    mixer = hus[0].unit_duty
+    assert abs(M.outs[0].H - M.ins[0].H - mixer) > 0.3 * mixer
+    message = (r"must be a heat exchanger's \(hu.hxn_ok\), not those of 'M',"
+               r".*heat_exchanger_utilities_from_units\(sys.units\)")
+    for given in (hus, hus[::-1]):
+        with pytest.raises(ValueError, match=message):
+            PinchTargets.from_heat_utilities(given, 10.)
+    selected = bst.process_tools.heat_exchanger_utilities_from_units(units)
+    assert [hu.unit for hu in selected] == [H, C]
+    t = PinchTargets.from_heat_utilities(sorted(selected, key=lambda hu: hu.duty), 10.)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=10., units=units)
+    facility = HXN.targets()
+    assert facility.labels == t.labels == ['C', 'H']
+    assert (facility.Q_hot, facility.Q_cold) == (t.Q_hot, t.Q_cold)
+    # a non-exchanger heat utility without duty is dropped, as any is
+    idle = bst.HeatUtility(unit=M)
+    assert not idle.hxn_ok and idle.duty == 0.
+    same = PinchTargets.from_heat_utilities(
+        [idle, *sorted(selected, key=lambda hu: hu.duty)], 10.)
+    assert same.labels == t.labels and (same.Q_hot, same.Q_cold) == (t.Q_hot, t.Q_cold)
+
+def test_is_hot_validated():
+    # is_hot must agree with each stream's direction (a stream without duty
+    # may be either)
+    t = targets('test_targeting_is_hot', REF_A, 10.)
+    assert t.labels == ['C1', 'H1'] and list(t.is_hot) == [False, True]
+    for is_hot, message in (
+            ([True, True], r"stream 'C1' is heated \(\+396000 kJ/hr\) but marked hot"),
+            ([False, False], r"stream 'H1' is cooled \(-360000 kJ/hr\) but marked cold"),
+            ([True, False], r"stream 'C1' is heated")):
+        for curves in (None, t.curves):
+            with pytest.raises(ValueError, match=message + '.*is_hot must be True '
+                                                 'for a cooled stream'):
+                PinchTargets(t.streams_inlet, t.streams_quenched, is_hot, 10.,
+                             labels=t.labels, curves=curves)
+    zero = cp_units('test_targeting_is_hot_zero', [('Z', 350., 350., 1.)])[0]
+    for flag in (True, False):
+        direct = PinchTargets(t.streams_inlet + zero.ins, t.streams_quenched + zero.outs,
+                              [*t.is_hot, flag], 10.)
+        assert (direct.Q_hot, direct.Q_cold) == (t.Q_hot, t.Q_cold)
 
 def test_agents_by_ID():
     # the agents of utility_targets, summary and supertarget may be the IDs

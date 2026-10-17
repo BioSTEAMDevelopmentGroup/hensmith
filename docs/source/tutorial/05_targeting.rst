@@ -61,10 +61,14 @@ duty by its agent's heat transfer efficiency, 0.95 for steam, and 2.828e+08 /
 Nothing is stored on the facility, and nothing is re-synthesized: the targets
 are those of the units' current states, which, with ``cache_network=True``,
 can differ from the cached network's. The same object can be built without a
-facility, from heat utilities with
+facility, from the heat utilities of heat exchangers with
 :meth:`PinchTargets.from_heat_utilities <hensmith.PinchTargets.from_heat_utilities>`
 (as the trade-off example below does) or from streams as
-:func:`~hensmith.problem_table` takes them.
+:func:`~hensmith.problem_table` takes them. The facility's selection,
+``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``, is the
+one to give it: a heat utility that a unit adds for itself (a reactor's or a
+heated mixer's, ``hu.hxn_ok`` False) raises a ``ValueError``, as its unit's
+first inlet and outlet need not be the stream it heats or cools.
 
 Several utilities on the grand composite curve
 ----------------------------------------------

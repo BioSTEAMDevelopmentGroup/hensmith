@@ -617,7 +617,8 @@ class PinchTargets:
     streams_quenched : list[Stream]
         Corresponding outlets, re-flashed at their enthalpy.
     is_hot : Sequence[bool]
-        True where the stream is cooled.
+        True where the stream is cooled, False where it is heated (a
+        ValueError is raised for a stream with duty marked otherwise).
     T_min_app : float, optional
         Minimum approach temperature [K], a finite number >= 0 (> 0 with
         approach contributions), or a ValueError is raised. Defaults to 5.
@@ -720,7 +721,12 @@ class PinchTargets:
     the first fuel agent, or is left unserved with a RuntimeWarning (nan
     cost). A level equal to a grid temperature serves that temperature's
     point loads (biosteam's own rule is strict; they differ only at exact
-    equality).
+    equality), except where a sensible agent's line would have no driving
+    force left: at a point load at ``agent.T - dT`` (``agent.T + dT`` for
+    cooling), a stream's limit when ``agent.dT`` is 0 (`UtilityAgent`'s
+    default), the agent would leave at its inlet temperature at an
+    unbounded flow, so its level stays just short of that point load, which
+    the next agent serves, as in biosteam.
 
     Each agent is priced as one biosteam heat utility over the stretch it
     serves, from its level (or the end of the grid, if that is nearer) to
@@ -961,6 +967,15 @@ class PinchTargets:
             table, curves, grid = _problem_table(
                 streams_inlet, streams_quenched, is_hot, T_min_app, curves,
                 approach_contributions=list(x))
+        dH = np.array([c.H_out - c.H_in for c in curves])
+        tol = 1e-9 * float(np.abs(dH).sum())
+        for j in np.flatnonzero(np.where(is_hot, dH > tol, dH < -tol)):
+            raise ValueError(f'stream {labels[j]!r} is '
+                             f"{'heated' if dH[j] > 0. else 'cooled'} "
+                             f'({dH[j]:+.6g} kJ/hr) but marked '
+                             f"{'hot' if is_hot[j] else 'cold'}: is_hot must "
+                             'be True for a cooled stream and False for a '
+                             'heated one')
         self.T_min_app = T_min_app
         self.approach_contributions = x
         self.is_hot = is_hot
@@ -982,8 +997,7 @@ class PinchTargets:
         #: Grid index of the pinch.
         self._k_pinch = int(np.flatnonzero(table.Ts == table.pinch_T)[0])
         #: Threshold of every heat comparison [kJ/hr], the table's own.
-        self._tol = 1e-9 * float(np.abs(
-            np.array([c.H_out - c.H_in for c in curves])).sum())
+        self._tol = tol
 
     @classmethod
     def from_heat_utilities(cls, hus, T_min_app=5., approach_contributions=None,
@@ -996,10 +1010,12 @@ class PinchTargets:
         Parameters
         ----------
         hus : Iterable[HeatUtility]
-            Heat utilities of heat exchangers (``hu.unit``), such as
-            ``[hu for u in sys.units for hu in u.heat_utilities]``, not
-            ``sys.heat_utilities`` (sums by agent, of no unit). Zero-duty
-            ones are dropped.
+            Heat utilities of heat exchangers (``hu.unit``, whose first
+            inlet and outlet are the process stream), such as
+            ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``
+            (those a heat exchanger network may take, ``hu.hxn_ok``, as
+            `HeatExchangerNetwork` selects them), not ``sys.heat_utilities``
+            (sums by agent, of no unit). Zero-duty ones are dropped.
         T_min_app : float, optional
             Minimum approach temperature [K], finite and >= 0 (> 0 with
             approach contributions). Defaults to 5.
@@ -1020,15 +1036,33 @@ class PinchTargets:
             first), labeled by unit (``'<owner> - <unit>'`` for an
             auxiliary unit).
 
+        Raises
+        ------
+        ValueError
+            If a heat utility belongs to no unit, or one with duty is not a
+            heat exchanger's (``hu.hxn_ok`` False, as for the heat utilities
+            that reactors, mixers or compressors add with
+            ``Unit.add_heat_utility``: their unit's first inlet and outlet
+            need not be the stream they heat or cool).
+
         """
         hus = list(hus)
         _check_T_min_app(T_min_app)
+        selection = ('take bst.process_tools.heat_exchanger_utilities_from_'
+                     'units(sys.units), the heat utilities a heat exchanger '
+                     'network may take')
         if any(hu.unit is None for hu in hus):
             raise ValueError('every heat utility must belong to a heat '
-                             'exchanger (hu.unit): take those of the units, '
-                             '[hu for u in sys.units for hu in '
-                             'u.heat_utilities], not System.heat_utilities '
-                             '(sums by agent, of no unit)')
+                             f'exchanger (hu.unit): {selection}, not '
+                             'System.heat_utilities (sums by agent, of no unit)')
+        others = [hu for hu in hus if hu.duty and not hu.hxn_ok]
+        if others:
+            names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
+                                            for hu in others))
+            raise ValueError('every heat utility must be a heat exchanger\'s '
+                             f'(hu.hxn_ok), not those of {names}, whose first '
+                             'inlet and outlet need not be the stream they '
+                             f'heat or cool: {selection}')
         values = _explicit_contributions(hus, approach_contributions, T_min_app)
         arranged, N_heating = _arrange_heat_utilities(hus, sort_hus_by_T)
         if values is None:
@@ -1208,8 +1242,31 @@ class PinchTargets:
                 caps = np.minimum(limit, top + _T_SHORT * point)[bottom < limit]
                 if j.size: L = caps.max(initial=limit.min())
                 else: L = R - self.T_min_app
+            if j.size and _sensible(agent):
+                L = self._short_of_stuck_loads(agent, heating, L, j, s)
             levels.append((agent, float(L)))
         return levels
+
+    def _short_of_stuck_loads(self, agent, heating, L, j, s):
+        """
+        The level `L` of the sensible `agent`, or just short of it
+        (`_T_SHORT`) if it would serve a point load of the streams `j`
+        (shifts `s`) at it that leaves the agent's line no driving force:
+        at ``agent.T - dT`` real (``agent.T + dT`` for cooling), a stream's
+        own limit when ``agent.dT`` is 0. The agent would leave at its inlet
+        temperature, at an unbounded flow; biosteam's rule, strict there,
+        does not take it either.
+        """
+        Ts = self.grid['Ts']
+        k = np.flatnonzero(np.abs(Ts - L) <= _T_EQ)
+        if not k.size: return L
+        dT = bst.HeatUtility.dT
+        T = Ts[k][None, :] + s[:, None] # real
+        load = np.abs(self.table.point_H[np.ix_(j, k)]) > self._tol
+        if heating:
+            if (load & (T >= agent.T - dT - _T_EQ)).any(): return L - _T_SHORT
+        elif (load & (T <= agent.T + dT + _T_EQ)).any(): return L + _T_SHORT
+        return L
 
     def _allocate(self, levels, Q, heating):
         """
