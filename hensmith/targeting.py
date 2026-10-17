@@ -2400,16 +2400,20 @@ def network_report(HXN, targets=None, **options):
     -----
     The network's 'area' is sized as the area target is: each exchanger
     with the film coefficients of its two sides (1 kW/m²/K by default),
-    counter-current (a correction factor of 1), and integrated along the
-    exact temperature profiles of its streams (their curves in the targets)
-    against the process duty; a utility's temperature is linear in the duty
-    between its inlet and outlet, and a furnace takes no area (as fuel in
-    the targets). 'area_biosteam' is biosteam's own sizing: heuristic
-    overall coefficients (0.5 kW/m²/K, but 1 for condensing against
-    boiling, which no film coefficients reproduce), a correction factor for
-    two shells, the log-mean of the terminal temperature differences
-    (which overstates the mean difference along a glide) and the utility
-    duty (the process duty divided by the heat transfer efficiency).
+    counter-current (a correction factor of 1), and integrated against the
+    process duty along the temperature profiles of its streams as their
+    curves in the targets model them, like for like with the area target: a
+    point-load stream at its outlet temperature and a non-equilibrium end
+    state (such as a vapour entering below its dew point) as its jump,
+    where the stream itself may glide a little in the exchanger. A
+    utility's temperature is linear in the duty between its inlet and
+    outlet, and a furnace takes no area (as fuel in the targets).
+    'area_biosteam' is biosteam's own sizing: heuristic overall
+    coefficients (0.5 kW/m²/K, but 1 for condensing against boiling, which
+    no film coefficients reproduce), a correction factor for two shells,
+    the log-mean of the terminal temperature differences (which overstates
+    the mean difference along a glide) and the utility duty (the process
+    duty divided by the heat transfer efficiency).
 
     The capital and utility costs are those of the whole network
     (`HXN.new_HXs` and `HXN.new_HX_utils`), not the facility's costs,
@@ -2580,7 +2584,8 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         Utilities of the balanced curves. Defaults to
         `PinchTargets.utility_targets` with the default agents.
     ax : matplotlib.axes.Axes, optional
-        Axes to draw on; a new figure is created if not given.
+        Axes to draw on; a new figure (with a constrained layout, which
+        keeps the axis labels in it) is created if not given.
     file : str, optional
         If given, the figure is saved to this path.
     dpi : int, optional
@@ -2636,7 +2641,7 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         raise ValueError("kind must be 'real', 'shifted' or 'balanced', not "
                          f'{kind!r}')
     if ax is None:
-        fig, ax = plt.subplots(figsize=(7.5, 4.2))
+        fig, ax = plt.subplots(figsize=(7.5, 4.2), layout='constrained')
     else:
         fig = ax.figure
     hot_color, cold_color = '#d62728', '#2e6db4'
@@ -2724,12 +2729,17 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         H_hot_end = hot_H[-1] if hot_H.size else 0.
         H_cold_end = cold_H[-1] if cold_H.size else targets.Q_cold
         ax.margins(y=0.12) # headroom for the utility labels
-        ax.text(0.5 * (H_hot_end + H_cold_end), T_all.max() + 1.,
-                f'hot utility {_format_duty(targets.Q_hot)} kJ/hr', ha='center',
-                va='bottom', gid='Hot utility', **text_kwargs)
-        ax.text(0.5 * targets.Q_cold, T_all.min() - 1.,
-                f'cold utility {_format_duty(targets.Q_cold)} kJ/hr', ha='left',
-                va='top', gid='Cold utility', **text_kwargs)
+        # above the top of the curves, ending at the right one of their hot
+        # ends, and below their bottom from the middle of the cold utility:
+        # inside the axes, clear of the curves by a few points
+        ax.annotate(f'hot utility {_format_duty(targets.Q_hot)} kJ/hr',
+                    xy=(max(H_hot_end, H_cold_end), T_all.max()), xytext=(-2, 4),
+                    textcoords='offset points', ha='right', va='bottom',
+                    gid='Hot utility', **text_kwargs)
+        ax.annotate(f'cold utility {_format_duty(targets.Q_cold)} kJ/hr',
+                    xy=(0.5 * targets.Q_cold, T_all.min()), xytext=(0, -4),
+                    textcoords='offset points', ha='left', va='top',
+                    gid='Cold utility', **text_kwargs)
         pinch_T = targets.pinch_T
         tol = 1e-9 * pinch_T
         if shifted and all(T.size and T.min() - tol <= pinch_T <= T.max() + tol
@@ -2763,7 +2773,8 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
         Utilities to draw. Defaults to `PinchTargets.utility_targets` with
         the default agents; False draws the curve only.
     ax : matplotlib.axes.Axes, optional
-        Axes to draw on; a new figure is created if not given.
+        Axes to draw on; a new figure (with a constrained layout, which
+        keeps the axis labels in it) is created if not given.
     file : str, optional
         If given, the figure is saved to this path.
     dpi : int, optional
@@ -2780,9 +2791,12 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
     ascending level from the temperature axis, each a horizontal segment at
     its level as long as its duty, joined by dotted verticals; cooling
     utilities likewise by descending level. Fuel is drawn dashed at the top
-    of the grid and an unserved remainder in gray. Each label sits at the
-    end of its segment, below it for heating and above it for cooling, off
-    the curve where a level touches it. Artists carry stable gids: 'GCC',
+    of the grid and an unserved remainder in gray. Each label sits beside
+    the end of its segment, on the side with more room in the axes, off
+    the curve: right of the end, toward the pinch (below the level for
+    heating, above it for cooling), or left of the end, beyond the level
+    (above it for heating, below it for cooling), where the heat cascaded
+    is at least the end of the step. Artists carry stable gids: 'GCC',
     'Pinch', 'Utility:<agent ID>' (the segments, 'Utility:unserved' for a
     remainder) and 'Label:<agent ID>'.
 
@@ -2813,7 +2827,7 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
     """
     import matplotlib.pyplot as plt
     if ax is None:
-        fig, ax = plt.subplots(figsize=(5, 4.2))
+        fig, ax = plt.subplots(figsize=(5, 4.2), layout='constrained')
     else:
         fig = ax.figure
     hot_color, cold_color = '#d62728', '#2e6db4'
@@ -2835,12 +2849,9 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
                          key=lambda u: u.level)
         cooling = sorted((u for u in utilities if not u.heating),
                          key=lambda u: -u.level)
-        # each label beside the end of its step, where a level touches the
-        # curve: below it for heating (the curve rises to the right above
-        # the pinch) and above it for cooling (it falls to the right below)
-        for steps, color, end, (dy, va) in (
-                (heating, hot_color, Ts[0], (-2, 'top')),
-                (cooling, cold_color, Ts[-1], (2, 'bottom'))):
+        ends = [] # (ID, x, y, heating, color) at the end of each step
+        for steps, color, end in ((heating, hot_color, Ts[0]),
+                                  (cooling, cold_color, Ts[-1])):
             x = 0.
             previous = None
             for u in steps:
@@ -2854,11 +2865,27 @@ def plot_grand_composite_curve(targets, utilities=None, ax=None, file=None,
                             ls=':', lw=0.8)
                 ax.plot([x, x + u.duty], [y, y], lw=1.5, gid='Utility:' + ID,
                         **style)
-                ax.annotate(ID, xy=(x + u.duty, y), xytext=(3, dy),
-                            textcoords='offset points', ha='left', va=va,
-                            fontsize=7, color=style['color'], gid='Label:' + ID)
                 x += u.duty
                 previous = y
+                ends.append((ID, x, y, u.heating, style['color']))
+        # each label beside the end of its step on the side with more room
+        # in the axes, so that it stays inside them, and off the curve. Left
+        # of the end it sits beyond the level (above it for heating, below
+        # it for cooling), where the curve is never left of the end: the
+        # heat cascaded there is at least the duty of the steps up to this
+        # one. Right of the end it sits toward the pinch, which the curve
+        # leaves rising to the right above it and falling to the right
+        # below it.
+        lo, hi = ax.get_xlim()
+        for ID, x, y, heating, color in ends:
+            sign = 1 if hi - x >= x - lo else -1 # right or left of the end
+            dy = -2 * sign if heating else 2 * sign
+            ax.annotate(ID, xy=(x, y), xytext=(3 * sign, dy),
+                        textcoords='offset points',
+                        ha='left' if sign > 0 else 'right',
+                        va='top' if dy < 0 else 'bottom', fontsize=7,
+                        color=color, gid='Label:' + ID)
+        ax.margins(y=0.08) # headroom for a label beyond the outermost level
     _sci_ticks(ax.xaxis)
     ax.set_xlabel('heat cascaded [kJ·h$^{-1}$]')
     ax.set_ylabel('shifted T [°C]')
@@ -2876,7 +2903,8 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     ----------
     sweep : Supertargets
     ax : matplotlib.axes.Axes, optional
-        Axes to draw on; a new figure is created if not given.
+        Axes to draw on; a new figure (with a constrained layout, which
+        keeps the axis labels in it) is created if not given.
     file : str, optional
         If given, the figure is saved to this path.
     dpi : int, optional
@@ -2923,7 +2951,7 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     """
     import matplotlib.pyplot as plt
     if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 4))
+        fig, ax = plt.subplots(figsize=(6, 4), layout='constrained')
     else:
         fig = ax.figure
     T = sweep['T_min_app']

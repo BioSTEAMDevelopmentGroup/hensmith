@@ -1032,8 +1032,13 @@ capital recovery factor against BioSTEAM's; and the swept optimum against
 the closed-form total annualized cost of a two-stream problem. The
 facility's targets must equal the synthesis's bit for bit, with and without
 approach contributions; the network report's areas must equal independent
-log-mean areas; and targeting must leave the flowsheet's streams, the
-agents, later utility costs and a later synthesis unchanged.
+log-mean areas integrated along the network's own streams where these are at
+equilibrium (the report follows each stream as the targets' curves model it,
+like for like with the area target, so it may differ slightly for a
+point-load stream, held at its outlet temperature, or a non-equilibrium end
+state, such as a vapour entering below its dew point); and targeting must
+leave the flowsheet's streams, the agents, later utility costs and a later
+synthesis unchanged.
 
 **Doctests.** The examples in the docstrings are executed as part of the test
 suite, so the numbers printed in the API reference are numbers the code

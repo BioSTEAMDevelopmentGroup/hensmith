@@ -2073,7 +2073,7 @@ def test_plot_gcc_gids():
     finally:
         plt.close(fig)
 
-def test_plot_readability():
+def test_plot_readability(quickstart):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -2137,25 +2137,50 @@ def test_plot_readability():
         try:
             label, = _gid_artists(ax, 'Utility:unserved')
             assert label.get_text() == texts[LP_only]
-            hot, = _gid_artists(ax, 'Hot balanced composite')
-            cold, = _gid_artists(ax, 'Cold balanced composite')
-            (hot_H, hot_T), (cold_H, cold_T) = hot.get_data(), cold.get_data()
+            hot_curve, = _gid_artists(ax, 'Hot balanced composite')
+            cold_curve, = _gid_artists(ax, 'Cold balanced composite')
+            (hot_H, hot_T), (cold_H, cold_T) = hot_curve.get_data(), cold_curve.get_data()
             assert hot_H[0] == 0. and cold_H[0] == pytest.approx(12.372 * kW, rel=1e-9)
             assert min_vertical_gap(hot_T, hot_H, cold_T, cold_H) == pytest.approx(
                 bst.HeatUtility.dT, abs=1e-6)
         finally:
             plt.close(fig)
-    # every utility label off both balanced composites: a sensible agent's
-    # beside the middle of its line (below right of the rising cold curve
-    # for cooling water and chilled water, above left of the hot curve for a
-    # hot oil), a latent one's by its flat and the furnace's above the end
+    def readable(fig, ax, labels, curves):
+        """Every one of the `labels` inside the axes and off the `curves`,
+        and the axis labels inside the figure: whether or not it is saved
+        with a tight bounding box (or shown in a window)."""
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        within = lambda box, frame: (frame.x0 <= box.x0 and box.x1 <= frame.x1
+                                     and frame.y0 <= box.y0 and box.y1 <= frame.y1)
+        frame = ax.get_window_extent(renderer)
+        points = []
+        for line in curves:
+            xy = ax.transData.transform(np.column_stack(line.get_data()))
+            points += [np.linspace(a, b, 500) for a, b in zip(xy, xy[1:])]
+        points = np.concatenate(points)
+        assert labels
+        for label in labels:
+            box = label.get_window_extent(renderer)
+            assert within(box, frame), label.get_text()
+            inside = ((points[:, 0] >= box.x0) & (points[:, 0] <= box.x1)
+                      & (points[:, 1] >= box.y0) & (points[:, 1] <= box.y1))
+            assert not inside.any(), label.get_text()
+        for label in (ax.xaxis.label, ax.yaxis.label, ax.xaxis.get_offset_text()):
+            assert within(label.get_window_extent(renderer), fig.bbox), label.get_text()
+    # every utility label inside the axes and off both balanced composites:
+    # a sensible agent's beside the middle of its line (below right of the
+    # rising cold curve for cooling water and chilled water, above left of
+    # the hot curve for a hot oil), a latent one's by its flat and the
+    # furnace's above the end
     oil = bst.UtilityAgent('test_targeting_plot_hot_oil', Water=1, T=480., P=5e6,
                            phase='l', thermo=bst.HeatUtility.thermo_water,
                            T_limit=420., heat_transfer_price=1e-6)
     oiled = targets('test_targeting_plot_oil', [('C1', 390., 470., 1.),
                                                 ('C2', 460., 470., 10.)], 10.)
+    liquid = liquids('test_targeting_plot_liquids')[1].targets()
     cases = [(threshold, None), (furnace, None), (oiled, oiled.utility_targets([oil], [])),
-             (liquids('test_targeting_plot_liquids')[1].targets(), None)]
+             (liquid, None)]
     for t, utilities in cases:
         fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
         try:
@@ -2165,41 +2190,56 @@ def test_plot_readability():
             curves = [line for line in ax.get_lines()
                       if 'balanced composite' in (line.get_gid() or '')]
             assert len(curves) == 2
-            points = []
-            for line in curves:
-                xy = ax.transData.transform(np.column_stack(line.get_data()))
-                points += [np.linspace(a, b, 500) for a, b in zip(xy, xy[1:])]
-            points = np.concatenate(points)
-            for box, label in zip(boxes(fig, labels), labels):
-                inside = ((points[:, 0] >= box.x0) & (points[:, 0] <= box.x1)
-                          & (points[:, 1] >= box.y0) & (points[:, 1] <= box.y1))
-                assert not inside.any(), label.get_text()
+            readable(fig, ax, labels, curves)
         finally:
             plt.close(fig)
+    # the utility labels of the real and shifted composites inside the axes
+    # and off the curves, also where the hot curve's hot end is the top of
+    # the plot, at the right of it (KEMP, hot streams only)
+    kemp = targets_of(cp_units('test_targeting_plot_kemp', KEMP, K), 10.)
+    for t in (kemp, hot, threshold, quickstart):
+        for kind in ('real', 'shifted'):
+            fig, ax = plot_composite_curves(t, kind=kind)
+            try:
+                labels = _gid_artists(ax, 'Hot utility') + _gid_artists(ax, 'Cold utility')
+                assert len(labels) == 2
+                readable(fig, ax, labels, _gid_artists(ax, 'Hot composite')
+                         + _gid_artists(ax, 'Cold composite'))
+            finally:
+                plt.close(fig)
     # the grand composite curve at its default size: heats of six digits
-    # [kJ/hr] in scientific notation, whose tick labels do not run together,
-    # and every label off the curve (which meets the end of a step)
-    t = targets('test_targeting_plot_readable_gcc', REF_A, 10.)
-    fig, ax = plot_grand_composite_curve(t)
+    # [kJ/hr] in scientific notation, whose tick labels do not run together
+    gcc_A = targets('test_targeting_plot_readable_gcc', REF_A, 10.)
+    fig, ax = plot_grand_composite_curve(gcc_A)
     try:
         lo, hi = ax.get_xlim()
         ticks = [x for x in ax.get_xticklabels() if lo <= x.get_position()[0] <= hi]
         assert ax.get_xticks()[-1] > 1e5
-        labels = _gid_artists(ax, 'Label:')
-        assert len(labels) == 4
-        boxed = boxes(fig, ticks + labels)
-        tick_boxes, label_boxes = boxed[:len(ticks)], boxed[len(ticks):]
+        tick_boxes = boxes(fig, ticks)
         assert ax.xaxis.get_offset_text().get_text() == '1e5'
         assert all(not a.overlaps(b) for a, b in zip(tick_boxes, tick_boxes[1:]))
-        gcc, = _gid_artists(ax, 'GCC')
-        xy = ax.transData.transform(np.column_stack(gcc.get_data()))
-        curve = np.concatenate([np.linspace(a, b, 500) for a, b in zip(xy, xy[1:])])
-        for box, label in zip(label_boxes, labels):
-            inside = ((curve[:, 0] >= box.x0) & (curve[:, 0] <= box.x1)
-                      & (curve[:, 1] >= box.y0) & (curve[:, 1] <= box.y1))
-            assert not inside.any(), label.get_text()
     finally:
         plt.close(fig)
+    # a label for each step, inside the axes on the side of the step's end
+    # with more room (the last steps end at the largest heats: left of the
+    # end, above a heating level and below a cooling one) and off the curve,
+    # which meets the end of a step or lies beyond it (KEMP's cooling water
+    # ends short of the curve, which turns back below its level)
+    for t in (gcc_A, furnace, liquid, kemp, threshold, hot, quickstart):
+        fig, ax = plot_grand_composite_curve(t)
+        try:
+            heating = {u.ID: u.heating for u in t.utility_targets()}
+            labels = _gid_artists(ax, 'Label:')
+            assert len(labels) == len(heating)
+            readable(fig, ax, labels, _gid_artists(ax, 'GCC'))
+            lo, hi = ax.get_xlim()
+            for label in labels:
+                (x, _), (dx, dy) = label.xy, label.xyann
+                right = dx > 0
+                assert right == (hi - x >= x - lo)
+                assert (dy > 0) == (heating[label.get_text()] != right)
+        finally:
+            plt.close(fig)
 
 def test_plot_supertargets_gids(tmp_path):
     import matplotlib
@@ -2222,6 +2262,13 @@ def test_plot_supertargets_gids(tmp_path):
         assert (optimum.get_xdata()[0], optimum.get_ydata()[0]) == (
             sweep.T_min_app, sweep.optimum['TAC'])
         assert not sweep.at_bound and optimum.get_label() == 'optimum 10 K'
+        # the axis labels inside the figure, without a tight bounding box
+        fig.canvas.draw()
+        frame = fig.bbox
+        for label in (ax.xaxis.label, ax.yaxis.label):
+            box = label.get_window_extent(fig.canvas.get_renderer())
+            assert (frame.x0 <= box.x0 and box.x1 <= frame.x1
+                    and frame.y0 <= box.y0 and box.y1 <= frame.y1), label.get_text()
     finally:
         plt.close(fig)
     # an optimum at an end of the sweep is labeled so; one without a finite
