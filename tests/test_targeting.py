@@ -291,6 +291,17 @@ def test_contributions():
     assert none.approach_contributions is None
     assert none.table.residual.tobytes() == t.table.residual.tobytes()
     assert none.Q_hot.hex() == t.Q_hot.hex()
+    # ... at any T_min_app (only a given value needs T_min_app > 0), with
+    # the length checked all the same
+    t0 = targets_of(units, 0.)
+    none0 = PinchTargets(t.streams_inlet, t.streams_quenched, t.is_hot, 0.,
+                         [float('nan')] * N, curves=t.curves)
+    assert none0.approach_contributions is None
+    assert none0.Q_hot.hex() == t0.Q_hot.hex()
+    with pytest.raises(ValueError, match=f'{N + 1} approach contributions '
+                                         f'given for {N} streams'):
+        PinchTargets(t.streams_inlet, t.streams_quenched, t.is_hot, 10.,
+                     [None] * (N + 1), curves=t.curves)
     assert targets_of(units, 10., approach_contributions={}).approach_contributions is None
     # KEMP with contributions against the classic cascade (hot T - c, cold T + c)
     tc = targets_of(units, 10., approach_contributions=KEMP_C)

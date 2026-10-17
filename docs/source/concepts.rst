@@ -215,13 +215,14 @@ so that
 Two streams that meet on the shifted scale are therefore exactly their pair's
 required approach apart, and the problem table above is built on that scale
 with no other change. A contribution is None or nan (unspecified) or a finite
-number greater than zero. Zero is excluded so that every pair's requirement
-stays positive: a match allowed to touch would have no driving force at its
-pinch and need an infinite area, and its ``HXprocess`` guard, the
-requirement less 1e-6 K, would turn negative. Whenever a contribution is
-given, ``T_min_app`` must be finite and positive as well, since it sets the
-default ``T_min_app / 2``; without contributions ``T_min_app = 0`` is
-accepted as before.
+number greater than zero. Zero is excluded so that every pair keeps a
+positive driving force: a match allowed to touch would have none at its pinch
+and need an infinite area. (The ``HXprocess`` guard is the requirement less
+1e-6 K, so a pair whose contributions sum to 1e-6 K or less still gets a
+guard of zero or less, as ``T_min_app <= 1e-6`` K does by default.) Whenever
+a contribution is given, ``T_min_app`` must be finite and positive as well,
+since it sets the default ``T_min_app / 2``; without contributions, or with
+every one unspecified, ``T_min_app = 0`` is accepted as before.
 
 **The default is unchanged, bit for bit.** An unspecified stream gets
 exactly the default shifts, ``T_min_app`` if hot and 0 if cold

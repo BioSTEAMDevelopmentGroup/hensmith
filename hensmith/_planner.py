@@ -1882,42 +1882,57 @@ def _contribution_value(x, label):
                      f'finite number > 0 K, or None, not {x!r}')
 
 
-def _approach_contributions(N, T_min_app, contributions=None):
+def _given_contributions(N, T_min_app, contributions):
     """
-    The (N,) approach temperature contributions [K] of `N` streams:
-    `contributions` (one entry per stream, see `_contribution_value`) with
-    every unspecified one, or all of them if `contributions` is None, at
-    ``T_min_app / 2``.
+    The validated contributions of `N` streams (a list of `N` values, see
+    `_contribution_value`), or None if `contributions` is None or every
+    value is unspecified (the default path, for any `T_min_app`). The
+    length is checked first, then every value, then, only when a value is
+    given, that `T_min_app` is finite and > 0.
     """
-    half = T_min_app / 2.
-    if contributions is None: return np.full(N, half)
-    if not (math.isfinite(T_min_app) and T_min_app > 0.):
-        raise ValueError('T_min_app must be finite and > 0 with approach '
-                         f'contributions, not {T_min_app!r}')
+    if contributions is None: return None
     contributions = list(contributions)
     if len(contributions) != N:
         raise ValueError(f'{len(contributions)} approach contributions given '
                          f'for {N} streams')
     values = [_contribution_value(x, f'stream {j}')
               for j, x in enumerate(contributions)]
+    if all(x is None for x in values): return None
+    if not (math.isfinite(T_min_app) and T_min_app > 0.):
+        raise ValueError('T_min_app must be finite and > 0 with approach '
+                         f'contributions, not {T_min_app!r}')
+    return values
+
+
+def _approach_contributions(N, T_min_app, contributions=None):
+    """
+    The (N,) approach temperature contributions [K] of `N` streams:
+    `contributions` (one entry per stream, see `_given_contributions`) with
+    every unspecified one, or all of them if `contributions` is None, at
+    ``T_min_app / 2``.
+    """
+    half = T_min_app / 2.
+    values = _given_contributions(N, T_min_app, contributions)
+    if values is None: return np.full(N, half)
     return np.array([half if x is None else x for x in values], dtype=float)
 
 
 def _approach_shifts(is_hot, T_min_app, contributions=None):
     """
     Each stream's shift onto the shifted scale, ``T* = T - shift``:
-    ``T_min_app`` for hot and 0 for cold streams without `contributions`,
-    else ``T_min_app/2 + c`` for hot and ``T_min_app/2 - c`` for cold
-    streams (`_approach_contributions`), so that a hot and a cold stream
-    that touch on the shifted scale are ``c_h + c_c`` apart. Unspecified
-    contributions give the default shifts bit for bit (``x/2 + x/2 == x``,
-    ``x/2 - x/2 == 0.``).
+    ``T_min_app`` for hot and 0 for cold streams without `contributions`
+    (or with every value unspecified), else ``T_min_app/2 + c`` for hot and
+    ``T_min_app/2 - c`` for cold streams (`_approach_contributions`), so
+    that a hot and a cold stream that touch on the shifted scale are ``c_h
+    + c_c`` apart. Unspecified contributions next to given ones keep the
+    default shifts bit for bit (``x/2 + x/2 == x``, ``x/2 - x/2 == 0.``).
     """
     is_hot = np.asarray(is_hot, dtype=bool)
-    if contributions is None:
+    values = _given_contributions(is_hot.size, T_min_app, contributions)
+    if values is None:
         return np.where(is_hot, T_min_app, 0.)
-    c = _approach_contributions(is_hot.size, T_min_app, contributions)
     half = T_min_app / 2.
+    c = np.array([half if x is None else x for x in values], dtype=float)
     return np.where(is_hot, half + c, half - c)
 
 

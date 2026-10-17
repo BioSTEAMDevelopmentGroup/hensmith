@@ -279,6 +279,37 @@ def test_default_problem_table_bit_for_bit(name):
             inlets, outlets, is_hot, T, curves,
             approach_contributions=contributions)) == reference
 
+@pytest.mark.parametrize('T', [0., math.ulp(0.)])
+def test_unspecified_contributions_need_no_positive_T_min_app(T):
+    # every value unspecified is the default path, which accepts any finite
+    # T_min_app (T_min_app = 0 included): same plan and table to the bit
+    streams = streams_from(LINNHOFF4)
+    N = len(streams)
+    is_hot_plan = [s['kind'] == 'hot' for s in streams]
+    default = P._plan_numeric(streams, T)['plan']
+    reference = plan_record(default)
+    for contributions in ([None] * N, [NAN] * N, np.full(N, NAN)):
+        plan = P._plan_numeric(streams, T,
+                               approach_contributions=contributions)['plan']
+        assert plan_record(plan) == reference
+        assert plan.status == default.status
+        assert plan.info['shift'].tobytes() == np.where(
+            is_hot_plan, T, 0.).tobytes()
+    inlets, outlets, is_hot, _ = water_example()
+    table, curves, grid = hxn_synthesis._problem_table(inlets, outlets, is_hot,
+                                                       T)
+    reference = table_record(table)
+    for contributions in ([None, None], [NAN, NAN], np.full(2, NAN)):
+        other, _, other_grid = hxn_synthesis._problem_table(
+            inlets, outlets, is_hot, T, curves, contributions)
+        assert table_record(other) == reference
+        for key in ('Ts', 'shift', 'Hl', 'Hr', 'k_hi', 'k_lo',
+                    'contributions'):
+            assert other_grid[key].tobytes() == grid[key].tobytes(), key
+        assert table_record(problem_table(
+            inlets, outlets, is_hot, T, curves,
+            approach_contributions=contributions)) == reference
+
 def default_network_units(name):
     """(units, T_min_app, stream_splitting) of a facility test case."""
     if name == 'r002':
@@ -434,6 +465,8 @@ def test_planner_targets_match_classic_cascade():
         Qh, Qc, zeros = classic_cascade(streams, c)
         assert_targets(net, Qh, Qc, streams)
         assert min(abs(net['plan'].pinch_T - (z - dT / 2)) for z in zeros) <= 1e-9
+        pair_ends_ok(streams, {s['name']: cj for s, cj in zip(streams, c)},
+                     net)
 
 @pytest.mark.parametrize('name', ['kemp', 'smith2005_exr17_2_dT10'])
 def test_problem_table_matches_classic_cascade(name):
@@ -516,9 +549,19 @@ def test_split_cases_with_contributions_reach_mer(name):
     Qh, Qc, _ = classic_cascade(streams, c)
     assert_targets(net, Qh, Qc, streams)
     # branch temperatures: the parent's at the parent-equivalent enthalpies
-    pair_ends_ok(streams, {s['name']: cj for s, cj in zip(streams, c)}, net)
+    cmap = {s['name']: cj for s, cj in zip(streams, c)}
+    pair_ends_ok(streams, cmap, net)
     assert net['plan'].splits
-    assert net['plan'].info['min_approach_margin'] >= -1e-9
+    info = net['plan'].info
+    assert info['min_approach_margin'] >= -1e-9
+    # split-mode reporting against the walked ends (linear profiles: the
+    # ends are each match's minimum)
+    ends = [min(m['T_hot_in'] - m['T_cold_out'],
+                m['T_hot_out'] - m['T_cold_in']) for m in net['matches']]
+    assert abs(info['min_approach'] - min(ends)) <= 1e-9
+    margin = min(a - (cmap[m['hot']] + cmap[m['cold']])
+                 for a, m in zip(ends, net['matches']))
+    assert abs(info['min_approach_margin'] - margin) <= 1e-9
 
 def test_exact_check_and_repair_per_pair():
     # hot stream 2 (on branches above the pinch) needs 5 K more against
@@ -551,7 +594,8 @@ def test_exact_check_and_repair_per_pair():
                                    is_hot, shift)[0]
     try:
         for n, hx in units.items():
-            required = dT + 5. if n in bad else dT
+            # the pair sets the requirement: every exchanger of stream j
+            required = dT + 5. if plan.exchangers[n].hot == j else dT
             assert hx.dT == required - 1e-6, hx.ID
             assert internal_approach(hx) >= required - APPROACH_TOL, hx.ID
     finally:
@@ -770,6 +814,14 @@ def test_invalid_contributions(monkeypatch):
     with pytest.raises(ValueError, match='T_min_app must be finite and > 0'):
         problem_table(inlets, outlets, is_hot, 0.,
                       approach_contributions=[1., 1.])
+    # the length is checked even when every value is unspecified
+    with pytest.raises(ValueError, match=f'{N + 1} approach contributions '
+                                         f'given for {N} streams'):
+        P._plan_numeric(streams, 0., approach_contributions=[None] * (N + 1))
+    with pytest.raises(ValueError, match='3 approach contributions given '
+                                         'for 2 streams'):
+        problem_table(inlets, outlets, is_hot, 0.,
+                      approach_contributions=[None, NAN, None])
     # nan is unspecified; numpy numbers are accepted
     default = plan_record(P._plan_numeric(streams, 10.)['plan'])
     for contributions in ([NAN] * N, np.full(N, NAN), np.full(N, 5.),

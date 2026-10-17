@@ -27,7 +27,7 @@ from warnings import warn
 import numpy as np
 import biosteam as bst
 from ._curves import _T_EQ
-from ._planner import _approach_contributions, _contribution_value
+from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
     _contribution_key_level, _names_unit, _owner_chains, _unit_name)
@@ -776,12 +776,10 @@ class PinchTargets:
                 raise TypeError('approach_contributions must be a sequence '
                                 'with one value per stream, not '
                                 f'{type(x).__name__!r}')
-            x = [_contribution_value(v, f'stream {j}') for j, v in enumerate(x)]
-            if all(v is None for v in x):
-                x = None
-            else: # checks T_min_app, then the length
-                _approach_contributions(N, T_min_app, x)
-                x = tuple(x)
+            # the length, each value, then T_min_app if a value is given;
+            # every value unspecified is the default path (None)
+            x = _given_contributions(N, T_min_app, x)
+            if x is not None: x = tuple(x)
         if labels is None:
             labels = [s.ID for s in streams_inlet]
         elif len(labels) != N:
