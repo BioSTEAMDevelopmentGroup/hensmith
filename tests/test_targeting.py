@@ -2004,6 +2004,20 @@ def test_sweep_constant():
     with pytest.warns(RuntimeWarning, match='leave part of a utility target unserved'):
         unserved = supertarget(pair, [12., 14.], refine=0, cooling_agents=[])
     assert np.isnan(unserved['TAC']).all() and not unserved.constant
+    # the same finite TACs, the others nan (the cooling past the threshold
+    # unserved): not refined either, and its optimum, the smallest
+    # temperature of that flat stretch, is not said to be at the bound
+    with pytest.warns(RuntimeWarning, match='leave part of a utility target unserved'):
+        partly = supertarget(pair, [2., 4., 6., 8., 12., 14.], cooling_agents=[])
+    assert len(partly.records) == 6 and not partly.constant and partly.at_bound
+    assert list(np.isfinite(partly['TAC'])) == [True] * 4 + [False] * 2
+    assert repr(partly) == ('<Supertargets: 6 points, T_min_app 2-14 K, optimum 2 K '
+                            f'(TAC {partly.optimum["TAC"]:.3e} USD/yr), TAC constant '
+                            'where finite>')
+    # but one finite TAC among nan ones is no flat stretch: at the bound
+    with pytest.warns(RuntimeWarning, match='leave part of a utility target unserved'):
+        one = supertarget(pair, [8., 12., 14.], refine=0, cooling_agents=[])
+    assert repr(one).endswith(', at the bound>')
 
 def test_sweep_refinement():
     # each round evaluates n_refine new temperatures, on both sides of the
@@ -2714,14 +2728,18 @@ def test_plot_readability(quickstart):
         renderer = fig.canvas.get_renderer()
         return [a.get_window_extent(renderer) for a in artists]
     # fuel above high pressure steam: the label of the furnace sits above
-    # that of the top flat, which ends where the finite hot curve does
+    # the hot end of the cold curve, whose top its heat closes, and over
+    # that of the top flat, which runs into it there
     furnace = targets('test_targeting_plot_readable_fuel', FURNACE, 10.)
     fig, ax = plot_composite_curves(furnace, kind='balanced')
     try:
         fuel, = _gid_artists(ax, 'Fuel')
         steam, = _gid_artists(ax, 'Utility:high_pressure_steam')
-        assert fuel.xy == pytest.approx(steam.xy, rel=1e-9)
+        hot_T, hot_H, cold_T, cold_H = furnace.balanced_composite_curves()
+        assert fuel.xy == pytest.approx((cold_H[-1], 520. - K), rel=1e-9)
+        assert steam.xy[0] < fuel.xy[0] and steam.xy[1] < fuel.xy[1]
         fuel, steam, frame = boxes(fig, [fuel, steam, ax])
+        assert fuel.x0 < steam.x1 and steam.x0 < fuel.x1 # stacked
         assert not fuel.overlaps(steam) and fuel.y0 >= steam.y1 - 1.
         assert frame.y1 >= fuel.y1
     finally:
@@ -2822,20 +2840,46 @@ def test_plot_readability(quickstart):
     oiled = targets('test_targeting_plot_oil', [('C1', 390., 470., 1.),
                                                 ('C2', 460., 470., 10.)], 10.)
     liquid = liquids('test_targeting_plot_liquids')[1].targets()
-    cases = [(threshold, None), (furnace, None), (oiled, oiled.utility_targets([oil], [])),
-             (liquid, None)]
-    for t, utilities in cases:
+    # and where a label at its anchor would run past the left edge of the
+    # axes, moved inside them: the low pressure steam's above a short flat
+    # near that edge (pyro), and a furnace's that served only a cold
+    # stream far above the short hot curve (fuel_only), whose label at the
+    # top of the curves stays clear of that edge and of the cold
+    # utilities' labels
+    pyro = targets('test_targeting_plot_pyro', [('C1', 300., 773., 1.),
+                                                ('H1', 750., 320., 0.6)], 10.)
+    fuel_only = targets('test_targeting_plot_fuel_only', [('C1', 600., 700., 1.),
+                                                          ('H1', 330., 300., 0.5)], 10.)
+    assert [u.ID for u in fuel_only.utility_targets() if u.heating] == ['natural_gas']
+    cases = [(threshold, None, True), (furnace, None, True),
+             (oiled, oiled.utility_targets([oil], []), True), (liquid, None, True),
+             (pyro, None, False), (fuel_only, None, True)]
+    for t, utilities, sensible in cases:
         fig, ax = plot_composite_curves(t, kind='balanced', utilities=utilities)
         try:
             labels = _gid_artists(ax, 'Utility:') + _gid_artists(ax, 'Fuel')
-            assert any(not (u.agent.isfuel or u.agent.T_limit is None)
-                       for u in utilities or t.utility_targets())
+            assert sensible == any(not (u.agent.isfuel or u.agent.T_limit is None)
+                                   for u in utilities or t.utility_targets())
             curves = [line for line in ax.get_lines()
                       if 'balanced composite' in (line.get_gid() or '')]
             assert len(curves) == 2
             readable(fig, ax, labels, curves)
+            label_boxes = boxes(fig, labels)
+            assert all(not a.overlaps(b) for i, a in enumerate(label_boxes)
+                       for b in label_boxes[i + 1:])
         finally:
             plt.close(fig)
+    # the low pressure steam's label of pyro, at its anchor, would start
+    # left of the axes: moved right just inside them, over the hot curve
+    fig, ax = plot_composite_curves(pyro, kind='balanced')
+    try:
+        steam, = _gid_artists(ax, 'Utility:low_pressure_steam')
+        box, frame = boxes(fig, [steam, ax])
+        anchor = ax.transData.transform(steam.xy)
+        assert box.x1 > anchor[0] and box.y0 > anchor[1]
+        assert box.x0 - frame.x0 == pytest.approx(2. * fig.dpi / 72., abs=0.5)
+    finally:
+        plt.close(fig)
     # the utility labels of the real and shifted composites inside the axes
     # and off the curves, also where the hot curve's hot end is the top of
     # the plot, at the right of it (KEMP, hot streams only); the legend off
@@ -2961,12 +3005,15 @@ def test_plot_supertargets_gids(tmp_path):
                 'no finite TAC' if spans else labels[-1])
         finally:
             plt.close(fig)
-    # a constant TAC is labeled so
+    # a constant TAC is labeled so, and one constant where finite too
     flat = supertarget(targets('test_targeting_plot_sweep_flat', [('C1', 330., 380., 1.)], 10.),
                        [5., 10.])
-    fig, ax = plot_supertargets(flat)
-    try:
-        assert [a.get_label() for a in _gid_artists(ax, 'Optimum')] == [
-            'optimum 5 K (TAC constant)']
-    finally:
-        plt.close(fig)
+    with pytest.warns(RuntimeWarning, match='leave part of a utility target unserved'):
+        flat_partly = supertarget(pair, [2., 4., 12.], cooling_agents=[])
+    for sweep, label in ((flat, 'optimum 5 K (TAC constant)'),
+                         (flat_partly, 'optimum 2 K (TAC constant where finite)')):
+        fig, ax = plot_supertargets(sweep)
+        try:
+            assert [a.get_label() for a in _gid_artists(ax, 'Optimum')] == [label]
+        finally:
+            plt.close(fig)

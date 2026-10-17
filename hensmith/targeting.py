@@ -2124,11 +2124,15 @@ def _least_TAC(records):
     TAC = np.array([r['TAC'] for r in records], dtype=float)
     return int(np.argmin(np.where(np.isnan(TAC), math.inf, TAC)))
 
-def _constant_TAC(records):
-    """Whether the records are at least two, each with a finite TAC, and
-    their TACs the same to within round-off (a relative 1e-12)."""
+def _constant_TAC(records, where_finite=False):
+    """Whether the records are at least two, each with a finite TAC (or, if
+    `where_finite`, have at least two finite TACs, the others left out),
+    and their TACs the same to within round-off (a relative 1e-12)."""
     TAC = np.array([r['TAC'] for r in records], dtype=float)
-    return (TAC.size > 1 and bool(np.isfinite(TAC).all())
+    finite = np.isfinite(TAC)
+    if where_finite: TAC = TAC[finite]
+    elif not finite.all(): return False
+    return (TAC.size > 1
             and float(np.ptp(TAC)) <= 1e-12 * float(np.abs(TAC).max()))
 
 def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
@@ -2201,7 +2205,11 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     same (to a relative 1e-12) is not refined: its targets do not depend on
     the minimum approach temperature over the sweep (for streams that
     recover no heat, only heaters, say), its optimum is merely the smallest
-    temperature, and `Supertargets.constant` flags it.
+    temperature, and `Supertargets.constant` flags it. Nor is one whose
+    finite TACs (at least two) are the same, the others not (an unserved
+    utility or an infinite area): its optimum is merely the smallest
+    temperature of that flat stretch, so its repr says 'TAC constant where
+    finite' rather than 'at the bound'.
 
     The capital target drops by about a shell and tube wherever the
     shrinking area fills one fewer of 150 ft² (see Notes of
@@ -2314,8 +2322,8 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     for _ in range(refine):
         if not any(math.isfinite(r['TAC']) for r in records):
             break # nothing to refine around
-        if _constant_TAC(records):
-            break # a flat line: nothing to refine either
+        if _constant_TAC(records, where_finite=True):
+            break # a flat line (where finite): nothing to refine either
         records.sort(key=lambda r: r['T_min_app'])
         i = _least_TAC(records)
         lo = records[max(i - 1, 0)]['T_min_app']
@@ -2424,6 +2432,8 @@ class Supertargets:
         n = len(self.records)
         lo, hi = self.records[0]['T_min_app'], self.records[-1]['T_min_app']
         if self.constant: bound = ', TAC constant over the sweep'
+        elif _constant_TAC(self.records, where_finite=True):
+            bound = ', TAC constant where finite'
         elif self.at_bound: bound = ', at the bound'
         else: bound = ''
         return (f'<{type(self).__name__}: {n} point{"s" if n != 1 else ""}, '
@@ -2838,6 +2848,59 @@ def _sci_ticks(axis):
     formatter = axis.get_major_formatter()
     if type(formatter) is ScalarFormatter: formatter.set_powerlimits((-3, 4))
 
+class _Inside:
+    """
+    A `textcoords` for the annotation `label` of `ax`: `dx`, `dy` points off
+    its anchor, above left of it (right- and bottom-aligned) if `dy` > 0,
+    else below right of it (left- and top-aligned).
+
+    Where that runs past the left (right) edge of the axes, decided when
+    drawn (at the final layout of the figure, which places the axes), the
+    label is moved right (left) to keep 2 points inside them, and raised
+    (lowered) to stay `abs(dy)` points above (below) the `curves` ((H, T)
+    in data) under (over) its new span. It is then moved on, up (down),
+    past each of the labels `over` whose box it would overlap or come
+    within 2 points of. A class rather than a closure, so that the figure
+    can still be pickled.
+    """
+    def __init__(self, ax, label, dx, dy, curves=(), over=()):
+        self.ax, self.label, self.dx, self.dy = ax, label, dx, dy
+        self.curves, self.over = list(curves), list(over)
+
+    def __call__(self, renderer):
+        from matplotlib.transforms import Affine2D
+        ax, label, dx, dy = self.ax, self.label, self.dx, self.dy
+        sign = 1. if dy > 0 else -1.
+        pt = ax.figure.dpi / 72. # pixels per point
+        prop = label.get_fontproperties()
+        size = lambda text: renderer.get_text_width_height_descent(
+            text, prop, ismath=False)
+        w = size(label.get_text())[0]
+        h = max(size(label.get_text())[1], size('lp')[1])
+        x, y = ax.transData.transform(label.xy) + (dx * pt, dy * pt)
+        # the label's right (left) end and its bottom (top)
+        span = lambda: (x - w, x) if sign > 0 else (x, x + w)
+        a, b = span()
+        if sign > 0: shift = ax.bbox.x0 + 2. * pt - a
+        else: shift = ax.bbox.x1 - 2. * pt - b
+        if shift * sign > 0.:
+            x += shift
+            a, b = span()
+            for H, T in self.curves:
+                X, Y = ax.transData.transform(np.column_stack((H, T))).T
+                if not X.size or b < X[0] or X[-1] < a: continue
+                Y = np.concatenate((Y[(X >= a) & (X <= b)],
+                                    np.interp([max(a, X[0]), min(b, X[-1])], X, Y)))
+                if sign > 0: y = max(y, Y.max() + dy * pt)
+                else: y = min(y, Y.min() + dy * pt)
+        for box in sorted((other.get_window_extent(renderer) for other in self.over),
+                          key=lambda box: sign * box.y0):
+            near, far = (box.y0, box.y1) if sign > 0 else (box.y1, box.y0)
+            if (box.x0 < b and a < box.x1 and sign * (near - y) < h
+                    and sign * (y - far) < 2. * pt):
+                y = far + sign * 2. * pt
+        return Affine2D().translate(x, y)
+
 def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                           file=None, dpi=300):
     """
@@ -2879,14 +2942,22 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     shifted composites touch: not for a threshold problem whose composites
     end apart, nor without streams on one side (whose empty composite stays
     out of the legend). Fuel, at infinite temperature on the balanced
-    curves, is labeled rather than drawn, and so is an unserved remainder
-    ('Utility:unserved', in the upper left corner): the cold balanced
-    composite starts at the unserved cooling, and the hot one ends short of
-    the cold one by the unserved heating. A label of a sensible agent sits
-    off the middle of its line, above left for heating and below right for
-    cooling. The legend goes where it covers the least of the curves, the
-    band and the labels (matplotlib's 'best' location: no fixed corner is
-    clear of the composites of every problem).
+    curves, is labeled rather than drawn, above the hot end of the cold
+    balanced composite (at the top of both), whose top its heat closes,
+    and so is an unserved remainder ('Utility:unserved', in the upper left
+    corner): the cold balanced composite starts at the unserved cooling,
+    and the hot one ends short of the cold one by the unserved heating. A
+    label of a latent agent sits by its flat, above left of the warm end of
+    a heating one and below right of the cold end of a cooling one, and a
+    sensible agent's off the middle of its line, above left for heating
+    and below right for cooling. When drawn (at the final layout of the
+    figure), a label that would run past the edge of the axes is moved just
+    inside them, and off the composite it labels; one that would run into
+    the label of a lower heating (higher cooling) agent is moved on past
+    it, up for heating and down for cooling, and the fuel's past those of
+    the heating agents. The legend goes where it covers the least of the
+    curves, the band and the labels (matplotlib's 'best' location: no fixed
+    corner is clear of the composites of every problem).
 
     Examples
     --------
@@ -2933,7 +3004,7 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         ax.plot(cold_H, cold_T - 273.15, color=cold_color, lw=2,
                 label=_legend('cold balanced composite', cold_H),
                 gid='Cold balanced composite')
-        above = [] # anchors of the labels above a heating flat
+        labels = [] # (annotation, offset, curve) of each agent's but fuel's
         fuels = []
         unserved = []
         for u in utilities:
@@ -2958,7 +3029,6 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                     i = np.searchsorted(T, T_u - 1e-6)
                     offset, ha, va = (2, -2), 'left', 'top'
                 x = H[min(max(i, 0), H.size - 1)]
-                if u.heating: above.append((x, T_u))
             else:
                 # at the middle of a sensible agent's line, off the rising
                 # composite: above left of it for heating, below right of it
@@ -2969,26 +3039,48 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                     offset, ha, va = (-6, 4), 'right', 'bottom'
                 else:
                     offset, ha, va = (6, -4), 'left', 'top'
-            ax.annotate(label, xy=(x, T_u - 273.15), xytext=offset,
-                        textcoords='offset points', ha=ha, va=va,
-                        color=hot_color if u.heating else cold_color,
-                        gid='Utility:' + u.ID, **text_kwargs)
-        stacked = False
-        for u in fuels: # at the end of the finite hot curve
-            x = hot_H[-1] if hot_H.size else 0.
-            y = hot_T[-1] if hot_T.size else targets.grid['Ts'][0]
-            # above the label of the top flat if that ends there too
-            stacked = any(abs(x - a) <= 1e-9 * (abs(x) + abs(a)) + 1e-12
-                          and abs(y - b) <= 1e-6 for a, b in above)
-            ax.annotate(f'{u.ID} (furnace) {_format_duty(u.duty)} kJ/hr',
-                        xy=(x, y - 273.15), xytext=(-2, 14) if stacked else (0, 4),
-                        textcoords='offset points', ha='right', va='bottom',
-                        color=hot_color, gid='Fuel', **text_kwargs)
+            annotation = ax.annotate(
+                label, xy=(x, T_u - 273.15), xytext=(0, 0), ha=ha, va=va,
+                color=hot_color if u.heating else cold_color,
+                gid='Utility:' + u.ID, **text_kwargs)
+            labels.append((annotation, offset, (H, T - 273.15)))
+        # each moved inside the axes if it would run out of them (off the
+        # composite it labels), and on past the labels of the lower heating
+        # (higher cooling) agents it would run into: up for heating, down
+        # for cooling
+        placed = {True: [], False: []} # the heating and the cooling labels
+        for annotation, offset, curve in sorted(
+                labels, key=lambda item: item[0].xy[1] * np.sign(item[1][1])):
+            side = placed[offset[1] > 0]
+            annotation.set_anncoords(_Inside(ax, annotation, *offset,
+                                             curves=[curve], over=side))
+            side.append(annotation)
+        heating = placed[True]
+        # the fuel's heat closes the cold curve: above its hot end (at the
+        # top of both curves), over the labels of the heating agents it
+        # would overlap there, and of any fuel before it
+        curves_T = np.concatenate((hot_T, cold_T))
+        if curves_T.size:
+            T_top, span = curves_T.max(), np.ptp(curves_T)
+            x = max(H[-1] for H in (hot_H, cold_H) if H.size)
+        else:
+            T_top, span, x = targets.grid['Ts'][0], 0., 0.
+        # headroom for two labels where a heating agent's is near the top
+        stacked = bool(fuels) and any(T_top - 273.15 - a.xy[1] <= 0.15 * span
+                                      for a in heating)
+        for u in fuels:
+            annotation = ax.annotate(
+                f'{u.ID} (furnace) {_format_duty(u.duty)} kJ/hr',
+                xy=(x, T_top - 273.15), xytext=(0, 0), ha='right', va='bottom',
+                color=hot_color, gid='Fuel', **text_kwargs)
+            annotation.set_anncoords(_Inside(ax, annotation, -2, 4,
+                                             over=heating))
+            heating.append(annotation)
         if unserved: # the curves end apart: say why
             ax.text(0.02, 0.97, '\n'.join(unserved), transform=ax.transAxes,
                     ha='left', va='top', color='0.45', gid='Utility:unserved',
                     **text_kwargs)
-        # headroom for a label (or two) above the top flat
+        # headroom for the labels above the top of the curves
         ax.margins(y=0.16 if stacked else 0.1)
         ax.set_ylabel('T [°C]')
     else:
@@ -3196,12 +3288,13 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     Artists carry stable gids: 'TAC', 'Capital' (the annualized capital
     cost), 'Operating', 'Optimum' and 'Nonfinite'. The optimum is labeled
     '(TAC constant)' if the TAC is the same over the sweep
-    (`Supertargets.constant`), else '(at the bound)' if it is at an end of
-    the sweep (`Supertargets.at_bound`), and is not marked without a finite
-    TAC. The lines leave out the temperatures without a finite TAC (an
-    unserved utility or an infinite area): each stretch of them is shaded
-    ('Nonfinite', halfway to its finite neighbors), so the axis keeps the
-    whole sweep.
+    (`Supertargets.constant`), '(TAC constant where finite)' if it is the
+    same at each temperature with a finite TAC (at least two), else '(at
+    the bound)' if it is at an end of the sweep (`Supertargets.at_bound`),
+    and is not marked without a finite TAC. The lines leave out the
+    temperatures without a finite TAC (an unserved utility or an infinite
+    area): each stretch of them is shaded ('Nonfinite', halfway to its
+    finite neighbors), so the axis keeps the whole sweep.
 
     Examples
     --------
@@ -3246,6 +3339,8 @@ def plot_supertargets(sweep, ax=None, file=None, dpi=300):
     optimum = sweep.optimum
     if math.isfinite(optimum['TAC']):
         if sweep.constant: bound = ' (TAC constant)'
+        elif _constant_TAC(sweep.records, where_finite=True):
+            bound = ' (TAC constant where finite)'
         elif sweep.at_bound: bound = ' (at the bound)'
         else: bound = ''
         ax.axvline(optimum['T_min_app'], color='k', ls='--', lw=0.8)
