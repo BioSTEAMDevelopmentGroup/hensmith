@@ -14,7 +14,7 @@ for the least total annualized cost and returns :class:`Supertargets`;
 :func:`network_report` compares a synthesized network with its targets; and
 :func:`plot_composite_curves`, :func:`plot_grand_composite_curve` and
 :func:`plot_supertargets` draw them. A facility's targets come from
-:meth:`HeatExchangerNetwork.targets`. Nothing here changes the synthesis:
+:meth:`HeatExchangerNetwork.targets`. Nothing here changes the synthesis.
 :doc:`../tutorial/05_targeting` shows every function on the quickstart system,
 and :doc:`../concepts` explains the methods and their limits.
 

@@ -784,8 +784,8 @@ class PinchTargets:
     piece between grid temperatures is balanced on its own: on each side of
     the pinch such pieces count S - 1 per group of them linked by common
     streams, so a stream across several counts once. It is an estimate, not
-    a bound: it assumes one component per region, and a balanced subset of
-    streams needs fewer units.
+    a bound: it assumes one component and no loop per region, so a balanced
+    subset of streams needs fewer units and each loop of matches one more.
 
     *Capital and total annualized cost.* `capital_cost_target` takes as
     many shells as the units target (less one furnace for all fuel) and
@@ -2309,8 +2309,9 @@ def network_report(HXN, targets=None, **options):
     dict
         'T_min_app' and 'targets_T_min_app' [K], of the facility (its
         attribute as it is now: a reused cached network keeps the one it
-        was synthesized at) and of the targets; 'status' (``HXN.synthesis_info['status']``); 'applied',
-        whether the network has a process exchanger; 'Q_hot' and 'Q_cold',
+        was synthesized at) and of the targets; 'status'
+        (``HXN.synthesis_info['status']``); 'applied', whether the network
+        has a process exchanger; 'Q_hot' and 'Q_cold',
         the heat of the network's heating and cooling utilities [kJ/hr],
         process side (`HXN.actual_heat_util_load` is utility side);
         'utilities', ``{agent ID: {'duty', 'utility_duty', 'cost'}}``
@@ -2372,10 +2373,14 @@ def network_report(HXN, targets=None, **options):
       same utilities: that problem's network takes 54.06 m² against a target
       of 59.68 m², with hotter steam and colder coolant;
     - the units target counts S - 1 per region between zeros of the
-      balanced grand composite curve: a network needs fewer units where a
-      subset of streams balances (6 against 7 in that problem) or where one
-      agent serves a stream the targets split between levels, and more for
-      repeated matches and splits.
+      balanced grand composite curve, as if each region's matches formed
+      no loop: a network needs fewer units where a subset of streams
+      balances (6 against 7 in that problem) or where one agent serves a
+      stream the targets split between levels, and one more for each loop
+      of its matches, such as a repeated match between two streams (two
+      branches of a split stream meeting the same stream make one too) or
+      two streams linked both through process matches and through a shared
+      utility.
 
     Examples
     --------

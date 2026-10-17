@@ -481,8 +481,9 @@ connected component needs at least :math:`S - 1` units (Euler's rule). The
 units target applies it to each region between the zeros of the balanced
 grand composite curve -- the process pinch and every utility pinch --,
 :math:`S` counting the streams with heat in the region and the utilities
-acting in it. It is an estimate, **S - 1 per region, assuming one component**:
-a subset of streams that balances on its own needs fewer units.
+acting in it. It is an estimate, **S - 1 per region, assuming one component
+and no loop**: a subset of streams that balances on its own needs fewer
+units, and each loop of matches one more.
 
 **Capital.** The area is put in as many shells as the units target,
 :math:`N`, less one furnace for all the fuel, and every shell is costed with
@@ -568,9 +569,15 @@ system is simulated again. The comparison has limits:
   so the network can use costlier agents than the target (on the four-stream
   problem of Linnhoff & Hindmarsh at 10 K, the target is low pressure steam
   and cooling water, the network medium pressure steam and chilled water);
-- the units target is an estimate in both directions: a balanced subset of
-  streams, or one agent per stream where the target counts each utility as a
-  stream, needs fewer units; repeated matches and splits need more.
+- the units target is an estimate in both directions, since Euler's S - 1
+  assumes one component and no loop per region: a balanced subset of
+  streams, or one agent serving a stream whose heat the target splits
+  between two utility levels, needs fewer units; each loop of matches needs
+  one more, whether a repeated match between two streams (two branches of a
+  split stream meeting the same stream make one too) or two streams linked
+  both through process matches and through a shared utility (for such a
+  loop, the quickstart network at 5 K has 7 units against 6, see
+  :doc:`tutorial/05_targeting`).
 
 From targets to a network: the pinch-outward MER planner
 --------------------------------------------------------
@@ -977,9 +984,9 @@ third on -- and for each one requires that the synthesized network (i) closes
 its energy balance without raising ``RuntimeWarning``, (ii) never uses less
 hot or cold utility than the MER targets computed on the same streams, and
 reports ``'mer'`` exactly when it reaches them, (iii) keeps each pair's
-required approach inside every process exchanger on exact states, (iv) is planned on the
-problem table's own cascade, and (v) recovers at least as much heat as a load
-recorded in the test file. A network that improves leaves slack in (v); those
+required approach inside every process exchanger on exact states, (iv) is
+planned on the problem table's own cascade, and (v) recovers at least as
+much heat as a load recorded in the test file. A network that improves leaves slack in (v); those
 recorded numbers are lowered deliberately by a maintainer, never raised to
 make a failing test pass. Every case is synthesized again with
 ``stream_splitting=True`` and held to the same checks, and the three cases

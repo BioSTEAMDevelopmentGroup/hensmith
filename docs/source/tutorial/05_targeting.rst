@@ -240,10 +240,10 @@ all, so the hot utility, its steam and the balanced composite curves no longer
 change with ``T_min_app``, and neither does any target. The TACs at 1 and at
 1.848 K differ by less than 7 USD/yr, 4e-7 of the TAC, which is no physical
 effect: the problem table's grid moves with ``T_min_app`` over the curved
-(vapor-liquid) profiles of the streams, and the area follows by 2e-5 of
-itself. Every ``T_min_app`` of that flat stretch is an optimum; the refinement
-happens to report the last one it evaluated, 1.848 K (inside the sweep, not at
-its bound). The real step comes at the next point, 1.853 K: the cold utility
+(vapor-liquid) profiles of the streams, and the area follows it, too little
+to show in the table (6836 m² at both). Every ``T_min_app`` of that flat
+stretch is an optimum; the refinement happens to report the last one it
+evaluated, 1.848 K (inside the sweep, not at its bound). The real step comes at the next point, 1.853 K: the cold utility
 appears and needs a unit of its own (6 units), which adds about 12000 USD/yr
 to the TAC. Between 10 and 15 K, where chapter 4's sweep saw the pinch move to
 the column condenser's vapor inlet, the units target jumps to 9.
@@ -334,11 +334,18 @@ network:
   its terminal log-mean temperature difference overstates the mean driving
   force of a glide; it also applies a correction factor for its shells and
   sizes utility exchangers on the utility side duty.
-- **Units.** The network has 7 exchangers against an estimate of 6: it gives
-  each stream its own utility exchanger, where the target counts the steam
-  as one stream in a region above the pinch. The estimate can be wrong both
-  ways: a balanced subset of streams needs fewer units, and repeated matches
-  and splits need more.
+- **Units.** The network has 7 exchangers against an estimate of 6 because
+  it has a loop. Above the pinch, the bottoms cooler ``D1_H1`` heats both the
+  reboiler (``HX_0_2_hs``) and the flash's feed heater (``HX_1_2_hs``), and
+  each of these also has its own steam heater (``Util_0_hs`` and
+  ``Util_1_hs``), so the four exchangers close a loop: reboiler, ``D1_H1``,
+  feed heater, steam and back to the reboiler. Euler's S - 1 counts the steam
+  as one stream however many streams it heats, and assumes the matches of a
+  region form no loop. The estimate can be wrong both ways: a balanced subset
+  of streams needs fewer units, and each loop needs one more, whether a
+  repeated match between two streams (two branches of a split stream meeting
+  the same stream make one too) or, as here, two streams linked both through
+  process matches and through a shared utility.
 - **Cost.** The installed cost and the TAC of the network (2.184e+06 USD and
   15072295 USD/yr) are biosteam's, on biosteam's areas, and here they are
   below the targets' (2.282e+06 USD and 15088200 USD/yr), which divide a

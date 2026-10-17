@@ -249,10 +249,11 @@ class HeatExchangerNetwork(bst.Facility):
     the exact stream states. It reaches the targets whenever its search
     finds an unsplit network that does; the same pair of streams may then be
     matched more than once (IDs with a suffix ``_<n>``, e.g.
-    ``HX_3_2_cs_2``), since series alternation can replace a split. Where the pinch design rules prove that MER needs stream
-    splitting, the network is a best-effort one close to the targets, or,
-    with `stream_splitting`, one that splits streams to reach them. The
-    outcome is recorded in `synthesis_info` (a dict; see the `info` keyword
+    ``HX_3_2_cs_2``), since series alternation can replace a split. Where
+    the pinch design rules prove that MER needs stream splitting, the
+    network is a best-effort one close to the targets, or, with
+    `stream_splitting`, one that splits streams to reach them. The outcome
+    is recorded in `synthesis_info` (a dict; see the `info` keyword
     of `synthesize_network`): 'status' is 'mer' when the network's utilities
     equal the targets and 'best_effort' otherwise, with the targets, the
     planned utilities and, per side of the pinch, any proof that a split is
