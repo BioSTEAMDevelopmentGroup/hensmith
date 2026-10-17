@@ -784,6 +784,12 @@ class PinchTargets:
     ``agent.dT`` is 0 (`UtilityAgent`'s default), the agent would leave at
     its inlet temperature at an unbounded flow, so its level stays just
     short of that point load, which the next agent serves, as in biosteam.
+    For the same reason a stream that ends at that temperature bounds the
+    level of such an agent at that end, as one reaching beyond its limit
+    does: were another stream (of another approach contribution) to set the
+    level beyond that end, the agent would have given heat above it (taken
+    it below, for cooling) and its line would reach its inlet temperature
+    there; at the level it has given none.
 
     Each agent is priced as one biosteam heat utility over the stretch it
     serves, from its level (or the end of the grid, if that is nearer) to
@@ -1328,7 +1334,9 @@ class PinchTargets:
         which those of the mask `reach` (`_in_reach`) are in its reach: the
         highest (lowest for cooling), up to the highest of the shifted limits
         of `j` (down to the lowest), that serves no stream in reach beyond
-        its own real limit (see Notes of the class).
+        its own real limit nor, if the agent is sensible, one at ``agent.T -
+        dT`` real (``agent.T + dT`` for cooling) anywhere but at the level
+        (see Notes of the class).
         """
         dT = bst.HeatUtility.dT
         grid = self.grid
@@ -1342,20 +1350,30 @@ class PinchTargets:
         # a stream in reach reaching beyond its limit caps the level at the
         # limit, or, lying wholly beyond it, at its own end (just short of it
         # if a point load is there): a level serves only what lies below it
-        # (above it, for cooling)
+        # (above it, for cooling). So does one ending at its limit, for a
+        # sensible agent whose dT is 0 (the stream's end at agent.T - dT
+        # real; agent.T + dT for cooling): the agent, having given heat above
+        # that end (taken it below), would have to leave at its inlet
+        # temperature there, at an unbounded flow (see `_line_limit`); at the
+        # level, where it has given none, it keeps dT
+        sensible = _sensible(agent)
         if heating:
             R = agent.T - agent.dT - dT
             limit = R - s
-            caps = np.maximum(limit, bottom - _T_SHORT * point)[reach & (top > limit)]
+            beyond = top > limit
+            if sensible: beyond |= top + s >= agent.T - dT - _T_EQ
+            caps = np.maximum(limit, bottom - _T_SHORT * point)[reach & beyond]
             if j.size: L = caps.min(initial=limit.max())
             else: L = R
         else:
             R = agent.T + agent.dT + dT
             limit = R - s
-            caps = np.minimum(limit, top + _T_SHORT * point)[reach & (bottom < limit)]
+            beyond = bottom < limit
+            if sensible: beyond |= bottom + s <= agent.T + dT + _T_EQ
+            caps = np.minimum(limit, top + _T_SHORT * point)[reach & beyond]
             if j.size: L = caps.max(initial=limit.min())
             else: L = R - self.T_min_app
-        if reach.any() and _sensible(agent):
+        if reach.any() and sensible:
             L = self._short_of_stuck_loads(agent, heating, L, j[reach], s[reach])
         return float(L)
 

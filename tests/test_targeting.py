@@ -884,6 +884,73 @@ def test_sensible_line_streams_of_other_shifts():
                                    rel=1e-12)
     assert line_gaps(t, rows, u) == pytest.approx({'H1': dT, 'H2': dT}, abs=1e-9)
 
+def test_sensible_line_stream_ending_without_driving_force():
+    # with approach contributions a stream can end at a sensible agent's
+    # zero-margin temperature, agent.T - dT (its limit when agent.dT is 0),
+    # while another stream sets the level higher: the agent, having given
+    # heat above that end, would have to leave at its inlet temperature
+    # there (biosteam would divide by a zero enthalpy change). That end
+    # caps the level, as a stream reaching beyond its limit does. A hot oil
+    # (480 K, dT 0) serves C1 (390 -> 480 K, shift -4 K, limit 479 K
+    # shifted) and C2 (400 -> 475 K, shift 0, limit 475 K, its end): it is
+    # placed at 475 K and natural gas serves the 9 kW of C1 above it.
+    dT, water = bst.HeatUtility.dT, bst.HeatUtility.thermo_water
+    rows = [('C1', 390., 480., 1.), ('C2', 400., 475., 1.)]
+    t = targets('test_targeting_line_end_heat', rows, 10.,
+                approach_contributions={'C1': 9.})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['C1'], shift['C2']) == (-4., 0.)
+    oil = bst.UtilityAgent('test_targeting_hot_oil_end', Water=1, T=480., P=5e6,
+                           phase='l', thermo=water, T_limit=300.,
+                           heat_transfer_price=1e-6)
+    assert oil.dT == 0. and 475. == oil.T - dT
+    NG = agent('natural_gas')
+    u, gas = t.utility_targets([oil, NG], [])
+    assert (u.ID, gas.ID) == (oil.ID, NG.ID)
+    assert u.level == 475.
+    assert (u.T_in, u.T_out) == (pytest.approx(390., abs=1e-9), 475.)
+    q = 156. * kW
+    assert u.duty == pytest.approx(q, rel=1e-12)
+    assert gas.duty == pytest.approx(9. * kW, rel=1e-12)
+    # bounded where C2 starts (shifted 400 K), having given 150 kW above it
+    T_out = oil.T - (oil.T - dT - 400.) * q / (150. * kW)
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
+    assert math.isfinite(u.flow) and math.isfinite(u.cost)
+    assert u.cost == pytest.approx(fresh_price(u.duty, T_out - dT, u.T_out, oil)[0],
+                                   rel=1e-12)
+    assert line_gaps(t, rows, u) == pytest.approx({'C1': 9., 'C2': dT}, abs=1e-9)
+    assert math.isfinite(t.summary(heating_agents=[oil, NG],
+                                   cooling_agents=[])['utility_cost'])
+    # its mirror: a coolant (300 K, dT 0) serves H1 (390 -> 300 K, shift 14
+    # K, limit 291 K shifted) and H2 (380 -> 305 K, shift 10 K, limit 295
+    # K, its end): it is placed at 295 K and chilled water serves the 9 kW
+    # of H1 below it
+    rows = [('H1', 390., 300., 1.), ('H2', 380., 305., 1.)]
+    t = targets('test_targeting_line_end_cool', rows, 10.,
+                approach_contributions={'H1': 9.})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['H1'], shift['H2']) == (14., 10.)
+    coolant = bst.UtilityAgent('test_targeting_coolant_end', Water=1, T=300.,
+                               P=101325., phase='l', thermo=water, T_limit=385.,
+                               heat_transfer_price=1e-6)
+    assert coolant.dT == 0. and 305. == coolant.T + dT
+    CHW = agent('chilled_water')
+    u, chilled = t.utility_targets([], [coolant, CHW])
+    assert (u.ID, chilled.ID) == (coolant.ID, CHW.ID)
+    assert u.level == 295.
+    assert (u.T_in, u.T_out) == (pytest.approx(390., abs=1e-9), 305.)
+    assert u.duty == pytest.approx(q, rel=1e-12)
+    assert chilled.duty == pytest.approx(9. * kW, rel=1e-12)
+    # bounded where H2 starts (shifted 370 K), having taken 150 kW below it
+    T_out = coolant.T + (380. - dT - coolant.T) * q / (150. * kW)
+    assert u.T_utility_out == pytest.approx(T_out, rel=1e-12)
+    assert math.isfinite(u.flow) and math.isfinite(u.cost)
+    assert u.cost == pytest.approx(fresh_price(-u.duty, T_out + dT, u.T_out, coolant)[0],
+                                   rel=1e-12)
+    assert line_gaps(t, rows, u) == pytest.approx({'H1': 9., 'H2': dT}, abs=1e-9)
+    assert math.isfinite(t.summary(heating_agents=[],
+                                   cooling_agents=[coolant, CHW])['utility_cost'])
+
 def test_pricing_temperatures():
     dT = bst.HeatUtility.dT
     # the hot stream's top, 445 K shifted, is above every cold stream: medium

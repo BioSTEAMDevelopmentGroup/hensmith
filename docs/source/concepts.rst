@@ -441,6 +441,11 @@ line would have no driving force left there: with ``agent.dT`` of 0
 (``UtilityAgent``'s default), it could serve a point load at its limit only
 at its own inlet temperature, at an unbounded flow, so its level stays just
 short of that point load, which the next agent serves, as in BioSTEAM.
+For the same reason, with approach contributions, a stream that ends at
+such an agent's limit bounds its level at that end, as a stream reaching
+beyond its limit does: were another stream to set the level beyond that
+end, the agent, having given heat above it (taken it below, for cooling),
+would have to leave at its inlet temperature there.
 The order is BioSTEAM's preference, not price: the utility cost target is
 what the agents cost placed this way, not the least utility cost, and an
 agent later in the list can be cheaper per kJ (with BioSTEAM's default
