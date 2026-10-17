@@ -926,6 +926,48 @@ def _auxiliary_slots(key, universe, owners=None):
             held = held[k] if k < len(held) else None
         yield unit, held if isinstance(held, bst.Unit) else None
 
+def _stage_tickets(compressor=None):
+    """The ticket names that a `biosteam.MultistageCompressor` gives its
+    stages in their IDs (``f'{K.ID}_{ticket}{n}'``): those of the
+    `biosteam.IsentropicCompressor` and `biosteam.HXutility` stages it
+    builds from `pr` and `n_stages`, and those of the stages that
+    `compressor` holds now (given as `compressors` and `hxs`)."""
+    tickets = {getattr(getattr(bst, 'IsentropicCompressor', None),
+                       'ticket_name', None), bst.HXutility.ticket_name}
+    if compressor is not None:
+        for stages in (getattr(compressor, 'compressors', None),
+                       getattr(compressor, 'hxs', None)):
+            tickets.update(getattr(stage, 'ticket_name', None)
+                           for stage in stages or ())
+    return {ticket for ticket in tickets if isinstance(ticket, str) and ticket}
+
+def _is_stage_ID(ID, compressor_ID, tickets):
+    """Whether `ID` is ``f'{compressor_ID}_{ticket}{n}'`` for a ticket name
+    of `tickets` and a stage number n >= 1 (see `_stage_tickets`)."""
+    prefix = f'{compressor_ID}_'
+    return ID.startswith(prefix) and any(
+        re.fullmatch(re.escape(ticket) + r'[1-9]\d*', ID[len(prefix):])
+        for ticket in tickets)
+
+def _names_unbuilt_stage(key, universe, owners=None):
+    """
+    Whether the tuple key `key` gives the ID of a stage that a
+    `biosteam.MultistageCompressor` K of `universe` under the top owner
+    ``key[0]`` (along `_parent` with `owners`) may build:
+    ``f'{K.ID}_{ticket}{n}'`` for any stage number n >= 1 (see
+    `_stage_tickets`). K sets its `auxiliary_unit_names` to the IDs of the
+    stages it builds whenever `pr` or `n_stages` changes, so ``('K1',
+    'K1_H3')`` names an intercooler of K1 with 3 stages or more and no unit
+    with fewer.
+    """
+    MultistageCompressor = getattr(bst, 'MultistageCompressor', None)
+    if MultistageCompressor is None: return False
+    owner_ID, ID = key
+    return any(isinstance(unit, MultistageCompressor)
+               and _is_stage_ID(ID, unit.ID, _stage_tickets(unit))
+               and _top(unit, owners).ID == owner_ID
+               for unit in universe)
+
 def _names_unbuilt_auxiliary(key, universe, live, owners=None):
     """
     Whether the key `key` (of a valid type, see `_check_contribution_key`),
@@ -938,8 +980,11 @@ def _names_unbuilt_auxiliary(key, universe, live, owners=None):
     gives an auxiliary (see `_auxiliary_slots`) where a unit of `universe`
     holds no unit, or holds the unit of that ID: ``('X1',
     'heat_exchangers[2]')`` while the list ``X1.heat_exchangers`` is
-    shorter, say. Such a key is valid but names nothing. A slot that holds
-    a unit of another ID (``T1.heat_exchanger`` of a
+    shorter, say. Or a tuple key of the ID that a
+    `biosteam.MultistageCompressor` of `universe` gives a stage, of any
+    stage number (see `_names_unbuilt_stage`): ``('K1', 'K1_H3')`` while
+    K1 has 2 stages. Such a key is valid but names nothing. A slot that
+    holds a unit of another ID (``T1.heat_exchanger`` of a
     `biosteam.EnzymeTreatment` T1 is ``('T1', '')``) does not make its key
     valid (see `_unknown_key_hints`).
     """
@@ -947,8 +992,9 @@ def _names_unbuilt_auxiliary(key, universe, live, owners=None):
         top = _top(key, owners)
         return top is not key and id(top) in live
     if not isinstance(key, tuple): return False
-    return any(held is None or held.ID == key[1]
-               for _, held in _auxiliary_slots(key, universe, owners))
+    return (any(held is None or held.ID == key[1]
+                for _, held in _auxiliary_slots(key, universe, owners))
+            or _names_unbuilt_stage(key, universe, owners))
 
 def _unknown_keys(keys, universe, owners=None):
     """The keys of `keys` (units, str or pairs of str) that name neither a
@@ -967,20 +1013,45 @@ def _unknown_key_hints(keys, universe, owners=None):
     key: for a str key, each auxiliary unit of that ID (``"'condenser' is
     ('D1', 'condenser')"``), and for a tuple key of the ID that biosteam
     gives an auxiliary (see `_auxiliary_slots`), each unit held there under
-    another ID (``"T1.heat_exchanger is ('T1', '')"``). Returns them as
-    ``'; <hint>'`` each, joined ('' if none).
+    another ID (``"T1.heat_exchanger is ('T1', '')"``). A tuple key
+    ``(owner_ID, ID)`` of a unit of `universe` without an owner gets that
+    unit's key (``"('K1', 'K1_H1') is 'K1_H1' (...)"``), and a str key,
+    the stages without an owner that a `biosteam.MultistageCompressor` of
+    that ID gives its IDs (see `_is_stage_ID`), such as the intercoolers
+    of the heat utilities of a compressor K1 outside a HeatExchangerNetwork
+    (which alone takes K1 as their owner, see `_held_owners`). Returns them
+    as ``'; <hint>'`` each, joined ('' if none).
     """
     hints = {}
+    tickets = _stage_tickets()
     for key in keys:
         if isinstance(key, str):
+            stages = []
             for unit in universe:
                 if unit.ID == key and _parent(unit, owners) is not None:
                     hints[f'; {key!r} is {_unit_name(unit, owners)!r}'] = None
+                elif (_parent(unit, owners) is None
+                        and _is_stage_ID(unit.ID, key, tickets)):
+                    stages.append(unit.ID)
+            if stages:
+                one = len(stages) == 1
+                keyed = ('its ID is its key' if one
+                         else 'their IDs are their keys')
+                hints[f"; {', '.join(map(repr, stages))} "
+                      f"{'has' if one else 'have'} no owner here, so {keyed}"
+                      f' (a MultistageCompressor {key!r} owns the stages it '
+                      'builds only among the units available to a '
+                      'HeatExchangerNetwork)'] = None
         elif isinstance(key, tuple):
             for unit, held in _auxiliary_slots(key, universe, owners):
                 if held is not None and held.ID != key[1]:
                     hints[f'; {unit.ID}.{key[1]} is '
                           f'{_unit_name(held, owners)!r}'] = None
+            if key[0] != key[1] and any(
+                    unit.ID == key[1] and _parent(unit, owners) is None
+                    for unit in universe):
+                hints[f'; {key!r} is {key[1]!r} (a unit without an owner '
+                      'here)'] = None
     return ''.join(hints)
 
 def _mapping_contributions(hus, mapping, units):
@@ -2236,8 +2307,13 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
           that ID under that owner, at any depth, so the heaters of two
           auxiliary flash drums are told apart by keying the drums or the
           heater objects) or the ID of a unit without an owner (a bare
-          auxiliary ID such as ``'condenser'`` names nothing). A heat
-          utility takes the value of
+          auxiliary ID such as ``'condenser'`` names nothing). Only the
+          units of `hus` and their owners are at hand, so an auxiliary that
+          its unit holds without setting its owner is a unit without an
+          owner here: an intercooler that a `biosteam.MultistageCompressor`
+          K1 built anew is ``'K1_H1'``, and ``'K1'`` raises (a
+          `HeatExchangerNetwork` that K1 is available to takes K1 as its
+          owner instead). A heat utility takes the value of
           the key nearest to its unit along the unit's chain of owners: a
           unit's own key beats its owner's, which beats the owner's owner's
           (e.g. ``'D1'`` covers the condenser and the reboiler of column

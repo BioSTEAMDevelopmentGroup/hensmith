@@ -280,13 +280,18 @@ the value of the key nearest to its unit along the unit's chain of owners,
 so ``'D1'`` covers a column's condenser and reboiler and
 ``('D1', 'condenser')`` overrides it for the condenser. A None or nan value
 is an explicit default that wins at its level like any value, and two keys
-of the same level for a unit must agree. A unit's owner is its ``owner``,
-or, for an auxiliary that a unit available to the network holds without
-setting its owner, that unit (the user's objects are left as they are):
-``biosteam.MultistageCompressor`` builds its compressors and intercoolers
-anew, without an owner, whenever ``pr`` or ``n_stages`` changes, and
-``'K1'`` still covers the intercoolers of compressor K1 and ``('K1',
-'K1_H1')`` names one in every sample, while ``'K1_H1'`` names nothing. ID
+of the same level for a unit must agree. A unit's owner is its direct owner
+(the unit it was made an auxiliary of; BioSTEAM's ``Unit.owner`` gives the
+top one), or, for an auxiliary that a unit available to the network holds
+without setting its owner, that unit (the user's objects are left as they
+are): ``biosteam.MultistageCompressor`` builds its compressors and
+intercoolers anew, without an owner, whenever ``pr`` or ``n_stages``
+changes, and ``'K1'`` still covers the intercoolers of compressor K1 and
+``('K1', 'K1_H1')`` names one in every sample, while ``'K1_H1'`` names
+nothing. (Outside the facility -- ``synthesize_network``,
+``temperature_interval_pinch_analysis``, ``PinchTargets.from_heat_utilities``
+-- only the heat utilities' units and their owners are at hand, so such an
+intercooler has no owner there and ``'K1_H1'`` is its key.) ID
 keys are the robust form: a unit that rebuilds its auxiliary units at every
 simulation (``biosteam.HXutilities``, for one) leaves a key holding an old
 auxiliary object, which then names the auxiliary that took its place: the
@@ -308,7 +313,11 @@ valid key whose unit holds no heat utility in a simulation (no duty,
 which a unit falls idle does not fail. The same holds for an auxiliary that a
 unit may build but does not hold in a sample: ``biosteam.HXutilities``, for
 one, builds one exchanger per agent it needs, so a lower outlet temperature
-drops ``('X1', 'heat_exchangers[2]')``. A key of the ID that BioSTEAM's
+drops ``('X1', 'heat_exchangers[2]')``, and a ``biosteam.MultistageCompressor``
+K1 with two stages drops ``('K1', 'K1_H3')``: a key ``('K1',
+'K1_<ticket><n>')`` of the ID that K1 gives its stage n (ticket ``K`` for a
+compressor, ``H`` for an intercooler) is valid for any stage number n >= 1,
+and has no effect while K1 has fewer stages. A key of the ID that BioSTEAM's
 ``Unit.auxiliary`` gives an auxiliary under a name of the
 ``auxiliary_unit_names`` of the owner or of one of its auxiliaries is valid
 whether or not that auxiliary is built, as is an old auxiliary object of a

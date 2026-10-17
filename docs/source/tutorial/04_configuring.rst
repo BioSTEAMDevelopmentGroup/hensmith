@@ -223,7 +223,8 @@ allows 1e-6 K below it). Setting ``approach_contributions`` back to ``None``
 restores the default on the next simulation. :doc:`../concepts` gives the
 shifted scale that makes the targets exact for any contributions, and the
 full key rules:
-``(owner.ID, unit.ID)`` keys for a single auxiliary unit, the nearest key
+``(owner.ID, unit.ID)`` keys for the auxiliary units of that ID under the
+top owner, the nearest key
 along a unit's owners winning, and keys that are checked even while their
 unit is idle.
 

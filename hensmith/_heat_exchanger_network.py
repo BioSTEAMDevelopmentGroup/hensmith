@@ -291,13 +291,16 @@ class HeatExchangerNetwork(bst.Facility):
     reboiler of column D1 and ``('D1', 'condenser')`` overrides it for the
     condenser; a None or nan value is an explicit default that wins at its
     level like any other, and two keys of the same level for a unit must
-    agree. A unit's owner is its `owner` or, for an auxiliary that a unit
-    available to the network holds without setting its owner, that unit:
-    a `biosteam.MultistageCompressor` K1 builds its compressors and
-    intercoolers anew whenever `pr` or `n_stages` changes, without an
-    owner, and ``'K1'`` still covers the intercoolers and ``('K1',
-    'K1_H1')`` names one in every simulation (the bare ``'K1_H1'`` names
-    nothing; user objects are not changed). ID keys are the robust form: a
+    agree. A unit's owner is its direct owner (the unit it was made an
+    auxiliary of; `biosteam.Unit.owner` gives the top one) or, for an
+    auxiliary that a unit available to the network holds without setting
+    its owner, that unit: a `biosteam.MultistageCompressor` K1 builds its
+    compressors and intercoolers anew whenever `pr` or `n_stages` changes,
+    without an owner, and ``'K1'`` still covers the intercoolers and
+    ``('K1', 'K1_H1')`` names one in every simulation (the bare ``'K1_H1'``
+    names nothing, though it is the key of that intercooler outside the
+    facility, see `synthesize_network`; user objects are not changed). ID
+    keys are the robust form: a
     unit that rebuilds its auxiliary units at every simulation (e.g.
     `biosteam.HXutilities`) leaves a key holding an old auxiliary, which
     then names the auxiliary that took its place (the one of the same ID
@@ -320,7 +323,9 @@ class HeatExchangerNetwork(bst.Facility):
     auxiliaries (e.g. ``('X1', 'heat_exchangers[2]')`` while a
     `biosteam.HXutilities` X1, which builds one exchanger per agent it needs,
     needs fewer), and ``(owner.ID, name)`` where it holds a single one (so
-    ``('X1', 'heat_exchangers')`` raises). Not every unit gives its
+    ``('X1', 'heat_exchangers')`` raises); or the ID that a
+    `biosteam.MultistageCompressor` K1 gives its stage n, for any n >= 1
+    (``('K1', 'K1_H3')`` while K1 has 2 stages). Not every unit gives its
     auxiliaries that ID: the heater of a `biosteam.EnzymeTreatment` T1 has
     the ID '', so ``('T1', 'heat_exchanger')`` raises, with a message that
     gives the heater's key, ``('T1', '')``. A callable is

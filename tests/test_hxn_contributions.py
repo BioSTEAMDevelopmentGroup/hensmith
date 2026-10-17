@@ -1243,6 +1243,113 @@ def test_keys_of_auxiliaries_held_without_an_owner():
             owner = K1 if presimulated and k == 0 else None
             assert all(getattr(hx, '_owner', None) is owner for hx in hxs)
 
+def test_keys_of_stages_a_compressor_does_not_build():
+    # biosteam.MultistageCompressor sets its auxiliary_unit_names to the IDs
+    # of the stages it builds, so a sweep over n_stages drops ('K1', 'K1_H3')
+    # at 2 stages: the key of a stage of any number is valid but has no
+    # effect while it is missing, and names the stage again once it is
+    # built, whichever n_stages the system started at; keys of IDs that K1
+    # never gives a stage still raise
+    for start in (3, 2):
+        name = f'contributions_unbuilt_stage_{start}'
+        bst.main_flowsheet.set_flowsheet(name)
+        bst.settings.set_thermo(['Water', 'Methane'], cache=True)
+        gas = bst.Stream('gas', Methane=100., units='kmol/hr', T=300.,
+                         P=101325., phase='g')
+        K1 = bst.MultistageCompressor('K1', ins=gas, pr=2., n_stages=start,
+                                      eta=0.7)
+        cold = bst.Stream('cold', Water=200., units='kmol/hr', T=290.,
+                          P=5e5)
+        C1 = bst.HXutility('C1', ins=cold, T=350., rigorous=False)
+        HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
+        sys = bst.System.from_units(name, units=[K1, C1, HXN])
+        x = {'K1': 2., ('K1', 'K1_H3'): 4., ('K1', 'K1_K3'): 1.}
+
+        def used(n, x):
+            K1.n_stages = n
+            HXN.approach_contributions = x
+            simulate_strictly(sys)
+            return dict(zip([hx.ID for hx in HXN.original_heat_exchangers],
+                            HXN.synthesis_info['approach_contributions']
+                            .tolist()))
+
+        for n in (start, 2, 3, 4, 2):
+            stages = {f'K1_H{i}': 2. for i in range(1, n + 1)}
+            if n >= 3: stages['K1_H3'] = 4.
+            assert used(n, x) == {'C1': 2.5} | stages
+            assert K1.auxiliary_unit_names == tuple(
+                f'K1_{t}{i}' for i in range(1, n + 1) for t in 'KH')
+            targets = HXN.targets()
+            assert targets.area_target(h={('K1', 'K1_H3'): .5}) == (
+                targets.area_target() if n < 3
+                else targets.area_target(h={K1.hxs[2]: .5}))
+        for key in (('K1', 'K1_H0'), ('K1', 'K1_H03'), ('K1', 'K1_X3'),
+                    ('K1', 'K1_H'), ('K1', 'K2_H3'), ('C1', 'K1_H3'),
+                    ('K1', 'K1_H3x')):
+            with pytest.raises(ValueError, match='h keys that name no stream'):
+                targets.area_target(h={key: 2.})
+            HXN.approach_contributions = {key: 3.}
+            with pytest.raises(ValueError, match='name no unit'):
+                sys.simulate()
+    # outside the facility, only the heat utilities' units are at hand: the
+    # intercoolers have no owner, and the messages say so
+    hus = bst.process_tools.heat_exchanger_utilities_from_units([K1, C1])
+    assert [hu.unit.ID for hu in hus] == ['K1_H1', 'K1_H2', 'C1']
+    assert hxn_synthesis._stream_contributions(hus, {'K1_H1': 2.}) == [
+        2., None, None]
+    for key, hint in (
+            ('K1', r"; 'K1_H1', 'K1_H2' have no owner here, so their IDs are "
+                   r"their keys \(a MultistageCompressor 'K1' owns"),
+            (('K1', 'K1_H1'), r"; \('K1', 'K1_H1'\) is 'K1_H1' \(a unit "
+                              r"without an owner here\)\)$")):
+        with pytest.raises(ValueError, match=hint):
+            hxn_synthesis._stream_contributions(hus, {key: 2.})
+        with pytest.raises(ValueError, match=hint):
+            PinchTargets.from_heat_utilities(hus, 5., {key: 2.})
+    # a key of a stage beyond n_stages is no key of a unit not at hand
+    with pytest.raises(ValueError, match=r"name no unit: \('K1', 'K1_H3'\)"):
+        hxn_synthesis._stream_contributions(hus, {('K1', 'K1_H3'): 2.})
+
+def test_held_owners_skip_loops_and_take_the_first_holder():
+    # units that hold each other as auxiliaries without an owner: the first
+    # holder in the order given owns a unit, a holder that would close a
+    # loop does not, and key resolution ends
+    bst.main_flowsheet.set_flowsheet('contributions_held_owners')
+    bst.settings.set_thermo(['Water'], cache=True)
+
+    class Holder(bst.Unit):
+        _N_ins = _N_outs = 0
+        def _run(self): pass
+
+    A, B, C = Holder('A'), Holder('B'), Holder('C')
+    A.auxiliary_unit_names = ('b', 'c')
+    A.b, A.c = B, C
+    B.auxiliary_unit_names = ('a', 'c')
+    B.a, B.c = A, C
+    for first, second in ((A, B), (B, A)):
+        owners = hxn_synthesis._held_owners([first, second])
+        assert owners == {id(second): (second, first), id(C): (C, first)}
+        universe, live, owners = hxn_synthesis._key_universe(
+            [first, second, C])
+        assert universe == [first, second, C]
+        assert hxn_synthesis._top(second, owners) is first
+        assert hxn_synthesis._top(first, owners) is first
+        assert hxn_synthesis._parent(C, owners) is first
+        assert hxn_synthesis._id_path(C, owners) == ('C', first.ID)
+        assert hxn_synthesis._unknown_keys(
+            [first.ID, (first.ID, second.ID), (first.ID, 'C'), C],
+            universe, owners) == []
+        assert hxn_synthesis._unknown_keys(
+            [second.ID, 'C', (second.ID, 'C')], universe, owners) == [
+            second.ID, 'C', (second.ID, 'C')]
+        # the first holder's key covers the other two, one step up
+        for unit in (second, C):
+            assert hxn_synthesis._contribution_key_level(
+                first.ID, unit, live, owners) == 1
+        assert hxn_synthesis._contribution_key_level(
+            second.ID, C, live, owners) is None
+    for unit in (A, B, C): assert getattr(unit, '_owner', None) is None
+
 def test_contribution_keys_with_the_units_option():
     # keys may name the units of the units option and their auxiliary units,
     # idle or not, but no other unit; a callable option is called once per
