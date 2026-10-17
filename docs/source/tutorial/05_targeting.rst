@@ -187,8 +187,9 @@ On the balanced composite curves, :meth:`~hensmith.PinchTargets.summary`
 targets the rest of the cost of a network. The methods that take
 ``utilities`` need those of the same targets: a list from targets at another
 ``T_min_app`` (``targets.at(20.)``, say) or a part of one would not balance
-the curves, so its duties are checked against ``Q_hot`` and ``Q_cold`` and a
-mismatch raises a ``ValueError``.
+the curves, so its duties are checked against ``Q_hot`` and ``Q_cold``, and
+the shifted temperatures its levels are on (each utility's ``shift``) against
+the targets' ``shift``; a mismatch raises a ``ValueError``.
 
 .. literalinclude:: /../_demo_src/examples/ch05_targeting.py
    :language: python

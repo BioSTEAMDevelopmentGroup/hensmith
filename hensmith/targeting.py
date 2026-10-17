@@ -77,7 +77,8 @@ _SUMMARY_OPTIONS = ('heating_agents', 'cooling_agents', 'h', 'h_utilities',
 
 UtilityTarget = namedtuple('UtilityTarget', (
     'ID', 'agent', 'heating', 'level', 'duty', 'utility_duty', 'flow', 'cost',
-    'T_in', 'T_out', 'T_utility_in', 'T_utility_out'))
+    'T_in', 'T_out', 'T_utility_in', 'T_utility_out', 'shift'),
+    defaults=(None,))
 
 UtilityTarget.__doc__ = """
 One utility of `PinchTargets.utility_targets`: an agent placed on the grand
@@ -116,6 +117,12 @@ T_in, T_out : float
 T_utility_in, T_utility_out : float
     Inlet and outlet temperature of the agent [K], from the priced
     `HeatUtility`; nan when unserved.
+shift : tuple[float] or None
+    `PinchTargets.shift` of the targets that placed it [K], in stream order:
+    `level` is on their shifted temperatures, and only targets with the same
+    shifts take it (their balanced curves and their area, units and capital
+    targets raise a ValueError for any other). None, the default, for a
+    utility built by hand, which is not checked.
 
 """
 
@@ -1567,21 +1574,21 @@ class PinchTargets:
                                                T_out, T_priced))
         return utilities
 
-    @staticmethod
-    def _utility(agent, heating, level, q, T_in, T_out, T_priced):
+    def _utility(self, agent, heating, level, q, T_in, T_out, T_priced):
         """The `UtilityTarget` of `agent` serving `q` from `T_in` to `T_out`
         (process temperatures), priced as one biosteam heat utility from
         `T_priced` to `T_out` (inside `_isolated_pricing`)."""
+        shift = tuple(self.shift.tolist())
         if agent is None:
             nan = math.nan
             return UtilityTarget(None, None, heating, level, q, nan, nan, nan,
-                                 T_in, T_out, nan, nan)
+                                 T_in, T_out, nan, nan, shift)
         hu = bst.HeatUtility()
         hu(q if heating else -q, T_priced, T_out, agent=agent)
         return UtilityTarget(agent.ID, agent, heating, level, q, abs(hu.duty),
                              abs(hu.flow), hu.cost, T_in, T_out,
                              hu.inlet_utility_stream.T,
-                             hu.outlet_utility_stream.T)
+                             hu.outlet_utility_stream.T, shift)
 
     # %% Balanced curves
 
@@ -1589,7 +1596,11 @@ class PinchTargets:
         """Raise a ValueError unless the heating duties of `utilities`
         (unserved ones included) add up to `Q_hot` and the cooling ones to
         `Q_cold`, as those of `utility_targets` do (to the remainders of at
-        most `_tol` that it leaves out, and round-off)."""
+        most `_tol` that it leaves out, and round-off), and every utility's
+        `shift` is None or `shift`: the duties alone do not tell targets of
+        another shift apart when they do not depend on it (streams of one
+        kind only, or a threshold problem below its threshold), and their
+        levels would then be read on the wrong shifted temperatures."""
         for heating, Q, name in ((True, self.Q_hot, 'Q_hot'),
                                  (False, self.Q_cold, 'Q_cold')):
             total = math.fsum([u.duty for u in utilities
@@ -1602,6 +1613,14 @@ class PinchTargets:
                     'utility_targets() of these targets (those of other '
                     'targets, e.g. of another T_min_app, or a part of them '
                     'do not balance their curves)')
+        for u in utilities:
+            if u.shift is not None and not np.array_equal(u.shift, self.shift):
+                raise ValueError(
+                    f'utility {u.ID!r} was placed on the shifted temperatures '
+                    'of other targets (its shift is not that of these '
+                    'targets): give the utility_targets() of these targets '
+                    '(those of other targets, e.g. of another T_min_app, do '
+                    'not balance their curves)')
 
     def _balanced_segments(self, utilities, inv_h=None, inv_h_utilities=None):
         """
@@ -1644,9 +1663,10 @@ class PinchTargets:
         utilities : list[UtilityTarget], optional
             `utility_targets` of these targets, with any agents: a
             ValueError is raised unless the heating duties (unserved ones
-            included) add up to `Q_hot` and the cooling ones to `Q_cold`
-            (the utilities of other targets, e.g. of another `T_min_app`,
-            or a part of them do not balance the curves). Defaults to
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`,
+            and the `shift` of each is None or these targets' `shift` (the
+            utilities of other targets, e.g. of another `T_min_app`, or a
+            part of them do not balance the curves). Defaults to
             `utility_targets` with the default agents.
 
         Returns
@@ -1693,9 +1713,10 @@ class PinchTargets:
         utilities : list[UtilityTarget], optional
             `utility_targets` of these targets, with any agents: a
             ValueError is raised unless the heating duties (unserved ones
-            included) add up to `Q_hot` and the cooling ones to `Q_cold`
-            (the utilities of other targets, e.g. of another `T_min_app`,
-            or a part of them do not balance the curves). Defaults to
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`,
+            and the `shift` of each is None or these targets' `shift` (the
+            utilities of other targets, e.g. of another `T_min_app`, or a
+            part of them do not balance the curves). Defaults to
             `utility_targets` with the default agents.
 
         Returns
@@ -1818,9 +1839,10 @@ class PinchTargets:
         utilities : list[UtilityTarget], optional
             `utility_targets` of these targets, with any agents: a
             ValueError is raised unless the heating duties (unserved ones
-            included) add up to `Q_hot` and the cooling ones to `Q_cold`
-            (the utilities of other targets, e.g. of another `T_min_app`,
-            or a part of them do not balance the curves). Defaults to
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`,
+            and the `shift` of each is None or these targets' `shift` (the
+            utilities of other targets, e.g. of another `T_min_app`, or a
+            part of them do not balance the curves). Defaults to
             `utility_targets` with the default agents.
         h : float, Sequence[float] or Mapping, optional
             Film coefficient of the streams [kW/m²/K]: one for all, one per
@@ -1865,9 +1887,10 @@ class PinchTargets:
         utilities : list[UtilityTarget], optional
             `utility_targets` of these targets, with any agents: a
             ValueError is raised unless the heating duties (unserved ones
-            included) add up to `Q_hot` and the cooling ones to `Q_cold`
-            (the utilities of other targets, e.g. of another `T_min_app`,
-            or a part of them do not balance the curves). Defaults to
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`,
+            and the `shift` of each is None or these targets' `shift` (the
+            utilities of other targets, e.g. of another `T_min_app`, or a
+            part of them do not balance the curves). Defaults to
             `utility_targets` with the default agents.
 
         Returns
@@ -1954,9 +1977,10 @@ class PinchTargets:
         utilities : list[UtilityTarget], optional
             `utility_targets` of these targets, with any agents: a
             ValueError is raised unless the heating duties (unserved ones
-            included) add up to `Q_hot` and the cooling ones to `Q_cold`
-            (the utilities of other targets, e.g. of another `T_min_app`,
-            or a part of them do not balance the curves). Defaults to
+            included) add up to `Q_hot` and the cooling ones to `Q_cold`,
+            and the `shift` of each is None or these targets' `shift` (the
+            utilities of other targets, e.g. of another `T_min_app`, or a
+            part of them do not balance the curves). Defaults to
             `utility_targets` with the default agents.
         h, h_utilities : optional
             Film coefficients, as `area_target` takes them.

@@ -862,6 +862,68 @@ def test_point_loads_at_stretch_ends():
     with pytest.raises(RuntimeError, match='no stream has heat in the stretch'):
         t._ends(np.zeros((2, 3)), 0, 2, 300., 310., True)
 
+def test_point_loads_at_the_pinch_follow_the_cut():
+    # the point loads at the pinch temperature lie on the side of the cut:
+    # a condenser there with the cut 'below' is served below the pinch, so
+    # it caps the cooling levels. Cooling water, whose limit lies above the
+    # condensing temperature, then serves nothing and chilled water serves
+    # all, leaving above the coldest temperature at which biosteam takes it
+    # (on the other side, cooling water would leave below its limit)
+    test_hxn_targets.setup('test_targeting_cut_condenser', ['Water'])
+    P = bst.settings.chemicals.Water.Psat(311.)
+    vapour = bst.Stream(None, Water=20., T=311., P=P, phase='g')
+    liquid = vapour.copy()
+    liquid.vle(V=0., P=P)
+    hot_in = bst.Stream(None, Water=200., T=330., P=3e5)
+    hot_out = hot_in.copy()
+    hot_out.T = 300.
+    # the cold inlet at the condenser's shifted temperature
+    cold_in = bst.Stream(None, Water=400., T=liquid.T - 6., P=3e5)
+    cold_out = cold_in.copy()
+    cold_out.T = 340.
+    t = PinchTargets([cold_in, vapour, hot_in], [cold_out, liquid, hot_out],
+                     [False, True, True], 10., [None, 1., 9.],
+                     labels=['C', 'COND', 'H'])
+    assert t.cut == 'below'
+    assert t.pinch_T + t.shift[1] == pytest.approx(liquid.T, abs=1e-9)
+    dT = bst.HeatUtility.dT
+    cooling = [u for u in t.utility_targets() if not u.heating]
+    assert [u.ID for u in cooling] == ['chilled_water']
+    assert cooling[0].duty == pytest.approx(t.Q_cold, rel=1e-12)
+    for u in cooling: # biosteam's get_suitable_cooling_agent
+        assert u.T_out > u.agent.T + u.agent.dT + dT
+    # a boiler at the pinch with the cut 'above' is served above it: above
+    # the pinch are C1's latent heat, H1 and low pressure steam (2 units),
+    # below it H1, C1's sensible heat and cooling water (2 units)
+    units, T_min_app = test_hxn_targets.case_two_stream()
+    t = targets_of(units, T_min_app)
+    assert t.cut == 'above'
+    assert t.units_target() == {'above': 2, 'below': 2, 'total': 4}
+
+@pytest.mark.parametrize('offset', [-1e-11, 0., 1e-11])
+def test_level_at_a_point_load_up_to_rounding(offset):
+    # a level equal to a grid temperature serves that temperature's point
+    # loads, also when it is off by rounding: a steam whose limit (its T
+    # less its dT and biosteam's) lies within rounding of where a boiler
+    # boils serves it all
+    test_hxn_targets.setup('test_targeting_snap', ['Water'])
+    boiler = water_boiler('B', 380., 10.)
+    t = targets_of([boiler], 10.)
+    k = np.flatnonzero(np.abs(t.table.point_H[0]) > 0.)
+    assert k.size == 1
+    T_b = t.grid['Ts'][k[0]] + t.shift[0]
+    dT = bst.HeatUtility.dT
+    T = T_b + dT + offset
+    steam = bst.UtilityAgent('test_targeting_snap_steam', Water=1, T=T,
+                             P=bst.settings.chemicals.Water.Psat(T), phase='g',
+                             thermo=bst.HeatUtility.thermo_water,
+                             regeneration_price=0.2378)
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning) # nothing unserved
+        utilities = t.utility_targets([steam], None)
+    assert [u.ID for u in utilities] == [steam.ID]
+    assert utilities[0].duty == pytest.approx(t.Q_hot, rel=1e-12)
+
 def test_levels_of_streams_beyond_reach():
     # a level serves only what lies below it (above it, for cooling): a
     # stream lying wholly beyond an agent's limit bounds the level only at
@@ -1102,6 +1164,44 @@ def test_utilities_must_be_of_the_targets(quickstart):
     assert t20.area_target(own) > 0. and math.isnan(t20.area_target(partial))
     fig, ax = plot_grand_composite_curve(t20, utilities=mismatched[:1])
     plt.close(fig)
+
+def test_utilities_of_another_shift():
+    # the utility targets of streams of one kind, or of a threshold problem
+    # below its threshold, do not depend on T_min_app, but the levels of
+    # cooling utilities do (they are on the shifted temperatures): the
+    # utilities of another shift raise wherever they are balanced even
+    # though their duties add up, so that the balanced grand composite
+    # curve stays non-negative and the units are those of these targets.
+    # Those of targets with the same shifts are the targets' own; one
+    # built by hand (shift None) is checked by its duties only
+    hot_only = [('H1', 400., 320., 1.), ('H2', 500., 290., 1.)]
+    threshold = [('H1', 450., 300., 2.), ('C1', 290., 380., 1.)]
+    for n, rows in enumerate((hot_only, threshold)):
+        t = targets(f'test_targeting_shift_{n}', rows, 10.)
+        own = t.utility_targets()
+        assert t.Q_hot == 0. and t.Q_cold > 0.
+        assert all(u.shift == tuple(t.shift.tolist()) for u in own)
+        calls = [t.area_target, t.units_target, t.capital_cost_target,
+                 t.balanced_composite_curves, t.balanced_grand_composite_curve]
+        for T_min_app in (0., 5., 20.):
+            other = t.at(T_min_app)
+            assert other.Q_cold == pytest.approx(t.Q_cold, rel=1e-12)
+            utilities = other.utility_targets()
+            for call in calls:
+                with pytest.raises(ValueError, match='shifted temperatures of other targets'):
+                    call(utilities)
+        for utilities in (t.at(10.).utility_targets(),
+                          [u._replace(shift=None) for u in own]):
+            assert t.units_target(utilities) == t.units_target(own)
+            assert t.area_target(utilities) == t.area_target(own)
+            T, B = t.balanced_grand_composite_curve(utilities)
+            assert_allclose(B, t.balanced_grand_composite_curve(own)[1], rtol=0, atol=0)
+            assert B.min() >= 0.
+    # streams that are all cold have the same shifts (0) at every T_min_app
+    rows = [('C1', 300., 420., 1.), ('C2', 310., 380., 2.)]
+    t = targets('test_targeting_shift_cold', rows, 10.)
+    utilities = t.at(0.).utility_targets()
+    assert t.units_target(utilities) == t.units_target(t.utility_targets())
 
 def test_bath_independent_integration(quickstart):
     # reference A: the streams plus the four utilities
