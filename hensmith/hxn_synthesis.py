@@ -15,7 +15,7 @@ default and with stream splits where needed if `stream_splitting` (on
 cycles (`StreamLifeCycle`) and pinch diagrams (`plot_pinch_diagram`).
 """
 from collections import namedtuple
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 import heapq
 import math
 import re
@@ -893,16 +893,54 @@ def _owner_chains(units, owners=None):
             unit = _parent(unit, owners)
     return list(found.values())
 
+def _nested_auxiliaries(unit):
+    """
+    The `biosteam.Unit` objects that `unit` holds as auxiliary units, at
+    any depth, in the order of `biosteam.Unit.nested_auxiliary_units`.
+    Unlike that property, this reads the auxiliaries of units only (an
+    object that is not one, such as the `biosteam.VacuumSystem` of a flash
+    drum under vacuum, has none, and the property fails on it one level
+    down), and it takes each unit once, never `unit` itself, and walks
+    into each unit at most once (so units that hold each other end it).
+    """
+    nested = []
+    found = {id(unit)} # the units listed (and `unit`)
+    walked = set() # the units `walk` went into
+
+    def add(aux):
+        if isinstance(aux, bst.Unit) and id(aux) not in found:
+            found.add(id(aux))
+            nested.append(aux)
+
+    def walk(holder):
+        # as `nested_auxiliary_units`: each attribute of `holder` (a unit or
+        # a list of them) before the auxiliaries of its units, and the
+        # auxiliaries of those that are units each before its own
+        walked.add(id(holder))
+        for name in getattr(holder, 'auxiliary_unit_names', ()):
+            held = getattr(holder, name, None)
+            if held is None: continue
+            group = list(held) if isinstance(held, Iterable) else [held]
+            for aux in group: add(aux)
+            for aux in group:
+                if not isinstance(aux, bst.Unit): continue
+                for sub in getattr(aux, 'auxiliary_units', ()):
+                    add(sub)
+                    if isinstance(sub, bst.Unit) and id(sub) not in walked:
+                        walk(sub)
+
+    walk(unit)
+    return nested
+
 def _with_auxiliaries(units):
     """Each unit of `units` followed by its nested auxiliary units (those
-    that are `biosteam.Unit` objects): the units that keys may name, as
-    `HeatExchangerNetwork` takes those available to it, whether or not
-    they hold a heat utility."""
+    that are `biosteam.Unit` objects, see `_nested_auxiliaries`): the units
+    that keys may name, as `HeatExchangerNetwork` takes those available to
+    it, whether or not they hold a heat utility."""
     candidates = []
     for unit in units:
         candidates.append(unit)
-        candidates.extend([i for i in unit.nested_auxiliary_units
-                           if isinstance(i, bst.Unit)])
+        candidates.extend(_nested_auxiliaries(unit))
     return candidates
 
 def _key_universe(units, held=None):
@@ -1150,8 +1188,11 @@ def _stream_contributions(hus, approach_contributions, units=None,
         return [_contribution_value(v, f'heat utility {k}')
                 for k, v in enumerate(values)]
     if callable(x):
-        return [_contribution_value(x(hu),
-                                    f'unit {_unit_message_name(hu.unit)}')
+        # labeled with the owners the keys of a mapping would take
+        owners = _held_owners([hu.unit for hu in hus] + list(units or ()),
+                              held)
+        return [_contribution_value(
+                    x(hu), f'unit {_unit_message_name(hu.unit, owners)}')
                 for hu in hus]
     raise TypeError('approach_contributions must be a mapping, a sequence or '
                     f'a callable, not {type(x).__name__!r}')

@@ -725,7 +725,10 @@ class HeatExchangerNetwork(bst.Facility):
                 # synthesis passes: smallest heating duty first among the cold
                 # streams, largest cooling duty first among the hot streams.
                 # The holders of the auxiliaries held without an owner, as
-                # the contributions were resolved by (see `targets`).
+                # the contributions were resolved by (see `targets`, which
+                # labels by them with or without contributions; the walk
+                # reads auxiliaries of units only, see
+                # `hensmith.hxn_synthesis._nested_auxiliaries`).
                 holders = _held_owners([hu.unit for hu in hx_utils]
                                        + self._candidate_units(units))
                 hx_utils.sort(key = lambda x: x.duty)

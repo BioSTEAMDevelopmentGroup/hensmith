@@ -1294,6 +1294,12 @@ def test_keys_of_stages_a_compressor_does_not_build():
             HXN.approach_contributions = {key: 3.}
             with pytest.raises(ValueError, match='name no unit'):
                 sys.simulate()
+    # a bad value of a callable names a stage by its key in the facility,
+    # as a mapping does (K1 holds its stages without an owner)
+    HXN.approach_contributions = lambda hu: (-1. if hu.unit.ID == 'K1_H2'
+                                             else None)
+    with pytest.raises(ValueError, match=r"unit \('K1', 'K1_H2'\) must be"):
+        sys.simulate()
     # outside the facility, only the heat utilities' units are at hand: the
     # intercoolers have no owner, and the messages say so
     hus = bst.process_tools.heat_exchanger_utilities_from_units([K1, C1])
@@ -1312,6 +1318,12 @@ def test_keys_of_stages_a_compressor_does_not_build():
     # a key of a stage beyond n_stages is no key of a unit not at hand
     with pytest.raises(ValueError, match=r"name no unit: \('K1', 'K1_H3'\)"):
         hxn_synthesis._stream_contributions(hus, {('K1', 'K1_H3'): 2.})
+    # a callable's bad value names a stage by its key with the units given
+    bad = lambda hu: -1. if hu.unit.ID == 'K1_H2' else None
+    for units, name in ((None, 'K1_H2'), ([K1], 'K1')):
+        with pytest.raises(ValueError, match=rf"unit \('{name}', 'K1_H2'\) "
+                                             r"must be"):
+            hxn_synthesis._stream_contributions(hus, bad, units)
 
 def test_targets_keep_the_holders_of_stages_rebuilt_since():
     # targets keep the holders of the stages that a MultistageCompressor
@@ -1425,7 +1437,79 @@ def test_held_owners_skip_loops_and_take_the_first_holder():
                 first.ID, unit, live, owners) == 1
         assert hxn_synthesis._contribution_key_level(
             second.ID, C, live, owners) is None
+        # the candidate units end too (biosteam's nested_auxiliary_units
+        # recurses without end), each unit once under each holder
+        assert hxn_synthesis._with_auxiliaries([first, second]) == [
+            first, second, C, second, first, C]
     for unit in (A, B, C): assert getattr(unit, '_owner', None) is None
+
+class VacuumTrain(bst.Unit):
+    """An auxiliary flash drum under vacuum, which holds its
+    `biosteam.VacuumSystem` (an auxiliary that is not a unit) as an
+    auxiliary: biosteam's ``nested_auxiliary_units`` fails on the train."""
+    _N_ins = 1
+    _N_outs = 2
+    auxiliary_unit_names = ('flash',)
+
+    def _init(self):
+        self.auxiliary('flash', bst.Flash, ins=self.ins[0], outs=self.outs,
+                       P=50000., V=0.3)
+
+    def _run(self): self.flash.simulate()
+    def _design(self): pass
+    def _cost(self): pass
+
+def test_auxiliaries_that_hold_auxiliaries_that_are_not_units():
+    # a unit whose auxiliary holds an auxiliary that is not a unit: the
+    # facility, by default (the network of the same streams with the drum
+    # as a unit of its own, as before contributions) or with contributions,
+    # and its targets, before and after a synthesis, take the drum's heater
+    def build(name, nested):
+        bst.main_flowsheet.set_flowsheet(name)
+        bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+        feed = bst.Stream('feed', Water=900., Ethanol=100., units='kmol/hr',
+                          T=300.)
+        hot = bst.Stream('hot', Water=500., units='kmol/hr', T=420., P=1e6)
+        U1 = (VacuumTrain('U1', ins=feed) if nested
+              else bst.Flash('U1', ins=feed, P=50000., V=0.3))
+        H1 = bst.HXutility('H1', ins=hot, T=320., rigorous=False)
+        HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
+        return U1, H1, HXN, bst.System.from_units(name, units=[U1, H1, HXN])
+
+    U0, *_, HXN0, sys0 = build('contributions_vacuum_top', False)
+    simulate_strictly(sys0)
+    U1, H1, HXN, sys = build('contributions_vacuum', True)
+    U1.simulate()
+    H1.simulate()
+    heater = U1.flash.heat_exchanger
+    assert isinstance(U1.flash.vacuum_system, bst.VacuumSystem)
+    with pytest.raises(AttributeError, match='nested_auxiliary_units'):
+        U1.nested_auxiliary_units
+    assert HXN._candidate_units([U1, H1]) == [U1, U1.flash, heater, H1]
+    reference = HXN0.targets()
+    before = HeatExchangerNetwork('HXN_units', T_min_app=5.,
+                                  units=[U1, H1]).targets()
+    assert before.labels == ['U1 - heat_exchanger', 'H1'] == reference.labels
+    assert (before.Q_hot, before.Q_cold) == (reference.Q_hot, reference.Q_cold)
+    simulate_strictly(sys)
+    assert [hx.ID for hx in HXN.original_heat_exchangers] == [
+        'heat_exchanger', 'H1']
+    assert network_record(HXN) == network_record(HXN0)
+    after = HXN.targets()
+    assert after.labels == reference.labels
+    assert (after.Q_hot, after.Q_cold) == (reference.Q_hot, reference.Q_cold)
+    for x in ({'U1': 2.}, {('U1', 'flash'): 2.}, {heater: 2.},
+              lambda hu: 2. if hu.unit is heater else None):
+        HXN.approach_contributions = x
+        simulate_strictly(sys)
+        assert HXN.synthesis_info['approach_contributions'].tolist() == [
+            2., 2.5]
+        assert HXN.targets().approach_contributions == (2., None)
+    hus = bst.process_tools.heat_exchanger_utilities_from_units([U1, H1])
+    targets = PinchTargets.from_heat_utilities(hus, 5., {('U1', 'flash'): 2.},
+                                               key_units=[U1, H1])
+    assert targets.approach_contributions == (2., None)
+    assert targets.key_units == [U1, U1.flash, heater, H1]
 
 def test_contribution_keys_with_the_units_option():
     # keys may name the units of the units option and their auxiliary units,
