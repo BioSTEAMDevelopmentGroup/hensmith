@@ -923,10 +923,11 @@ class PinchTargets:
     below). Where it departs from the equal division it tends to be high, as
     networks keep only part of their area in shell and tubes (the equal
     division tends to be low there): an estimate, not a bound. The furnace
-    is costed on the fuel's utility duty. `summary` adds the total
-    annualized cost, the installed (bare module) cost times the capital
-    recovery factor plus the utility cost times the operating hours: no Lang
-    factor and no working capital.
+    is costed on the fuel's utility duty at biosteam's default furnace
+    pressure of 500 psi (`P` sets the pressure of the shells only).
+    `summary` adds the total annualized cost, the installed (bare module)
+    cost times the capital recovery factor plus the utility cost times the
+    operating hours: no Lang factor and no working capital.
 
     Examples
     --------
@@ -1947,8 +1948,10 @@ class PinchTargets:
         by_index = {k: v for k, v in items if isinstance(k, Integral)}
         values = np.full(N, _H_DEFAULT)
         for j in range(N): # a stream index is below its unit
-            values[j] = (by_index[j] if j in by_index else _nearest_key_value(
-                unit_items, units[j], live, owners, _H_DEFAULT))
+            if j in by_index: values[j] = by_index[j]
+            elif unit_items: # only targets of heat utilities have units
+                values[j] = _nearest_key_value(unit_items, units[j], live,
+                                               owners, _H_DEFAULT)
         return values
 
     def _area(self, utilities, h, h_utilities):

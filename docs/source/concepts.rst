@@ -547,7 +547,8 @@ units, and each loop of matches one more.
 
 **Capital.** The area is put in as many shells as the units target,
 :math:`N`, less one furnace for all the fuel, and every shell is costed with
-BioSTEAM's own correlations; the furnace is costed on the fuel's utility duty.
+BioSTEAM's own correlations; the furnace is costed on the fuel's utility duty,
+at BioSTEAM's default furnace pressure of 500 psi.
 Linnhoff & Ahmad (1990) divide the area equally, :math:`N \cdot C(A / N)`:
 with economies of scale (:math:`C = a + b A^c`) that is the costliest way to
 divide it, and every unit added adds cost. BioSTEAM's correlations are not of

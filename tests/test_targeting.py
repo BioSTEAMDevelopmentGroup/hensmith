@@ -1478,6 +1478,16 @@ def test_bath_balanced_pair(quickstart):
     assert direct.area_target(h={0: .5, 1: 2.}) == pytest.approx(25., rel=1e-12)
     with pytest.raises(ValueError, match='name no stream'):
         direct.area_target(h={'H1': 2.})
+    # streams left out of a stream index mapping take 1
+    assert direct.area_target(h={0: .5}) == direct.area_target(h=[.5, 1.])
+    assert direct.area_target(h={}) == direct.area_target() == t.area_target(h={})
+    assert direct.area_target(h={1: 2.}) == t.area_target(h={1: 2.})
+    area = direct.area_target(h=[1., 2.])
+    assert direct.summary(h={1: 2.})['area'] == area
+    sweep = supertarget(direct, [5., 15.], refine=0, h={1: 2.})
+    assert_allclose(sweep['area'], supertarget(direct, [5., 15.], refine=0,
+                                               h=[1., 2.])['area'], rtol=0)
+    assert direct.capital_cost_target(h={1: 2.}) == direct.capital_cost_target(h=[1., 2.])
     # utilities: reference A, keyed by agent ID or agent
     a = targets('test_targeting_pair_utilities', REF_A, 10.)
     utilities = a.utility_targets()
