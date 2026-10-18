@@ -713,9 +713,10 @@ class PinchTargets:
         Further units that keys of `h` may name (with their owners) without
         a stream of theirs, a key that names only such units then having no
         effect: for `HeatExchangerNetwork.targets`, every unit available to
-        the network and its nested auxiliary units, which approach
-        contribution keys may name; for `from_heat_utilities`, its
-        `key_units` and their nested auxiliary units; else None (settable).
+        the network, its nested auxiliary units and the exchangers they hold
+        through their heat utilities only, which approach contribution keys
+        may name; for `from_heat_utilities`, its `key_units` and theirs;
+        else None (settable).
         An auxiliary that one of them, or a unit of `units`, holds without
         an owner when the targets are made (for `HeatExchangerNetwork.targets`,
         at the network's synthesis) stays that unit's for keys and labels,
@@ -1106,14 +1107,16 @@ class PinchTargets:
         key_units : Iterable[Unit], optional
             Further units at hand, such as ``sys.units``: the keys of
             `approach_contributions` and of `h` (see `area_target`) may name
-            them and their nested auxiliary units (the targets'
-            `key_units`), whether or not they hold a heat utility of `hus`,
-            as the keys of a `HeatExchangerNetwork` with these units may. A
+            them, their nested auxiliary units and the exchangers they hold
+            through their heat utilities only (the targets' `key_units`),
+            whether or not they hold a heat utility of `hus`, as the keys of
+            a `HeatExchangerNetwork` with these units may. A
             `biosteam.MultistageCompressor` K1 among them owns the stages it
             holds without an owner, so ``'K1'`` covers its intercoolers and
-            ``('K1', 'K1_H1')`` names one. Without them, only the units of
-            `hus` and their owners are at hand, and ``'K1_H1'`` is that
-            intercooler's key. Defaults to None.
+            ``('K1', 'K1_H1')`` names one (as a unit owns an exchanger it
+            holds through its heat utilities only). Without them, only the
+            units of `hus` and their owners are at hand, and ``'K1_H1'`` is
+            that intercooler's key. Defaults to None.
 
         Returns
         -------
@@ -2577,8 +2580,10 @@ def _check_targets(HXN, targets):
 
 def _rebuilt_label(hxs, labels, units):
     """The label (of `labels`, aligned with `hxs`) of the first of the
-    exchangers `hxs` that is not one of `units` (a facility's units and
-    their nested auxiliaries: a unit has rebuilt it since), or None."""
+    exchangers `hxs` that is not one of `units` (a facility's units, their
+    nested auxiliaries and the exchangers they hold through their heat
+    utilities only, see `hensmith.hxn_synthesis._with_auxiliaries`: a unit
+    has rebuilt it since), or None."""
     at_hand = {id(unit) for unit in units}
     for hx, label in zip(hxs, labels):
         if id(hx) not in at_hand: return label
@@ -2586,8 +2591,9 @@ def _rebuilt_label(hxs, labels, units):
 
 def _check_network(HXN, targets):
     """Raise a ValueError unless every stream of `HXN`'s network is that of
-    an original exchanger still among the facility's units and their
-    nested auxiliaries (not one that its unit has rebuilt since, as a
+    an original exchanger still among the facility's units, their nested
+    auxiliaries and the exchangers they hold through their heat utilities
+    only (see `_rebuilt_label`; not one that its unit has rebuilt since, as a
     `biosteam.MultistageCompressor` simulated alone after a change of `pr`
     rebuilds its intercoolers, whose former objects keep their former,
     consistent states), and enters and leaves the network at the end states

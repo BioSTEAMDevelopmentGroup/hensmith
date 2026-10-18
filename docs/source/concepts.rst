@@ -283,14 +283,17 @@ is an explicit default that wins at its level like any value, and two keys
 of the same level for a unit must agree. A unit's owner is its direct owner
 (the unit it was made an auxiliary of; BioSTEAM's ``Unit.owner`` gives the
 top one), or, for an auxiliary that a unit available to the network holds
-without setting its owner, that unit (the user's objects are left as they
-are): ``biosteam.MultistageCompressor`` builds its compressors and
-intercoolers anew, without an owner, whenever ``pr`` or ``n_stages``
-changes, and ``'K1'`` still covers the intercoolers of compressor K1 and
-``('K1', 'K1_H1')`` names one in every sample, while ``'K1_H1'`` names
-nothing. Targets keep this relation as it was when they were made (those of
-``HXN.targets()`` as it was at the network's synthesis), for their
-contributions, film coefficient keys and labels (``'K1 - K1_H1'``): ``'K1'``
+without setting its owner, or an exchanger without one whose heat utilities
+a unit takes without holding it as an auxiliary (a custom unit's
+``self.heat_utilities = self.hx.heat_utilities``), that unit (the user's
+objects are left as they are): ``biosteam.MultistageCompressor`` builds its
+compressors and intercoolers anew, without an owner, whenever ``pr`` or
+``n_stages`` changes, and ``'K1'`` still covers the intercoolers of
+compressor K1 and ``('K1', 'K1_H1')`` names one in every sample, while
+``'K1_H1'`` names nothing. Targets keep this relation as it was when they
+were made (those of ``HXN.targets()`` as it was at the network's synthesis),
+for their contributions, film coefficient keys and labels
+(``'K1 - K1_H1'``): ``'K1'``
 still covers the intercoolers of targets stored in one sample after K1 has
 rebuilt them in the next, or has been simulated alone. (Outside the
 facility -- ``synthesize_network``, ``temperature_interval_pinch_analysis``,

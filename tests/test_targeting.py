@@ -58,7 +58,7 @@ from hensmith.hxn_synthesis import _problem_table, temperature_interval_pinch_an
 from hensmith.targeting import _exchanger_costs, _economics, _lmtd, _profile_area
 from test_hxn import (build_system, cp_units, KEMP, simulate_HXN, simulate_strictly,
                       _gid_artists)
-from test_hxn_contributions import classic_cascade
+from test_hxn_contributions import classic_cascade, KeptHeater
 import test_hxn_targets
 
 K = 273.15
@@ -2623,6 +2623,53 @@ def test_network_report_rebuilt_stages():
         HXN.targets()
     assert report['targets'] == HXN.targets().summary()
     assert report['targets']['Q_hot'] == 0. and report['targets']['Q_cold'] > 0.
+
+@pytest.mark.parametrize('replace', [False, True])
+def test_network_report_of_exchangers_held_through_heat_utilities(replace):
+    # a unit that keeps its heater outside its auxiliary_unit_names and
+    # takes its heat utilities: right after a simulation, the facility's
+    # targets and report are of that heater, still at hand (labeled by the
+    # unit), and neither warns nor raises; a unit that builds its heater
+    # anew at every simulation, simulated alone, leaves the network of the
+    # former heater, and they say so until the system is simulated again
+    bst.main_flowsheet.set_flowsheet('test_targeting_report_kept_heater')
+    bst.settings.set_thermo(['Water'], cache=True)
+    feed = bst.Stream('feed', Water=300., units='kmol/hr', T=300.)
+    U = KeptHeater('U', ins=feed, T=360., rebuild=True)
+    hot = bst.Stream('hot', Water=200., units='kmol/hr', T=400.)
+    H1 = bst.HXutility('H1', ins=hot, T=310., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5.,
+                               replace_unit_heat_utilities=replace)
+    sys = bst.System.from_units('test_targeting_report_kept_heater',
+                                units=[U, H1, HXN])
+
+    def check_clean():
+        simulate_strictly(sys)
+        assert set(HXN.original_heat_exchangers) == {U.hx, H1}
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', RuntimeWarning)
+            targets = HXN.targets()
+            report = network_report(HXN)
+        assert dict(zip(targets.units, targets.labels)) == {
+            U.hx: 'U - U_hx', H1: 'H1'}
+        assert report['targets'] == targets.summary()
+        assert targets.Q_hot == HXN.synthesis_info['Q_hot_target']
+        return report
+
+    check_clean()
+    report = check_clean() # the same once simulated again
+    former = U.hx
+    U.simulate()
+    assert U.hx is not former
+    with pytest.warns(RuntimeWarning,
+                      match=r'the targets of HXN are of the former state of '
+                            r'U - U_hx, which is no longer'):
+        targets = HXN.targets()
+    assert targets.summary() == report['targets']
+    with pytest.raises(ValueError, match=r'the network of HXN is of U - U_hx, '
+                                         r'which is no longer'):
+        network_report(HXN)
+    check_clean()
 
 @pytest.mark.parametrize('contributions', [None, {'H1': 3., 'C1': 2.}])
 def test_network_report_cached_split_network(contributions):

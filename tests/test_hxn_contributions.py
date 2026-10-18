@@ -762,10 +762,16 @@ def test_contribution_keys_on_auxiliary_units():
                                          r"\('D1', 'nope'\)"):
         resolve({'condenser': 1., ('D1', 'nope'): 1., 'D1': 2.})
     # biosteam gives a single auxiliary its bare name, so an indexed ID of
-    # one names nothing
+    # one names nothing, and the message gives the unit's key
     for key in (('D1', 'condenser[0]'), ('D1', 'reboiler[7]'),
                 ('D1', 'pump[0]'), ('F1', 'heat_exchanger[3]')):
         with pytest.raises(ValueError, match='name no unit'):
+            resolve({key: 1.})
+    for key, hint in ((('D1', 'condenser[0]'), "D1.condenser is ('D1', "
+                       "'condenser')"),
+                      (('F1', 'heat_exchanger[3]'), "F1.heat_exchanger is "
+                       "('F1', 'heat_exchanger')")):
+        with pytest.raises(ValueError, match=re.escape(f'; {hint}')):
             resolve({key: 1.})
     # sequence (aligned with hus) and callable (once per heat utility, in
     # order) forms; heat utility and other keys are rejected
@@ -1093,6 +1099,12 @@ def test_keys_of_auxiliaries_a_unit_does_not_build():
         HXN.approach_contributions = {key: 3.}
         with pytest.raises(ValueError, match='name no unit'):
             sys.simulate()
+    # the bare name of the list gets the keys of its exchangers
+    hint = "; X1.heat_exchangers is a list: ('X1', 'heat_exchangers[0]')"
+    with pytest.raises(ValueError, match=re.escape(hint) + r'\)$'):
+        sys.simulate()
+    with pytest.raises(ValueError, match=re.escape(hint)):
+        targets.area_target(h={('X1', 'heat_exchangers'): 2.})
     # outside the facility, the universe is that of the heat utilities
     hus = bst.process_tools.heat_exchanger_utilities_from_units([X1, X2])
     assert hxn_synthesis._stream_contributions(hus, tuple_key) == [None, None]
@@ -1444,6 +1456,134 @@ def test_held_owners_skip_loops_and_take_the_first_holder():
         assert hxn_synthesis._with_auxiliaries([first, second]) == [
             first, second, C, second, first, C]
     for unit in (A, B, C): assert getattr(unit, '_owner', None) is None
+
+class KeptHeater(bst.Unit):
+    """A heater kept as a plain attribute, outside `auxiliary_unit_names`,
+    whose heat utilities the unit takes in its `_design`, as units written
+    before biosteam's auxiliary units do (biosteam rejects only the heat
+    utilities of auxiliaries added again). With `rebuild`, it builds its
+    heater anew at every simulation."""
+    _N_ins = 1
+    _N_outs = 1
+
+    def _init(self, T, rebuild=False):
+        self.T = T
+        self.rebuild = rebuild
+        self.hx = self._heater()
+
+    def _heater(self):
+        return bst.HXutility(f'.{self.ID}_hx', None, None, T=self.T,
+                             rigorous=False)
+
+    def _run(self):
+        self.outs[0].copy_like(self.ins[0])
+        self.outs[0].T = self.T
+
+    def _design(self):
+        if self.rebuild: self.hx = self._heater()
+        self.hx.simulate_as_auxiliary_exchanger(self.ins, self.outs)
+        self.heat_utilities = self.hx.heat_utilities
+
+def test_keys_of_exchangers_held_through_heat_utilities():
+    # a unit that keeps a heater outside its auxiliary_unit_names and takes
+    # its heat utilities holds it for the facility, as a unit holds the
+    # auxiliaries it holds without an owner: 'U' covers the heater,
+    # ('U', 'U_hx') names it and the bare 'U_hx' raises, with the pair in
+    # the message; outside the facility, without key_units, the heater has
+    # no owner and 'U_hx' is its key; the user's objects are left as they are
+    bst.main_flowsheet.set_flowsheet('contributions_kept_heater')
+    bst.settings.set_thermo(['Water'], cache=True)
+    feed = bst.Stream('feed', Water=300., units='kmol/hr', T=300.)
+    U = KeptHeater('U', ins=feed, T=360.)
+    hot = bst.Stream('hot', Water=200., units='kmol/hr', T=400.)
+    H1 = bst.HXutility('H1', ins=hot, T=310., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5.)
+    sys = bst.System.from_units('contributions_kept_heater',
+                                units=[U, H1, HXN])
+    simulate_strictly(sys)
+    hx = U.hx
+    assert hx.ID == 'U_hx' and not U.auxiliary_units
+    assert set(HXN.original_heat_exchangers) == {hx, H1}
+    assert HXN._candidate_units() == [U, hx, H1, HXN]
+
+    def used(x):
+        HXN.approach_contributions = x
+        simulate_strictly(sys)
+        return dict(zip(HXN.original_heat_exchangers,
+                        HXN.synthesis_info['approach_contributions'].tolist()))
+
+    default = used(None)
+    assert set(default.values()) == {2.5}
+    for x, given in [({'U': 2.}, {hx: 2.}), ({('U', 'U_hx'): 2.}, {hx: 2.}),
+                     ({U: 2.}, {hx: 2.}), ({hx: 2.}, {hx: 2.}),
+                     ({'U': 2., ('U', 'U_hx'): 1.}, {hx: 1.}),
+                     ({'H1': 1.}, {H1: 1.})]:
+        assert used(x) == default | given
+    HXN.approach_contributions = {'U_hx': 2.}
+    with pytest.raises(ValueError, match=r"name no unit: 'U_hx' .*; 'U_hx' "
+                                         r"is \('U', 'U_hx'\)"):
+        sys.simulate()
+    HXN.approach_contributions = None
+    simulate_strictly(sys)
+    targets = HXN.targets()
+    assert dict(zip(targets.units, targets.labels)) == {hx: 'U - U_hx',
+                                                         H1: 'H1'}
+    area = targets.area_target()
+    assert targets.area_target(h={'U': .5}) != area
+    assert targets.area_target(h={'U': .5}) == targets.area_target(
+        h={('U', 'U_hx'): .5})
+    # outside the facility, only the heat utilities' units are at hand
+    hus = bst.process_tools.heat_exchanger_utilities_from_units(sys.units)
+    assert [hu.unit for hu in hus] == [hx, H1]
+    assert hxn_synthesis._stream_contributions(hus, {'U_hx': 2.}) == [
+        2., None]
+    with pytest.raises(ValueError, match='name no unit'):
+        hxn_synthesis._stream_contributions(hus, {'U': 2.})
+    for x in ({'U': 2.}, {U: 2.}, {('U', 'U_hx'): 2.}):
+        targets = PinchTargets.from_heat_utilities(hus, 5., x,
+                                                   key_units=sys.units)
+        assert dict(zip(targets.units, targets.approach_contributions)) == {
+            hx: 2., H1: None}
+        assert targets.labels == HXN.targets().labels
+    assert getattr(hx, '_owner', None) is None and not U.auxiliary_units
+
+def test_held_owners_through_heat_utilities():
+    # an exchanger held through heat utilities only is held by the lowest
+    # holder of its heat utility (an owner lists those of its auxiliaries
+    # too), after the holders of the auxiliaries held without an owner,
+    # never by a unit that would close a loop, and never if it has an owner
+    bst.main_flowsheet.set_flowsheet('contributions_heat_utility_holders')
+    bst.settings.set_thermo(['Water'], cache=True)
+
+    class Holder(bst.Unit):
+        _N_ins = _N_outs = 0
+        def _run(self): pass
+
+    T, A, X, Y = Holder('T'), Holder('A'), Holder('X'), Holder('Y')
+    T.auxiliary_unit_names = ('a',)
+    T.a = A
+    hu_X, hu_Y = bst.HeatUtility(None, X), bst.HeatUtility(None, Y)
+    A.heat_utilities = [hu_X]
+    T.heat_utilities = [hu_X, hu_Y] # as biosteam lists A's under T
+    for units in ([T, A, X, Y], [X, Y, A, T], [A, T]):
+        owners = hxn_synthesis._held_owners(units)
+        assert owners == {id(A): (A, T), id(X): (X, A), id(Y): (Y, T)}
+        assert hxn_synthesis._id_path(X, owners) == ('X', 'A', 'T')
+        assert hxn_synthesis._unit_name(X, owners) == ('T', 'X')
+    assert hxn_synthesis._heat_utility_units([T]) == [X, Y]
+    assert hxn_synthesis._with_auxiliaries([T]) == [T, A, X, Y]
+    # an exchanger with an owner keeps it
+    Y._owner = A
+    assert id(Y) not in hxn_synthesis._held_owners([T, A, Y])
+    # units that hold each other's heat utilities: the first holder in the
+    # order given holds the other, which does not close the loop
+    P, Q = Holder('P'), Holder('Q')
+    P.heat_utilities = [bst.HeatUtility(None, Q)]
+    Q.heat_utilities = [bst.HeatUtility(None, P)]
+    for first, second in ((P, Q), (Q, P)):
+        assert hxn_synthesis._held_owners([first, second]) == {
+            id(second): (second, first)}
+    for unit in (T, A, X, P, Q): assert getattr(unit, '_owner', None) is None
 
 class VacuumTrain(bst.Unit):
     """An auxiliary flash drum under vacuum, which holds its

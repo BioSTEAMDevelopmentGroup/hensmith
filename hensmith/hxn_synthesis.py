@@ -799,19 +799,42 @@ def _held_owners(units, held=None):
     dict taken earlier (a snapshot, which keeps its objects alive), comes
     first: its auxiliaries keep their holders even once a holder has
     rebuilt them (no longer holds them), and the units at hand add the
-    others, along its owners. Nothing is mutated.
+    others, along its owners. Then a unit without an ``_owner`` that none
+    holds as an auxiliary, but whose heat utility is among the
+    `heat_utilities` of units on those chains (an exchanger kept outside
+    the `auxiliary_unit_names`, see `_heat_utility_units`), is held by the
+    lowest of them (an owner lists the heat utilities of its auxiliaries
+    too), none that would close a loop. Nothing is mutated.
     """
     owners = dict(held) if held else {}
-    for unit in _owner_chains(units, owners):
+    chains = _owner_chains(units, owners)
+
+    def closes_loop(aux, unit):
+        above = unit
+        while above is not None and above is not aux:
+            above = _parent(above, owners)
+        return above is not None
+
+    for unit in chains:
         for aux in getattr(unit, 'auxiliary_units', ()):
             if (not isinstance(aux, bst.Unit)
                     or getattr(aux, '_owner', None) is not None
                     or id(aux) in owners):
                 continue
-            above = unit
-            while above is not None and above is not aux:
-                above = _parent(above, owners)
-            if above is None: owners[id(aux)] = (aux, unit)
+            if not closes_loop(aux, unit): owners[id(aux)] = (aux, unit)
+    by_heat_utilities = {}
+    for unit in chains:
+        for hx in _heat_utility_units([unit]):
+            if getattr(hx, '_owner', None) is None and id(hx) not in owners:
+                by_heat_utilities.setdefault(id(hx), (hx, []))[1].append(unit)
+    for hx, holders in by_heat_utilities.values():
+        holders = [unit for unit in holders if not closes_loop(hx, unit)]
+        # the lowest holder: one on the chain of no other holder
+        lowest = [unit for unit in holders
+                  if not any(above is unit for other in holders
+                             if other is not unit
+                             for above in _owner_chains([other], owners)[1:])]
+        if lowest: owners[id(hx)] = (hx, lowest[0])
     return owners
 
 def _unit_name(unit, owners=None):
@@ -932,15 +955,45 @@ def _nested_auxiliaries(unit):
     walk(unit)
     return nested
 
+def _heat_utility_units(units):
+    """
+    The `biosteam.Unit` objects that the heat utilities of `units` belong
+    to (``hu.unit``), each once, other than the units of `units`: the
+    exchangers that a unit holds through its `heat_utilities` only, outside
+    its `auxiliary_unit_names`, as a unit may keep an exchanger as a plain
+    attribute and take its heat utilities in its `_design`
+    (``self.heat_utilities = self.hx.heat_utilities``; biosteam rejects
+    only the heat utilities of auxiliaries added again). A
+    `HeatExchangerNetwork` takes those heat utilities as any other
+    (`biosteam.process_tools.heat_exchanger_utilities_from_units` reads
+    `unit.heat_utilities`), so such exchangers are among its original
+    heat exchangers. An owner lists the heat utilities of its auxiliaries
+    too, whose units are its nested auxiliaries.
+    """
+    found = {id(unit) for unit in units}
+    held = []
+    for unit in units:
+        for hu in getattr(unit, 'heat_utilities', None) or ():
+            hx = getattr(hu, 'unit', None)
+            if isinstance(hx, bst.Unit) and id(hx) not in found:
+                found.add(id(hx))
+                held.append(hx)
+    return held
+
 def _with_auxiliaries(units):
     """Each unit of `units` followed by its nested auxiliary units (those
-    that are `biosteam.Unit` objects, see `_nested_auxiliaries`): the units
-    that keys may name, as `HeatExchangerNetwork` takes those available to
-    it, whether or not they hold a heat utility."""
+    that are `biosteam.Unit` objects, see `_nested_auxiliaries`) and by the
+    exchangers that it or they hold through their heat utilities only (see
+    `_heat_utility_units`): the units that keys may name, as
+    `HeatExchangerNetwork` takes those available to it, whether or not they
+    hold a heat utility, and among which its original exchangers are found
+    while no unit has rebuilt them (see
+    `hensmith.targeting._rebuilt_label`)."""
     candidates = []
     for unit in units:
-        candidates.append(unit)
-        candidates.extend(_nested_auxiliaries(unit))
+        group = [unit, *_nested_auxiliaries(unit)]
+        candidates.extend(group)
+        candidates.extend(_heat_utility_units(group))
     return candidates
 
 def _key_universe(units, held=None):
@@ -979,6 +1032,38 @@ def _auxiliary_slots(key, universe, owners=None):
             k = int(match[2])
             held = held[k] if k < len(held) else None
         yield unit, held if isinstance(held, bst.Unit) else None
+
+def _other_form_hints(key, universe, owners=None):
+    """
+    Hints for the tuple key `key` of the ID that `biosteam.Unit.auxiliary`
+    gives an auxiliary in the other form than the attribute it names takes
+    (see `_auxiliary_slots`, which skips such attributes): for ``(owner.ID,
+    name)`` where a unit under that top owner holds a list there, the keys
+    of its units (``"E1.evaporators is a list: ('E1', 'evaporators[0]'),
+    ..."``), and for ``(owner.ID, 'name[k]')`` where it holds one unit,
+    that unit's key (``"D1.condenser is ('D1', 'condenser')"``).
+    """
+    owner_ID, ID = key
+    match = re.fullmatch(r'(.+)\[(0|[1-9]\d*)\]', ID)
+    name = match[1] if match else ID
+    hints = []
+    for unit in universe:
+        if (_top(unit, owners).ID != owner_ID
+                or name not in getattr(unit, 'auxiliary_unit_names', ())):
+            continue
+        held = getattr(unit, name, None)
+        if held is None or isinstance(held, list) == bool(match): continue
+        if match:
+            if isinstance(held, bst.Unit):
+                hints.append(f'; {unit.ID}.{name} is '
+                             f'{_unit_name(held, owners)!r}')
+            continue
+        keys = [repr(_unit_name(aux, owners)) for aux in held
+                if isinstance(aux, bst.Unit)]
+        if keys:
+            shown = ', '.join(keys[:3]) + (', ...' if len(keys) > 3 else '')
+            hints.append(f'; {unit.ID}.{name} is a list: {shown}')
+    return hints
 
 def _stage_tickets(compressor=None):
     """The ticket names that a `biosteam.MultistageCompressor` gives its
@@ -1067,8 +1152,10 @@ def _unknown_key_hints(keys, universe, owners=None):
     key: for a str key, each auxiliary unit of that ID (``"'condenser' is
     ('D1', 'condenser')"``), and for a tuple key of the ID that biosteam
     gives an auxiliary (see `_auxiliary_slots`), each unit held there under
-    another ID (``"T1.heat_exchanger is ('T1', '')"``). A tuple key
-    ``(owner_ID, ID)`` of a unit of `universe` without an owner gets that
+    another ID (``"T1.heat_exchanger is ('T1', '')"``), or the keys of the
+    units held there when the key takes the other form (a list's name
+    alone, or an index into a single one, see `_other_form_hints`). A tuple
+    key ``(owner_ID, ID)`` of a unit of `universe` without an owner gets that
     unit's key (``"('K1', 'K1_H1') is 'K1_H1' (...)"``), and a str key,
     the stages without an owner that a `biosteam.MultistageCompressor` of
     that ID gives its IDs (see `_is_stage_ID`), such as the intercoolers
@@ -1103,6 +1190,8 @@ def _unknown_key_hints(keys, universe, owners=None):
                 if held is not None and held.ID != key[1]:
                     hints[f'; {unit.ID}.{key[1]} is '
                           f'{_unit_name(held, owners)!r}'] = None
+            for hint in _other_form_hints(key, universe, owners):
+                hints[hint] = None
             if key[0] != key[1] and any(
                     unit.ID == key[1] and _parent(unit, owners) is None
                     for unit in universe):

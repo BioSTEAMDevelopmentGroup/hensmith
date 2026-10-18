@@ -294,9 +294,12 @@ class HeatExchangerNetwork(bst.Facility):
     agree. A unit's owner is its direct owner (the unit it was made an
     auxiliary of; `biosteam.Unit.owner` gives the top one) or, for an
     auxiliary that a unit available to the network holds without setting
-    its owner, that unit: a `biosteam.MultistageCompressor` K1 builds its
-    compressors and intercoolers anew whenever `pr` or `n_stages` changes,
-    without an owner, and ``'K1'`` still covers the intercoolers and
+    its owner, or an exchanger without one whose heat utilities a unit takes
+    without holding it as an auxiliary (``self.heat_utilities =
+    self.hx.heat_utilities``), that unit: a `biosteam.MultistageCompressor`
+    K1 builds its compressors and intercoolers anew whenever `pr` or
+    `n_stages` changes, without an owner, and ``'K1'`` still covers the
+    intercoolers and
     ``('K1', 'K1_H1')`` names one in every simulation (the bare ``'K1_H1'``
     names nothing, though it is the key of that intercooler outside the
     facility, see `synthesize_network`; user objects are not changed). ID
@@ -308,7 +311,8 @@ class HeatExchangerNetwork(bst.Facility):
     an owner (an old intercooler of K1) names none, and raises (heat
     utility keys are rejected, since BioSTEAM replaces them at every
     simulation). The keys and values are checked against every unit
-    available to the network and its nested auxiliary units before the
+    available to the network, its nested auxiliary units and the exchangers
+    they hold through their heat utilities only, before the
     heat utilities are taken: a key that names none of them, a bad value
     or two conflicting keys raise a ValueError, even while their unit is
     idle, but a valid key whose unit holds no heat utility in a simulation
@@ -532,7 +536,9 @@ class HeatExchangerNetwork(bst.Facility):
     def _candidate_units(self, units=None):
         """The units that approach contribution keys may name: each unit of
         `units` (defaults to `_get_units`) followed by its nested auxiliary
-        units, whether or not it holds a heat utility the network takes."""
+        units and the exchangers they hold through their heat utilities
+        only, whether or not it holds a heat utility the network takes (see
+        `hensmith.hxn_synthesis._with_auxiliaries`)."""
         if units is None: units = self._get_units()
         return _with_auxiliaries(units)
 
@@ -1126,9 +1132,10 @@ class HeatExchangerNetwork(bst.Facility):
 
     def _pinch_targets(self, T_min_app=None):
         """`targets` (see there) and the label of the first of their
-        streams whose exchanger is no longer among the facility's units and
-        their nested auxiliaries (rebuilt since the last simulation), or
-        None (always before a simulation)."""
+        streams whose exchanger is no longer among the facility's units,
+        their nested auxiliaries and the exchangers they hold through their
+        heat utilities only (rebuilt since the last simulation), or None
+        (always before a simulation)."""
         from .targeting import PinchTargets, _rebuilt_label
         if T_min_app is None: T_min_app = self.T_min_app
         if (hasattr(self, 'original_heat_exchangers')
