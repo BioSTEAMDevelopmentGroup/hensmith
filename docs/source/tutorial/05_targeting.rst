@@ -68,7 +68,9 @@ facility, from the heat utilities of heat exchangers with
 ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``, is the
 one to give it: a heat utility that a unit adds for itself (a reactor's or a
 heated mixer's, ``hu.hxn_ok`` False) raises a ``ValueError``, as its unit's
-first inlet and outlet need not be the stream it heats or cools. Given
+first inlet and outlet need not be the stream it heats or cools, and so does
+a heat utility given twice (as selections from overlapping unit lists give
+it), whose stream would count twice. Given
 ``key_units=sys.units`` too, the keys of ``approach_contributions`` and of
 ``h`` may name any unit, as the facility's may: ``'K1'`` then covers the
 intercoolers of a ``biosteam.MultistageCompressor`` K1, which builds them

@@ -30,7 +30,7 @@ from matplotlib.legend import Legend
 from matplotlib.patches import Patch
 from matplotlib.path import Path
 import biosteam as bst
-from ._curves import _T_EQ, _copy
+from ._curves import StreamCurve, _T_EQ, _copy
 from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
@@ -310,7 +310,9 @@ def _duty_off_stream(hu):
     (``hu.unit_duty``) differs from that of its process stream (``outs[0].H
     - ins[0].H`` of its unit) beyond rounding, as for the heat utilities
     that a heat exchanger network simulated with
-    ``replace_unit_heat_utilities`` writes its utilities over or empties."""
+    ``replace_unit_heat_utilities`` writes its utilities over or empties
+    (and, by 0.1 %, that of biosteam's `MESHDistillation` total
+    condenser)."""
     unit = hu.unit
     dH = unit.outs[0].H - unit.ins[0].H
     return abs(dH - hu.unit_duty) > 1e-6 * max(abs(dH), abs(hu.unit_duty))
@@ -687,7 +689,9 @@ class PinchTargets:
         ``T_min_app / 2``), or a finite number > 0 (`T_min_app` must then be
         finite and > 0 too). All unspecified is the same as None.
     labels : list[str], optional
-        Display name of each stream. Defaults to the IDs of `streams_inlet`.
+        Display name of each stream, which the curves built here also take
+        (to name their streams in their warnings). Defaults to the IDs of
+        `streams_inlet`.
     curves : list[StreamCurve], optional
         Prebuilt temperature-enthalpy curves of the streams (built here if
         not given).
@@ -1057,6 +1061,9 @@ class PinchTargets:
             labels = [s.ID for s in streams_inlet]
         elif len(labels) != N:
             raise ValueError(f'{len(labels)} labels given for {N} streams')
+        if curves is None: # named by the labels in their warnings
+            curves = [StreamCurve(si, so, hot, label=label) for si, so, hot, label
+                      in zip(streams_inlet, streams_quenched, is_hot, labels)]
         if x is None:
             table, curves, grid = _problem_table(
                 streams_inlet, streams_quenched, is_hot, T_min_app, curves)
@@ -1164,15 +1171,26 @@ class PinchTargets:
             heat exchanger's (``hu.hxn_ok`` False, as for the heat utilities
             that reactors, mixers or compressors add with
             ``Unit.add_heat_utility``: their unit's first inlet and outlet
-            need not be the stream they heat or cool).
+            need not be the stream they heat or cool), or if two with duty
+            are of the same unit (the same heat utility given twice, as by
+            selections from overlapping unit lists), whose stream would
+            count once per heat utility.
 
         Warns
         -----
         RuntimeWarning
-            If the duty of a heat exchanger's heat utility (``hu.unit_duty``)
-            differs from that of its process stream (``outs[0].H -
-            ins[0].H`` of its unit, which the targets use) beyond rounding,
-            as after a simulation with ``replace_unit_heat_utilities=True``.
+            If a heat utility is one that a `HeatExchangerNetwork`
+            simulated with ``replace_unit_heat_utilities=True`` has written
+            its utilities over (and not given back yet, as its next
+            simulation does), with a duty (``hu.unit_duty``) other than its
+            process stream's (``outs[0].H - ins[0].H`` of its unit, which
+            the targets use) beyond rounding: the warning names that
+            network, whose `HeatExchangerNetwork.targets` are the process's.
+            A duty that differs from its stream's for another reason warns
+            of nothing, the targets being the streams' (the total condenser
+            of a `biosteam.MESHDistillation` with ``full_condenser=True``
+            reports a duty about 0.1 % off the enthalpy change of its own
+            streams, for instance).
 
         """
         hus = list(hus)
@@ -1196,16 +1214,37 @@ class PinchTargets:
                              f'(hu.hxn_ok), not those of {names}, whose first '
                              'inlet and outlet need not be the stream they '
                              f'heat or cool: {selection}')
+        seen = set()
+        repeated = [hu for hu in hus if hu.duty and (id(hu.unit) in seen
+                                                     or seen.add(id(hu.unit)))]
+        if repeated:
+            names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
+                                            for hu in repeated))
+            raise ValueError(f'the stream of {names} would count once per '
+                             'heat utility of its unit given (the same heat '
+                             'utility given twice, as by selections from '
+                             'overlapping unit lists, such as a unit and an '
+                             'auxiliary unit of it): give each heat '
+                             "exchanger's heat utility once")
+        # only those that a network has written over: a duty may differ from
+        # its stream's for another reason (biosteam's MESHDistillation total
+        # condenser, 0.1 % off), which the targets, the streams', ignore
         replaced = [hu for hu in hus if hu.hxn_ok and _duty_off_stream(hu)]
+        if replaced:
+            from ._heat_exchanger_network import _replacing_networks
+            networks = _replacing_networks(replaced)
+            replaced = [hu for hu in replaced if id(hu) in networks]
         if replaced:
             names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
                                             for hu in replaced))
+            IDs = list(dict.fromkeys(networks[id(hu)].ID for hu in replaced))
             warn(f'the heat utilities of {names} have duties (hu.unit_duty) '
                  'other than their process streams\' (outs[0].H - ins[0].H), '
-                 'which the targets use: after a simulation of a '
-                 'HeatExchangerNetwork with replace_unit_heat_utilities=True '
-                 'they hold its utilities, and the streams it serves '
-                 'completely have none and are left out; take its targets() '
+                 'which the targets use: they hold the utilities of '
+                 f"HeatExchangerNetwork {', '.join(map(repr, IDs))}, "
+                 'simulated with replace_unit_heat_utilities=True, and the '
+                 'streams it serves completely have none and are left out; '
+                 f"take {' or '.join(f'{ID}.targets()' for ID in IDs)} "
                  'instead', RuntimeWarning)
         if key_units is not None: key_units = _with_auxiliaries(key_units)
         values = _explicit_contributions(hus, approach_contributions, T_min_app,

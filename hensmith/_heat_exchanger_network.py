@@ -17,6 +17,7 @@ Created on Sat Aug 22 21:58:19 2020
 @author: sarangbhagwat and yoelcp
 """
 import heapq
+import weakref
 from collections.abc import Mapping
 import biosteam as bst
 import numpy as np
@@ -35,6 +36,26 @@ __all__ = ('HeatExchangerNetwork',)
 #: 1e-10 of the duty over the test suite, where the smallest utility duty a
 #: network does leave is 3e-7 of the stream's duty).
 _SERVED_RTOL = 1e-9
+
+#: The facilities whose `_replace_unit_heat_utilities` has written their
+#: utilities over heat utilities of their units that
+#: `_restore_unit_heat_utilities` has not given back yet (see
+#: `_replacing_networks`).
+_REPLACING = weakref.WeakSet()
+
+def _replacing_networks(hus):
+    """
+    The facilities that hold heat utilities of `hus` written over by
+    `HeatExchangerNetwork._replace_unit_heat_utilities` and not given back
+    yet, by the ``id`` of each such heat utility (a unit simulated again
+    since holds new heat utilities, which are not among them).
+    """
+    ids = set(map(id, hus))
+    networks = {}
+    for network in list(_REPLACING):
+        for hu, _ in getattr(network, '_replaced_heat_utilities', None) or ():
+            if id(hu) in ids: networks.setdefault(id(hu), network)
+    return networks
 
 def _pass_through_served_streams(stream_life_cycles, original_units):
     """
@@ -609,6 +630,7 @@ class HeatExchangerNetwork(bst.Facility):
             else: hu.empty() # a stream the process exchangers serve
             _load_utility_costs(hu.unit)
         self._replaced_heat_utilities = replaced
+        _REPLACING.add(self)
 
     def _restore_unit_heat_utilities(self):
         """
@@ -625,6 +647,7 @@ class HeatExchangerNetwork(bst.Facility):
         left, would drop out of the next network.
         """
         replaced = getattr(self, '_replaced_heat_utilities', None)
+        _REPLACING.discard(self)
         if not replaced: return
         self._replaced_heat_utilities = None
         for hu, original in replaced:

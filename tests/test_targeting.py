@@ -55,7 +55,8 @@ from hensmith import (HeatExchangerNetwork, PinchTargets, Supertargets, supertar
                       plot_supertargets)
 from hensmith._curves import _copy
 from hensmith.hxn_synthesis import _problem_table, temperature_interval_pinch_analysis
-from hensmith.targeting import _exchanger_costs, _economics, _lmtd, _profile_area
+from hensmith.targeting import (_exchanger_costs, _economics, _lmtd, _profile_area,
+                                _duty_off_stream)
 from test_hxn import (build_system, cp_units, KEMP, simulate_HXN, simulate_strictly,
                       _gid_artists)
 from test_hxn_contributions import classic_cascade, KeptHeater
@@ -2004,6 +2005,11 @@ def test_from_heat_utilities_takes_exchangers():
     selected = bst.process_tools.heat_exchanger_utilities_from_units(units)
     assert [hu.unit for hu in selected] == [H, C]
     t = PinchTargets.from_heat_utilities(sorted(selected, key=lambda hu: hu.duty), 10.)
+    # a heat utility given twice would count its stream twice
+    for given in (selected + selected[:1], selected[:1] + selected):
+        with pytest.raises(ValueError, match=r"the stream of 'H' would count "
+                                             r"once per heat utility of its unit"):
+            PinchTargets.from_heat_utilities(given, 10.)
     HXN = HeatExchangerNetwork('HXN', T_min_app=10., units=units)
     facility = HXN.targets()
     assert facility.labels == t.labels == ['C', 'H']
@@ -2030,13 +2036,17 @@ def test_from_heat_utilities_after_replaced_heat_utilities(kemp_hxn, kemp_hxn_re
     assert [hu.unit for hu in hus] == [units[0], units[3]]
     assert_allclose([hu.unit_duty / kW for hu in hus], [20., -60.], rtol=1e-9)
     message = (r"heat utilities of 'C1', 'H4' have duties \(hu.unit_duty\) other "
-               r"than their process streams' .*replace_unit_heat_utilities=True"
-               r".*take its targets\(\) instead")
+               r"than their process streams' .*they hold the utilities of "
+               r"HeatExchangerNetwork 'HXN', simulated with "
+               r"replace_unit_heat_utilities=True.*take HXN.targets\(\) instead")
     with pytest.warns(RuntimeWarning, match=message):
         t = PinchTargets.from_heat_utilities(hus, 10.)
     assert t.labels == ['C1', 'H4']
     facility = HXN.targets()
     assert facility.labels == ['C1', 'C3', 'H2', 'H4']
+    # the curves are named by the labels (in their warnings), not by the
+    # IDs of the targets' private stream copies
+    assert [c.label for c in facility.curves] == facility.labels
     assert (facility.Q_hot, facility.Q_cold) == (pytest.approx(20. * kW, rel=1e-9),
                                                  pytest.approx(60. * kW, rel=1e-9))
     # every unit's own heat utility: the empty ones are named too
@@ -2054,20 +2064,62 @@ def test_from_heat_utilities_after_replaced_heat_utilities(kemp_hxn, kemp_hxn_re
     assert t.labels == facility.labels
     assert (t.Q_hot, t.Q_cold) == (pytest.approx(facility.Q_hot, rel=1e-12),
                                    pytest.approx(facility.Q_cold, rel=1e-12))
-    # a duty off by 1e-4 of its stream's is another than the stream's; one
-    # off by 1e-9 is the stream's up to rounding
+    # a written-over duty off by 1e-4 of its stream's is another than the
+    # stream's; one off by 1e-9 is the stream's up to rounding
+    units, HXN = kemp_hxn_replaced
+    hu = units[0].heat_utilities[0]
+    dH = units[0].outs[0].H - units[0].ins[0].H
+    replaced = hu.unit_duty
+    try:
+        for f, off in ((1e-4, True), (-1e-4, True), (1e-9, False)):
+            hu.unit_duty = dH * (1. + f)
+            assert _duty_off_stream(hu) == off
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter('always')
+                PinchTargets.from_heat_utilities([hu], 10.)
+            messages = [str(x.message) for x in w
+                        if 'other than their process' in str(x.message)]
+            assert len(messages) == off
+            if off: assert messages[0].startswith("the heat utilities of 'C1' have duties")
+    finally:
+        hu.unit_duty = replaced
+    # a duty off its stream's that no network has written over warns of
+    # nothing: the targets are the streams'
     units = cp_units('test_targeting_duty_off', REF_A)
     hus = [u.heat_utilities[0] for u in units]
     dH = units[0].outs[0].H - units[0].ins[0].H
-    for f, off in ((1e-4, True), (-1e-4, True), (1e-9, False)):
-        hus[0].unit_duty = dH * (1. + f)
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter('always')
-            PinchTargets.from_heat_utilities(hus, 10.)
-        messages = [str(x.message) for x in w
-                    if 'other than their process' in str(x.message)]
-        assert len(messages) == off
-        if off: assert messages[0].startswith("the heat utilities of 'H1' have duties")
+    hus[0].unit_duty = dH * (1. + 1e-4)
+    assert _duty_off_stream(hus[0])
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        t = PinchTargets.from_heat_utilities(hus, 10.)
+    assert t.labels == ['C1', 'H1']
+
+def test_from_heat_utilities_of_a_total_condenser():
+    # the heat utility of the total condenser of biosteam's MESHDistillation
+    # reports a duty 0.1 % off the enthalpy change of the condenser's own
+    # streams (no network about): neither the selection nor the facility's
+    # targets before a simulation warn of a network that wrote it over
+    bst.main_flowsheet.set_flowsheet('test_targeting_total_condenser')
+    bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+    feed = bst.Stream('feed', Water=800., Ethanol=100., units='kmol/hr', T=350.)
+    D1 = bst.MESHDistillation('D1', ins=feed, outs=('dist', 'bott'), N_stages=12,
+                              feed_stages=(6,), reflux=2., boilup=1.5,
+                              LHK=('Ethanol', 'Water'), full_condenser=True)
+    C1 = bst.HXutility('C1', ins=D1-0, T=310.)
+    C2 = bst.HXutility('C2', ins=D1-1, T=320.)
+    sys = bst.System.from_units('sys', units=[D1, C1, C2])
+    sys.simulate()
+    hu = D1.condenser.heat_utilities[0]
+    dH = D1.condenser.outs[0].H - D1.condenser.ins[0].H
+    assert _duty_off_stream(hu) and abs(hu.unit_duty / dH - 1.) > 1e-4
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        hus = bst.process_tools.heat_exchanger_utilities_from_units(sys.units)
+        t = PinchTargets.from_heat_utilities(sorted(hus, key=lambda hu: hu.duty))
+        facility = HeatExchangerNetwork('HXN', units=sys.units).targets()
+    assert 'D1 - condenser' in t.labels and facility.labels == t.labels
+    assert (facility.Q_hot, facility.Q_cold) == (t.Q_hot, t.Q_cold)
 
 def test_is_hot_validated():
     # is_hot must agree with each stream's direction (a stream without duty
