@@ -26,6 +26,7 @@ from contextlib import contextmanager
 from numbers import Integral, Real
 from warnings import catch_warnings, filterwarnings, warn
 import numpy as np
+from matplotlib.legend import Legend
 from matplotlib.patches import Patch
 from matplotlib.path import Path
 import biosteam as bst
@@ -3103,11 +3104,16 @@ class _Leader(Patch):
     def get_path(self):
         return self._path
 
+    def path(self, renderer):
+        """The path of the leader where the labels are placed for the
+        `renderer` (in display; empty without a leader)."""
+        ends = self.labels.spots(renderer)[self.index][1]
+        return Path(np.zeros((0, 2)) if ends is None else np.array(ends))
+
     def draw(self, renderer):
         if not self.get_visible(): return
-        ends = self.labels.spots(renderer)[self.index][1]
-        self._path = Path(np.zeros((0, 2)) if ends is None else np.array(ends))
-        if ends is not None: super().draw(renderer)
+        self._path = self.path(renderer)
+        if len(self._path.vertices): super().draw(renderer)
 
 class _Stacked(_Labels):
     """
@@ -3334,6 +3340,74 @@ class _Beside(_Labels):
             spots.append(((box.x0, box.y0), None))
         return spots
 
+class _ClearLegend(Legend):
+    """
+    A legend (of loc 'best') at matplotlib's 'best' location in its axes
+    among the spots that cover none of their texts (the labels), decided
+    when drawn, as the labels are placed: of the spots matplotlib tries in
+    the axes, the first, in its order, of those clear of the texts that
+    covers the least of the rest of the axes, by matplotlib's count (of
+    the points of their lines, patches and collections in it, of their
+    crossings of it, and of the rectangles, such as a shaded band, that it
+    overlaps; the leaders where they are drawn), which is matplotlib's
+    location wherever that is clear of the texts. Else, where each of them
+    covers a text, it goes above the axes (and any title of them),
+    left-aligned with them, where a constrained layout or a tight bounding
+    box makes room for it.
+    """
+    # the anchors of the locations 1 to 10 ('upper right' to 'center')
+    _anchors = ('NE', 'NW', 'SW', 'SE', 'E', 'W', 'E', 'S', 'N', 'C')
+
+    def _find_best_position(self, width, height, renderer):
+        # matplotlib's hook of the 'best' location (which the legend would
+        # fall back to without it): the display (x, y) of the lower left
+        # corner of the legend of `width` and `height`
+        from matplotlib.collections import PolyCollection
+        from matplotlib.patches import Rectangle
+        from matplotlib.text import Text
+        from matplotlib.transforms import Bbox
+        ax = self.parent
+        texts = [text.get_window_extent(renderer) for text in ax.texts
+                 if text.get_visible() and text.get_text()]
+        paths = [line.get_transform().transform_path(line.get_path())
+                 for line in ax.lines]
+        boxes, points = [], []
+        for patch in ax.patches:
+            if isinstance(patch, _Leader):
+                paths.append(patch.path(renderer))
+            elif isinstance(patch, Rectangle):
+                boxes.append(patch.get_bbox().transformed(patch.get_data_transform()))
+            else:
+                paths.append(patch.get_transform().transform_path(patch.get_path()))
+        for collection in ax.collections:
+            if isinstance(collection, PolyCollection):
+                transform = collection.get_transform()
+                paths += [transform.transform_path(path)
+                          for path in collection.get_paths()]
+            elif len(collection.get_offsets()):
+                points.append(collection.get_offset_transform().transform(
+                    collection.get_offsets()))
+        points = np.concatenate(points) if points else np.zeros((0, 2))
+        pad = self.borderaxespad * renderer.points_to_pixels(
+            self.prop.get_size_in_points())
+        frame = self.get_bbox_to_anchor()
+        size = Bbox.from_bounds(0., 0., width, height)
+        best = None
+        for anchor in self._anchors:
+            box = size.anchored(anchor, container=frame.padded(-pad))
+            if any(box.overlaps(text) for text in texts): continue
+            badness = (sum(box.count_contains(path.vertices)
+                           + path.intersects_bbox(box, filled=False) for path in paths)
+                       + box.count_contains(points) + box.count_overlaps(boxes))
+            if best is None or badness < best[0]: best = (badness, box.p0)
+            if not badness: break
+        if best is not None: return best[1]
+        # the titles are the texts of the axes besides `texts`
+        titles = [title.get_window_extent(renderer).y1 for title in ax.get_children()
+                  if isinstance(title, Text) and title not in ax.texts
+                  and title.get_visible() and title.get_text()]
+        return frame.x0, max([frame.y1, *titles]) + pad
+
 def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
                           file=None, dpi=300):
     """
@@ -3407,14 +3481,20 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
     the order inside the axes, those that would run past the edge are moved
     sideways past the label in their way. Labels can then still overlap,
     on axes too small for them all (many agents on small axes without a
-    layout engine, say): a larger figure, or one with
-    ``layout='constrained'``, gives them room. A label left more than 1.5
-    times its height away from its anchor gets a thin leader from it
-    ('Leader:<agent ID>', an empty path otherwise), and each label a halo,
-    so that a leader passing behind it strikes none of its letters. The
-    legend goes where it covers the least of the curves, the band and the
-    labels (matplotlib's 'best' location: no fixed corner is clear of the
-    composites of every problem).
+    layout engine, say, or on short axes that a legend above them leaves
+    shorter): a larger figure, or one with ``layout='constrained'``, gives
+    them room. A label left more than 1.5 times its height away from its
+    anchor gets a thin leader from it ('Leader:<agent ID>', an empty path
+    otherwise), and each label a halo, so that a leader passing behind it
+    strikes none of its letters. The legend, of any kind, covers none of
+    the labels: when drawn, it goes to the spot of matplotlib's 'best'
+    location in the axes that covers the least of the curves, the leaders
+    and the band among those clear of the labels (matplotlib's own spot
+    wherever that is clear of them: no fixed corner is clear of the
+    composites of every problem); or, where each of those spots would cover
+    a label (on small axes, say), above the axes and any title of them,
+    left-aligned with them, where a constrained layout or a tight bounding
+    box makes room for it.
 
     Examples
     --------
@@ -3597,7 +3677,11 @@ def plot_composite_curves(targets, kind='real', utilities=None, ax=None,
         ax.set_ylabel('shifted T [°C]' if shifted else 'T [°C]')
     _sci_ticks(ax.xaxis)
     ax.set_xlabel('H [kJ·h$^{-1}$]')
-    ax.legend(loc='best', fontsize=8)
+    # at matplotlib's 'best' location among the spots clear of the labels,
+    # or above the axes if none is (added as `Axes.legend` adds one)
+    ax.legend_ = _ClearLegend(ax, *ax.get_legend_handles_labels(), loc='best',
+                              fontsize=8)
+    ax.legend_._remove_method = ax._remove_legend
     ax.grid(alpha=0.3)
     if file: fig.savefig(file, dpi=dpi, bbox_inches='tight')
     return fig, ax

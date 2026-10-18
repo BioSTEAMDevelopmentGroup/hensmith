@@ -3442,6 +3442,76 @@ def test_plot_readability(quickstart):
                          + _gid_artists(ax, 'Cold composite'))
             finally:
                 plt.close(fig)
+    # the legend of the composite curves of any kind over none of the
+    # labels, decided when drawn: at matplotlib's 'best' location where
+    # that is clear of them (as at the default size); on smaller axes (of
+    # a figure of the user's, alone or the middle one of three in a row),
+    # where each spot clear of the curves holds a label, at the spot clear
+    # of the labels that covers the least of the curves; and above the axes
+    # (and their title) where each spot in the axes covers a text
+    def clear_legend(fig, ax):
+        """The legend inside the figure and off every text of `ax`: inside
+        the axes, or above them (and their title), left-aligned with them;
+        whether it is inside them."""
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        box = ax.get_legend().get_window_extent(renderer)
+        for text in ax.texts:
+            assert not box.overlaps(text.get_window_extent(renderer)), text.get_text()
+        frame, page = ax.get_window_extent(renderer), fig.bbox
+        assert (page.x0 <= box.x0 and box.x1 <= page.x1
+                and page.y0 <= box.y0 and box.y1 <= page.y1)
+        if (frame.x0 <= box.x0 and box.x1 <= frame.x1
+                and frame.y0 <= box.y0 and box.y1 <= frame.y1):
+            return True
+        top = ax.title.get_window_extent(renderer).y1 if ax.get_title() else frame.y1
+        pad = 0.5 * 8. * fig.dpi / 72. # borderaxespad of the 8 point font
+        assert box.x0 == pytest.approx(frame.x0) and box.y0 == pytest.approx(top + pad)
+        return False
+    for t, kind in ((furnace, 'balanced'), (liquid, 'balanced'), (kemp, 'real'),
+                    (liquid, 'shifted')):
+        fig, ax = plot_composite_curves(t, kind=kind)
+        try:
+            assert clear_legend(fig, ax)
+            ours, = boxes(fig, [ax.get_legend()])
+            mpl_best, = boxes(fig, [ax.legend(loc='best', fontsize=8)])
+            assert ours.bounds == pytest.approx(mpl_best.bounds, abs=1e-6)
+        finally:
+            plt.close(fig)
+    for t in (furnace, liquid):
+        for size, columns in (((4., 3.), 1), ((10., 4.), 3)):
+            fig, axes = plt.subplots(1, columns, figsize=size, layout='constrained')
+            try:
+                ax = axes[1] if columns > 1 else axes
+                plot_composite_curves(t, kind='balanced', ax=ax)
+                labels = _gid_artists(ax, 'Utility:') + _gid_artists(ax, 'Fuel')
+                readable(fig, ax, labels, [line for line in ax.get_lines()
+                                           if 'balanced composite' in (line.get_gid() or '')],
+                         legend=False)
+                label_boxes = boxes(fig, labels)
+                assert all(not a.overlaps(b) for i, a in enumerate(label_boxes)
+                           for b in label_boxes[i + 1:])
+                assert clear_legend(fig, ax)
+            finally:
+                plt.close(fig)
+    for kind in ('real', 'shifted'):
+        fig, ax = plt.subplots(figsize=(3., 3.), layout='constrained')
+        try:
+            plot_composite_curves(liquid, kind=kind, ax=ax)
+            assert clear_legend(fig, ax)
+        finally:
+            plt.close(fig)
+    fig, ax = plt.subplots(figsize=(6., 4.), layout='constrained')
+    try:
+        plot_composite_curves(liquid, kind='real', ax=ax)
+        for x, ha in ((0.02, 'left'), (0.5, 'center'), (0.98, 'right')):
+            for y, va in ((0.03, 'bottom'), (0.5, 'center'), (0.97, 'top')):
+                ax.text(x, y, 'a note of the user', ha=ha, va=va, transform=ax.transAxes)
+        assert not clear_legend(fig, ax)
+        ax.set_title('composite curves')
+        assert not clear_legend(fig, ax)
+    finally:
+        plt.close(fig)
     # the grand composite curve at its default size: heats of six digits
     # [kJ/hr] in scientific notation, whose tick labels do not run together
     gcc_A = targets('test_targeting_plot_readable_gcc', REF_A, 10.)
