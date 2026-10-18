@@ -54,7 +54,7 @@ each of them changes.
      - Run the analysis on stream copies with ideal thermodynamics; the synthesized exchangers inherit that thermo. Defaults to False.
    * - ``cache_network``
      - bool
-     - Reuse the network configuration of the previous simulation when the set of units contributing heat utilities, ``stream_splitting`` and the explicit approach contributions (resolved per stream) are unchanged, updating only stream states and exchanger specifications: each process exchanger keeps the fraction of its stream's duty at which its enthalpy limit sat at synthesis (the splitters keep their branch fractions), and the utility exchangers bring every stream to its new outlet. The reused network is not planned again, so it need not be at MER for the new duties. Defaults to False.
+     - Reuse the network configuration of the previous simulation when the units contributing heat utilities (each as often as it gives a stream, as a unit in parallel does once per unit), ``stream_splitting`` and the explicit approach contributions (resolved per stream) are unchanged, updating only stream states and exchanger specifications: each process exchanger keeps the fraction of its stream's duty at which its enthalpy limit sat at synthesis (the splitters keep their branch fractions), and the utility exchangers bring every stream to its new outlet. The reused network is not planned again, so it need not be at MER for the new duties. Defaults to False.
    * - ``avoid_recycle``
      - bool
      - Never match the same hot/cold stream pair twice anywhere (on one side of the pinch or across the two), so that no two exchangers connect the same pair and form a recycle loop; this forbids the repeated matches some unsplit MER networks need. Defaults to False.

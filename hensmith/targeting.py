@@ -2788,6 +2788,40 @@ def _rebuilt_label(hxs, labels, units):
         if id(hx) not in at_hand: return label
     return None
 
+def _miscounted(hxs, labels, units, at_hand):
+    """
+    ``[(label, n, listed), ...]``, in order of first occurrence in `hxs`
+    (`labels` aligned with it): the exchangers of `hxs` that are among
+    `at_hand` (not rebuilt since, see `_rebuilt_label`) and give `n` of its
+    streams, one per time their heat utility was listed at the synthesis,
+    while the `heat_utilities` of `units` (a facility's units, from which
+    its synthesis takes the heat utilities) list a heat exchanger's heat
+    utility of theirs `listed` times now, with or without duty. biosteam
+    lists the heat utilities of a unit in parallel once per unit
+    (``Unit.parallel``, which a `biosteam.AbstractStirredTankReactor` sets
+    by its volume), so their number changes with the unit's size when the
+    unit is simulated alone; the streams stay one per unit at the facility's
+    last simulation.
+    """
+    given = {}
+    for hx, label in zip(hxs, labels):
+        given.setdefault(id(hx), [label, 0])[1] += 1
+    listed = {}
+    for unit in units:
+        for hu in unit.heat_utilities:
+            if hu.hxn_ok: listed[id(hu.unit)] = listed.get(id(hu.unit), 0) + 1
+    at_hand = {id(unit) for unit in at_hand}
+    return [(label, n, listed.get(key, 0))
+            for key, (label, n) in given.items()
+            if key in at_hand and listed.get(key, 0) != n]
+
+def _miscounted_names(miscounted):
+    """The streams of `miscounted` (see `_miscounted`) for a message, e.g.
+    ``"'R1 - heat_exchanger' 5 times, listed 2 times now"``."""
+    times = lambda n: f'{n} time{"" if n == 1 else "s"}'
+    return '; '.join(f'{label!r} {times(n)}, listed {times(m)} now'
+                     for label, n, m in miscounted)
+
 def _check_network(HXN, targets):
     """Raise a ValueError unless every stream of `HXN`'s network is that of
     an original exchanger still among the facility's units, their nested
@@ -2795,19 +2829,32 @@ def _check_network(HXN, targets):
     only (see `_rebuilt_label`; not one that its unit has rebuilt since, as a
     `biosteam.MultistageCompressor` simulated alone after a change of `pr`
     rebuilds its intercoolers, whose former objects keep their former,
-    consistent states), and enters and leaves the network at the end states
+    consistent states), every such exchanger gives as many streams as the
+    facility's units list its heat utility now (see `_miscounted`: not a
+    unit in parallel whose number has changed since), and every stream
+    enters and leaves the network at the end states
     of its curve in `targets` (which are of the units' current states): its
     copy of the real inlet where it enters the network, and the outlet of
     its last stage (the network's copies share the curves' thermodynamic
     basis)."""
-    label = _rebuilt_label(HXN.original_heat_exchangers, targets.labels,
-                           HXN._candidate_units())
+    hxs = HXN.original_heat_exchangers
+    units = list(HXN._get_units())
+    at_hand = HXN._candidate_units(units)
+    label = _rebuilt_label(hxs, targets.labels, at_hand)
     if label is not None:
         raise ValueError(f'the network of {HXN.ID} is of {label}, which is '
                          "no longer one of the facility's units nor an "
                          'auxiliary of one (rebuilt since the '
                          "facility's last simulation?): simulate the "
                          'system')
+    miscounted = _miscounted(hxs, targets.labels, units, at_hand)
+    if miscounted:
+        raise ValueError(f'the network of {HXN.ID} has a stream per heat '
+                         'utility its units listed at its last simulation, '
+                         'not as they list them now: '
+                         f'{_miscounted_names(miscounted)} (Unit.parallel '
+                         'changed since, its unit simulated alone?): '
+                         'simulate the system')
     for life_cycle, c, label in zip(HXN.stream_life_cycles, targets.curves,
                                     targets.labels):
         entry = life_cycle.entry
@@ -2934,11 +2981,15 @@ def network_report(HXN, targets=None, **options):
         If `targets` are not those of the facility's process streams in
         their current states (enthalpies at both ends, and pressure and
         flows at the inlet), if the network's streams do not enter and
-        leave it at those states or are of exchangers no longer among the
-        facility's units and their auxiliaries (a unit or a stream changed
+        leave it at those states, are of exchangers no longer among the
+        facility's units and their auxiliaries or are not as many as the
+        units list their heat utilities now (a unit or a stream changed
         since the facility's last simulation: a
         `biosteam.MultistageCompressor` simulated alone after a change of
-        `pr`, say, rebuilds its intercoolers), or for an invalid option.
+        `pr`, say, rebuilds its intercoolers, and a unit in parallel
+        simulated alone may change its number of units, ``Unit.parallel``,
+        whose heat utilities biosteam lists once per unit), or for an
+        invalid option.
     TypeError
         For an unknown option.
 

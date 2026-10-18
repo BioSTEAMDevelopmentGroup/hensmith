@@ -992,9 +992,12 @@ own utilities. If no process match was made at all, the facility reports zero
 capital and no utilities.
 
 **Reusing a network.** With ``cache_network=True`` a later simulation checks
-whether the set of units behind the heat utilities, and the explicit approach
-contributions they resolve to, are unchanged; if they are, the
-same network configuration is reused instead of being synthesized again. Each
+whether the units behind the heat utilities, each as often as it gives a
+stream (biosteam lists the heat utility of a unit in parallel once per unit,
+so a reactor whose ``parallel['self']`` changes with its volume changes the
+streams), and the explicit approach contributions they resolve to, are
+unchanged; if they are, the same network configuration is reused instead of
+being synthesized again. Each
 life cycle's first inlet is copied from the current stream, and each process
 exchanger keeps, as the enthalpy limit of its *must* stream (the hot stream
 above the pinch, the cold stream below it), the fraction of that stream's

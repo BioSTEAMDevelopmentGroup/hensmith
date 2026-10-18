@@ -2112,6 +2112,81 @@ def test_from_heat_utilities_of_units_in_parallel():
     info = HXN.synthesis_info
     assert (info['Q_hot_target'], info['Q_cold_target']) == (t.Q_hot, t.Q_cold)
 
+def test_facility_units_in_parallel_whose_number_changes():
+    # a fermentor sets its number of reactors in parallel by its volume, so
+    # a feed change changes the number of streams of its recirculation
+    # cooler. With cache_network, the network is synthesized again for the
+    # new number (it was reused for the former one, its loads those of the
+    # former number of reactors, while only the set of exchangers was
+    # compared); with the units simulated alone, the facility's streams stay
+    # one per reactor of its last simulation, which its targets warn of and
+    # its report refuses until the system is simulated
+    import thermosteam as tmo
+    glucose = tmo.Chemical('Glucose', phase='l', default=True)
+    test_hxn_targets.setup('test_targeting_parallel_changed',
+                           ['Water', 'Ethanol', 'CO2', glucose])
+    feed = bst.Stream('feed', Water=6000., Glucose=300., T=340.)
+    C0 = bst.HXutility('C0', ins=feed, T=305.15)
+    R1 = Fermentation('R1', ins=C0-0, outs=('vent', 'beer'),
+                      reactions=bst.ReactionSystem(
+                          bst.Reaction('Glucose -> 2Ethanol + 2CO2', 'Glucose', 0.9),
+                          basis='mol'))
+    H1 = bst.HXutility('H1', ins=R1-1, T=360.)
+    C2 = bst.HXutility('C2', ins=bst.Stream('cold', Water=3000., T=290.), T=320.)
+    units = [C0, R1, H1, C2]
+    sys, HXN = simulate_HXN(units, 5., name='sys_parallel_changed',
+                            cache_network=True)
+    hx = R1.heat_exchanger
+    count = lambda: HXN.original_heat_exchangers.count(hx)
+    N = R1.parallel['self']
+    assert N > 2 and count() == N
+    # the same number of reactors: the cached network is reused
+    network = HXN.HXN_sys
+    feed.F_mol *= 1.000001
+    simulate_strictly(sys)
+    assert R1.parallel['self'] == N and HXN.HXN_sys is network
+    # fewer reactors: synthesized again, as a facility without the cache
+    feed.F_mol *= 0.4
+    simulate_strictly(sys)
+    N = R1.parallel['self']
+    assert HXN.HXN_sys is not network and count() == N
+    cached = (HXN.actual_heat_util_load, HXN.actual_cool_util_load,
+              HXN.installed_costs['Heat exchangers'])
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        targets = HXN.targets()
+        network_report(HXN)
+    assert targets.labels.count('R1 - heat_exchanger') == N
+    HXN.cache_network = False
+    simulate_strictly(sys)
+    assert (HXN.actual_heat_util_load, HXN.actual_cool_util_load,
+            HXN.installed_costs['Heat exchangers']) == cached
+    assert HXN.targets().summary() == targets.summary()
+    # more reactors, the units simulated alone: the streams stay one per
+    # reactor of the facility's last simulation, at the new duty of each
+    feed.F_mol *= 2.5
+    for unit in units: unit.simulate()
+    assert R1.parallel['self'] > N
+    message = (rf"'R1 - heat_exchanger' {N} times, listed "
+               rf"{R1.parallel['self']} times now \(Unit.parallel changed "
+               r"since, its unit simulated alone\?\): simulate the system")
+    with pytest.warns(RuntimeWarning, match='the targets of HXN take a stream '
+                      'per heat utility .*: ' + message):
+        targets = HXN.targets()
+    assert targets.labels.count('R1 - heat_exchanger') == N
+    for args in ((HXN,), (HXN, targets)):
+        with pytest.raises(ValueError, match='the network of HXN has a stream '
+                           'per heat utility .*: ' + message):
+            network_report(*args)
+    # simulated again: one stream per reactor now, and no warning
+    N = R1.parallel['self']
+    simulate_strictly(sys)
+    assert count() == N
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        assert HXN.targets().labels.count('R1 - heat_exchanger') == N
+        network_report(HXN)
+
 def test_from_heat_utilities_reversed_stream():
     # a feed set hotter than its heater's outlet since the heater was
     # simulated: the stream from the inlet now to the outlet as last

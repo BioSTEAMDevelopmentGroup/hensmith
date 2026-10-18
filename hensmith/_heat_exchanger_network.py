@@ -18,6 +18,7 @@ Created on Sat Aug 22 21:58:19 2020
 """
 import heapq
 import weakref
+from collections import Counter
 from collections.abc import Mapping
 import biosteam as bst
 import numpy as np
@@ -376,14 +377,16 @@ class HeatExchangerNetwork(bst.Facility):
     its planned state, so the loops are at their fixed point after one
     pass).
 
-    With `cache_network`, a network is reused while the set of heat
-    exchangers, `stream_splitting` and the explicit approach contributions
-    (resolved per stream) are the same: each process exchanger
-    keeps, as its enthalpy limit, the share of the stream's duty it had at
-    synthesis (on the stream that the plan serves completely on that side of
-    the pinch; its partner transfers that share, but never past its own
-    outlet, and takes the rest to its utility), and the utility exchangers
-    bring every stream to its new outlet. The splitters keep their
+    With `cache_network`, a network is reused while the multiset of heat
+    exchangers (each as often as it gives a stream: biosteam lists the heat
+    utility of a unit in parallel once per unit, by ``Unit.parallel``, which
+    a reactor may set by its volume), `stream_splitting` and the explicit
+    approach contributions (resolved per stream) are the same: each process
+    exchanger keeps, as its enthalpy limit, the share of the stream's duty
+    it had at synthesis (on the stream that the plan serves completely on
+    that side of the pinch; its partner transfers that share, but never
+    past its own outlet, and takes the rest to its utility), and the
+    utility exchangers bring every stream to its new outlet. The splitters keep their
     fractions, so a branch exchanger's limit is its branch's fraction of the
     whole stream's. If the cached network does not reproduce the outlets, or
     its energy balance is off, the network is synthesized again.
@@ -713,11 +716,16 @@ class HeatExchangerNetwork(bst.Facility):
                 and getattr(self, '_synthesis_options', None)
                     == (self.stream_splitting,)):
             # Units are a stable key to compare whether system has changed
-            # configuration; the explicit contributions, resolved per
-            # stream, must be those the network was synthesized with.
+            # configuration, each as often as it gives a stream: biosteam
+            # lists the heat utility of a unit in parallel once per unit
+            # (Unit.parallel, which a reactor may set by its volume), so a
+            # change of that number changes the streams; the explicit
+            # contributions, resolved per stream, must be those the network
+            # was synthesized with.
             hu_by_unit = {hu.unit: hu for hu in hx_utils}
             use_cached_network = (
-                hu_by_unit.keys() == set(self.original_heat_exchangers)
+                Counter([hu.unit for hu in hx_utils])
+                    == Counter(self.original_heat_exchangers)
                 and getattr(self, '_resolved_contributions', None) == (
                     None if value_of is None else tuple(
                         value_of[id(hu_by_unit[hx])]
@@ -1092,6 +1100,13 @@ class HeatExchangerNetwork(bst.Facility):
             auxiliaries (rebuilt since the facility's last simulation, see
             Notes): the targets are of its former state.
         RuntimeWarning
+            After a simulation, if an exchanger gives more or fewer streams
+            than the facility's units list its heat utility now: a unit in
+            parallel whose number (``Unit.parallel``, which a reactor may
+            set by its volume) has changed since, simulated alone (see
+            Notes). The targets keep a stream per unit of the facility's
+            last simulation.
+        RuntimeWarning
             If the first inlet and outlet of a stream's exchanger differ in
             flow (``ins[0].mol`` and ``outs[0].mol``) by more than 1 % of
             the larger: its inlet has changed since its unit was simulated
@@ -1137,7 +1152,11 @@ class HeatExchangerNetwork(bst.Facility):
         meanwhile). Each stream runs from its exchanger's inlet now to its
         outlet as its unit last left it: after a feed or another stream
         changes, simulate the system before targeting (or the units alone,
-        which gives the targets of the process now). A stream whose inlet
+        which gives the targets of the process now, unless a unit in
+        parallel changes its number of units: biosteam lists its heat
+        utilities once per unit, and the streams stay one per unit at the
+        facility's last simulation, with a RuntimeWarning;
+        `hensmith.targeting.network_report` raises). A stream whose inlet
         has changed in flow meanwhile warns (see Warns); a change of
         temperature alone keeps the flows equal and warns of nothing, its
         targets being right only if its unit sets its outlet by
@@ -1182,14 +1201,21 @@ class HeatExchangerNetwork(bst.Facility):
         <PinchTargets: 4 streams, T_min_app = 20 K, Q_hot = 4.834e+05 kJ/hr, Q_cold = 8.658e+05 kJ/hr>
 
         """
-        from .targeting import _warn_stale
-        targets, rebuilt, stale = self._pinch_targets(T_min_app)
+        from .targeting import _warn_stale, _miscounted_names
+        targets, rebuilt, miscounted, stale = self._pinch_targets(T_min_app)
         if rebuilt is not None:
             warn(f'the targets of {self.ID} are of the former state of '
                  f"{rebuilt}, which is no longer one of the facility's units "
                  "nor an auxiliary of one (rebuilt since the facility's last "
                  'simulation?): simulate the system for those of the process '
                  'now', RuntimeWarning, stacklevel=2)
+        if miscounted:
+            warn(f'the targets of {self.ID} take a stream per heat utility '
+                 "the facility's units listed at its last simulation, not "
+                 'as they list them now: '
+                 f'{_miscounted_names(miscounted)} (Unit.parallel changed '
+                 'since, its unit simulated alone?): simulate the system for '
+                 'those of the process now', RuntimeWarning, stacklevel=2)
         _warn_stale(stale, f' of {self.ID}')
         return targets
 
@@ -1197,14 +1223,18 @@ class HeatExchangerNetwork(bst.Facility):
         """`targets` (see there), the label of the first of their streams
         whose exchanger is no longer among the facility's units, their
         nested auxiliaries and the exchangers they hold through their heat
-        utilities only (rebuilt since the last simulation), or None, and
-        the labels of the streams whose exchanger's inlet has changed in
-        flow since its unit was simulated (see
-        `hensmith.targeting._stale_labels`). Both are None and empty
-        before a simulation, whose targets,
-        `PinchTargets.from_heat_utilities`, warn of the latter
-        themselves."""
-        from .targeting import PinchTargets, _rebuilt_label, _stale_labels
+        utilities only (rebuilt since the last simulation), or None, the
+        exchangers of the others that give more or fewer streams than the
+        facility's units list their heat utility now (a unit in parallel
+        whose number has changed since, see
+        `hensmith.targeting._miscounted`), and the labels of the streams
+        whose exchanger's inlet has changed in flow since its unit was
+        simulated (see `hensmith.targeting._stale_labels`). They are None
+        and empty before a simulation, whose targets,
+        `PinchTargets.from_heat_utilities`, take the heat utilities as
+        listed now and warn of the last themselves."""
+        from .targeting import (PinchTargets, _rebuilt_label, _stale_labels,
+                                _miscounted)
         if T_min_app is None: T_min_app = self.T_min_app
         if (hasattr(self, 'original_heat_exchangers')
                 and hasattr(self, 'original_heat_utils')):
@@ -1242,6 +1272,7 @@ class HeatExchangerNetwork(bst.Facility):
             targets.key_units = key_units
             targets.system = self.system
             return (targets, _rebuilt_label(hxs, targets.labels, key_units),
+                    _miscounted(hxs, targets.labels, units, key_units),
                     _stale_labels(hxs, targets.labels))
         if self.system is None and not self.units:
             raise RuntimeError('simulate the system (or give the facility its '
@@ -1253,7 +1284,7 @@ class HeatExchangerNetwork(bst.Facility):
             hx_utils, T_min_app, self._network_contributions(hx_utils, units),
             self.force_ideal_thermo, self.sort_hus_by_T, key_units=units)
         targets.system = self.system
-        return targets, None, []
+        return targets, None, [], []
 
     def get_original_hxs_associated_with_streams(self): # pragma: no cover
         original_units = self.system.units

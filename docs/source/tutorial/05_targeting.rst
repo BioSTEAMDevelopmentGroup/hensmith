@@ -64,8 +64,12 @@ can differ from the cached network's. Each stream runs from its unit's inlet
 now to its outlet as the unit was last simulated, so after a feed changes,
 simulate the system (or the units) before targeting: a stream whose inlet has
 changed in flow since warns that its targets mix the new inlet with the former
-outlet, a state of no process. The same object can be built without a
-facility, from the heat utilities of heat exchangers with
+outlet, a state of no process. The streams themselves are those of the
+facility's last simulation, one per heat utility its units listed then: a unit
+in parallel simulated alone that changes its number of units (a fermentor's
+``parallel['self']``, set by its volume) warns, as biosteam lists its heat
+utilities once per unit, until the system is simulated. The same object can be
+built without a facility, from the heat utilities of heat exchangers with
 :meth:`PinchTargets.from_heat_utilities <hensmith.PinchTargets.from_heat_utilities>`
 (as the trade-off example below does) or from streams as
 :func:`~hensmith.problem_table` takes them. The facility's selection,

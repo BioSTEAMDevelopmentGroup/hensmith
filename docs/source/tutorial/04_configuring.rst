@@ -301,7 +301,8 @@ stream that finishes on process heat alone carries no utility symbol.
 simulations, which is worth doing when the same system is simulated many times
 with slightly different inputs, as in a Monte Carlo or a sensitivity analysis.
 When it is on and a network has already been synthesized, the units owning the
-current heat utilities are compared with the exchangers behind the cached one,
+current heat utilities are compared with the exchangers behind the cached one
+(each as often as it gives a stream, as a unit in parallel does once per unit),
 and the explicit approach contributions, resolved to one value per stream,
 with those the cached network was synthesized with; if both match, the cached
 network is kept and only the stream states
