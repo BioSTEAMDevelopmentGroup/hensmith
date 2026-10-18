@@ -2017,10 +2017,12 @@ def test_from_heat_utilities_takes_exchangers():
     selected = bst.process_tools.heat_exchanger_utilities_from_units(units)
     assert [hu.unit for hu in selected] == [H, C]
     t = PinchTargets.from_heat_utilities(sorted(selected, key=lambda hu: hu.duty), 10.)
-    # a heat utility given twice would count its stream twice
+    # a heat utility given twice (more often than its unit lists it) would
+    # count its stream twice
     for given in (selected + selected[:1], selected[:1] + selected):
-        with pytest.raises(ValueError, match=r"the stream of 'H' would count "
-                                             r"once per heat utility of its unit"):
+        with pytest.raises(ValueError, match=r"the heat utilities of 'H' \(2 given, 1 "
+                                             r"listed\) are given more often than "
+                                             r"their units.*heat_exchanger_utilities"):
             PinchTargets.from_heat_utilities(given, 10.)
     HXN = HeatExchangerNetwork('HXN', T_min_app=10., units=units)
     facility = HXN.targets()
@@ -2032,6 +2034,118 @@ def test_from_heat_utilities_takes_exchangers():
     same = PinchTargets.from_heat_utilities(
         [idle, *sorted(selected, key=lambda hu: hu.duty)], 10.)
     assert same.labels == t.labels and (same.Q_hot, same.Q_cold) == (t.Q_hot, t.Q_cold)
+
+class Fermentation(bst.AbstractStirredTankReactor):
+    """biosteam's own example of a stirred-tank reactor (the
+    ContinuousFermentation of its docstring): in parallel, ``parallel['self']``
+    reactors, each with a recirculation cooler (its auxiliary
+    ``heat_exchanger``, hxn_ok) at 1/N of the duty."""
+    _N_ins = 1
+    _N_outs = 2
+    T_default = 32. + 273.15
+    P_default = 101325.
+    tau_default = 8.
+
+    def _run(self):
+        vent, effluent = self.outs
+        effluent.mix_from(self.ins, energy_balance=False)
+        self.reactions(effluent)
+        effluent.T = vent.T = self.T
+        effluent.P = vent.P = self.P
+        vent.phase = 'g'
+        vent.empty()
+        vent.receive_vent(effluent, energy_balance=False)
+
+def test_from_heat_utilities_of_units_in_parallel():
+    # biosteam lists the heat utility of a unit in parallel once per unit in
+    # its owner's heat_utilities, and so in its selection: the synthesis
+    # takes it as a stream per reactor, and so do the targets of the
+    # selection and those of a facility before any simulation (which take
+    # the selection), equal to the facility's after its simulation
+    import thermosteam as tmo
+    glucose = tmo.Chemical('Glucose', phase='l', default=True)
+    test_hxn_targets.setup('test_targeting_parallel', ['Water', 'Ethanol', 'CO2', glucose])
+    feed = bst.Stream('feed', Water=6000., Glucose=300., T=340.)
+    C0 = bst.HXutility('C0', ins=feed, T=305.15)
+    R1 = Fermentation('R1', ins=C0-0, outs=('vent', 'beer'),
+                      reactions=bst.ReactionSystem(
+                          bst.Reaction('Glucose -> 2Ethanol + 2CO2', 'Glucose', 0.9),
+                          basis='mol'))
+    H1 = bst.HXutility('H1', ins=R1-1, T=360.)
+    units = [C0, R1, H1]
+    plain = bst.System.from_units('plain', units=units)
+    plain.simulate()
+    N = R1.parallel['self']
+    hu = R1.heat_exchanger.heat_utilities[0]
+    assert N > 1 and hu.hxn_ok and hu.duty < 0.
+    assert [h is hu for h in R1.heat_utilities] == [True] * N
+    selected = bst.process_tools.heat_exchanger_utilities_from_units(units)
+    assert sum(h is hu for h in selected) == N
+    with warnings.catch_warnings():
+        warnings.simplefilter('error')
+        t = PinchTargets.from_heat_utilities(sorted(selected, key=lambda h: h.duty), 10.,
+                                             key_units=units)
+        preview = HeatExchangerNetwork('preview', T_min_app=10., units=units).targets()
+    assert t.labels.count('R1 - heat_exchanger') == N
+    assert preview.labels == t.labels
+    assert (preview.Q_hot, preview.Q_cold) == (t.Q_hot, t.Q_cold)
+    # each reactor's cooling counts: the reactor's whole duty, N times one
+    # recirculation cooler's
+    dH = R1.heat_exchanger.outs[0].H - R1.heat_exchanger.ins[0].H
+    alone = PinchTargets.from_heat_utilities([h for h in selected if h is not hu], 10.)
+    assert t.Q_cold - alone.Q_cold == pytest.approx(-N * dH, rel=1e-6)
+    # the heat utility given more often than the reactor lists it: a unit
+    # and its auxiliary unit both selected
+    overlapping = bst.process_tools.heat_exchanger_utilities_from_units(
+        [*units, R1.heat_exchanger])
+    with pytest.raises(ValueError, match=r"the heat utilities of 'R1 - heat_exchanger' "
+                                         rf"\({N + 1} given, {N} listed\)"):
+        PinchTargets.from_heat_utilities(overlapping, 10., key_units=units)
+    # the auxiliary unit alone: its own single heat utility, one stream
+    single = PinchTargets.from_heat_utilities(R1.heat_exchanger.heat_utilities, 10.)
+    assert single.labels == ['R1 - heat_exchanger']
+    # the facility's synthesis takes them alike
+    sys, HXN = simulate_HXN(units, 10., name='sys_parallel')
+    facility = HXN.targets()
+    assert facility.labels == preview.labels
+    assert (facility.Q_hot, facility.Q_cold) == (preview.Q_hot, preview.Q_cold)
+    info = HXN.synthesis_info
+    assert (info['Q_hot_target'], info['Q_cold_target']) == (t.Q_hot, t.Q_cold)
+
+def test_from_heat_utilities_reversed_stream():
+    # a feed set hotter than its heater's outlet since the heater was
+    # simulated: the stream from the inlet now to the outlet as last
+    # simulated is cooled, against its heat utility, which heats. The error
+    # says so in terms of the heat utility (not of is_hot, which the caller
+    # never gave); the warning of a changed flow comes before it
+    test_hxn_targets.setup('test_targeting_reversed')
+    a = bst.Stream('a', Water=100., T=300.)
+    H1 = bst.HXutility('H1', ins=a, T=350.)
+    C1 = test_hxn_targets.utility_hx('C1', 370., 101325., 'l', 310., Water=100.)
+    H1.simulate()
+    hus = [H1.heat_utilities[0], C1.heat_utilities[0]]
+    a.T = 360.
+    message = (r"the heat utility of 'H1' heats \(hu.duty = \+\d+ kJ/hr\), but its "
+               r"stream, from its unit's inlet now to its outlet as last simulated, "
+               r"is cooled \(-\d+(\.\d+)? kJ/hr\): its inlet has changed since its "
+               r"unit was simulated")
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        with pytest.raises(ValueError, match=message) as error:
+            PinchTargets.from_heat_utilities(hus, 10.)
+    assert 'is_hot' not in str(error.value)
+    assert not [x for x in w if 'differ in flow' in str(x.message)]
+    a.imol['Water'] = 120.
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        with pytest.raises(ValueError, match=message):
+            PinchTargets.from_heat_utilities(hus, 10.)
+    assert [str(x.message)[:43] for x in w if 'differ in flow' in str(x.message)] == [
+        "the inlet and outlet of 'H1' differ in flow"]
+    # simulated again: a cooler now
+    H1.simulate()
+    t = PinchTargets.from_heat_utilities([H1.heat_utilities[0], hus[1]], 10.)
+    assert t.labels == ['H1', 'C1'] and list(t.is_hot) == [True, True]
 
 def test_from_heat_utilities_after_replaced_heat_utilities(kemp_hxn, kemp_hxn_replaced):
     # biosteam's selection after a simulation with

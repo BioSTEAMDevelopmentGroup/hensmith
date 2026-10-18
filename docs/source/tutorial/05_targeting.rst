@@ -72,9 +72,14 @@ facility, from the heat utilities of heat exchangers with
 ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``, is the
 one to give it: a heat utility that a unit adds for itself (a reactor's or a
 heated mixer's, ``hu.hxn_ok`` False) raises a ``ValueError``, as its unit's
-first inlet and outlet need not be the stream it heats or cools, and so does
-a heat utility given twice (as selections from overlapping unit lists give
-it), whose stream would count twice. Given
+first inlet and outlet need not be the stream it heats or cools. A heat
+utility counts as a stream each time it is given, as in the synthesis:
+biosteam lists the heat utility of a unit in parallel once per unit (a
+fermentor's recirculation cooler, for one, once per reactor of its
+``parallel['self']``), and so does the selection. One given more often than
+its unit and owners list it, as selections from overlapping unit lists (a
+unit and an auxiliary unit of it) give it, raises a ``ValueError``: its
+stream would count once more per extra one. Given
 ``key_units=sys.units`` too, the keys of ``approach_contributions`` and of
 ``h`` may name any unit, as the facility's may: ``'K1'`` then covers the
 intercoolers of a ``biosteam.MultistageCompressor`` K1, which builds them

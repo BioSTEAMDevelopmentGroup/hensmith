@@ -36,7 +36,7 @@ from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
     _check_key_levels, _nearest_key_value, _key_universe, _unknown_keys,
-    _unknown_key_hints, _held_owners, _top, _with_auxiliaries)
+    _unknown_key_hints, _held_owners, _parent, _top, _with_auxiliaries)
 
 __all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
            'plot_composite_curves', 'plot_grand_composite_curve',
@@ -313,6 +313,33 @@ def _isolated_pricing(agents):
         for a, dump in dumps.values(): a.utility_stream_dump = dump
         if previous is missing: flowsheets.pop(ID, None)
         else: flowsheets[ID] = previous
+
+def _overcounted_units(hus, owners=None):
+    """
+    The units given more heat utilities with duty in `hus` than they hold,
+    ``[(unit, given, listed), ...]`` in order of first occurrence: those
+    whose heat utilities `hus` holds more often than any unit on their
+    owner chain (`unit` and up along `hensmith.hxn_synthesis._parent` with
+    `owners`) lists them in its `heat_utilities`. biosteam lists the heat
+    utilities of a unit in parallel (``Unit.parallel``, as a
+    `biosteam.AbstractStirredTankReactor` sets for its recirculation heat
+    exchanger) once per unit in parallel in its owner's, each a stream of
+    the synthesis; a heat utility given more often than that is given
+    twice, as by selections from overlapping unit lists.
+    """
+    given = {}
+    for hu in hus:
+        if hu.duty: given.setdefault(id(hu.unit), [hu.unit, 0])[1] += 1
+    over = []
+    for unit, n in given.values():
+        if n == 1: continue
+        listed, above = 0, unit
+        while above is not None:
+            listed = max(listed, sum([hu.unit is unit and bool(hu.duty)
+                                      for hu in above.heat_utilities]))
+            above = _parent(above, owners)
+        if n > listed: over.append((unit, n, listed))
+    return over
 
 def _duty_off_stream(hu):
     """Whether the duty of the heat exchanger's heat utility `hu`
@@ -1084,12 +1111,16 @@ class PinchTargets:
         dH = np.array([c.H_out - c.H_in for c in curves])
         tol = 1e-9 * float(np.abs(dH).sum())
         for j in np.flatnonzero(np.where(is_hot, dH > tol, dH < -tol)):
-            raise ValueError(f'stream {labels[j]!r} is '
-                             f"{'heated' if dH[j] > 0. else 'cooled'} "
-                             f'({dH[j]:+.6g} kJ/hr) but marked '
-                             f"{'hot' if is_hot[j] else 'cold'}: is_hot must "
-                             'be True for a cooled stream and False for a '
-                             'heated one')
+            error = ValueError(f'stream {labels[j]!r} is '
+                               f"{'heated' if dH[j] > 0. else 'cooled'} "
+                               f'({dH[j]:+.6g} kJ/hr) but marked '
+                               f"{'hot' if is_hot[j] else 'cold'}: is_hot "
+                               'must be True for a cooled stream and False '
+                               'for a heated one')
+            # which stream, for `from_heat_utilities` to say it in terms of
+            # its heat utility, which gives its side
+            error._hensmith_reversed = (int(j), float(dH[j]))
+            raise error
         self.T_min_app = T_min_app
         self.approach_contributions = x
         self.is_hot = is_hot
@@ -1134,7 +1165,13 @@ class PinchTargets:
             ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``
             (those a heat exchanger network may take, ``hu.hxn_ok``, as
             `HeatExchangerNetwork` selects them), not ``sys.heat_utilities``
-            (sums by agent, of no unit). Zero-duty ones are dropped. After a
+            (sums by agent, of no unit). Zero-duty ones are dropped. Each
+            counts once per occurrence, a stream each, as in the synthesis:
+            biosteam lists the heat utility of a unit in parallel
+            (``Unit.parallel``, as the recirculation heat exchanger of a
+            `biosteam.AbstractStirredTankReactor`, such as a fermentor,
+            with ``parallel['self']`` reactors) once per unit in its
+            owner's ``heat_utilities``, and so in this selection. After a
             simulation of a `HeatExchangerNetwork` with
             ``replace_unit_heat_utilities=True`` they hold the network's
             utilities, not the process duties, and those of the streams it
@@ -1181,10 +1218,17 @@ class PinchTargets:
             heat exchanger's (``hu.hxn_ok`` False, as for the heat utilities
             that reactors, mixers or compressors add with
             ``Unit.add_heat_utility``: their unit's first inlet and outlet
-            need not be the stream they heat or cool), or if two with duty
-            are of the same unit (the same heat utility given twice, as by
-            selections from overlapping unit lists), whose stream would
-            count once per heat utility.
+            need not be the stream they heat or cool). If the heat utilities
+            with duty of a unit are given more often than its
+            ``heat_utilities`` or those of any of its owners list them, as
+            when selections from overlapping unit lists (such as a unit and
+            an auxiliary unit of it) give the same heat utility twice: its
+            stream would count once more per extra one. If the stream of a
+            heat utility, from its unit's inlet now to its outlet as last
+            simulated, runs against the heat utility (cooled for a heating
+            one, or heated for a cooling one): its inlet has changed since
+            its unit was simulated (as the second warning below, given
+            before this error, may say too).
 
         Warns
         -----
@@ -1236,18 +1280,27 @@ class PinchTargets:
                              f'(hu.hxn_ok), not those of {names}, whose first '
                              'inlet and outlet need not be the stream they '
                              f'heat or cool: {selection}')
-        seen = set()
-        repeated = [hu for hu in hus if hu.duty and (id(hu.unit) in seen
-                                                     or seen.add(id(hu.unit)))]
-        if repeated:
-            names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
-                                            for hu in repeated))
-            raise ValueError(f'the stream of {names} would count once per '
-                             'heat utility of its unit given (the same heat '
-                             'utility given twice, as by selections from '
-                             'overlapping unit lists, such as a unit and an '
-                             'auxiliary unit of it): give each heat '
-                             "exchanger's heat utility once")
+        if key_units is not None: key_units = _with_auxiliaries(key_units)
+        holders = _held_owners([hu.unit for hu in hus] + (key_units or []))
+        # a heat utility counts once per occurrence, as in the synthesis
+        # (biosteam repeats those of a unit in parallel): only more
+        # occurrences than its unit and owners list are given twice
+        over = _overcounted_units(hus, holders)
+        if over:
+            names = ', '.join(f'{_unit_label(unit, holders)!r} ({n} given, '
+                              f'{m} listed)' for unit, n, m in over)
+            raise ValueError(f'the heat utilities of {names} are given more '
+                             'often than their units, or the owners of '
+                             'these, list them in their heat_utilities (which '
+                             'repeat those of a unit in parallel, by '
+                             'Unit.parallel, once per unit, each a stream): '
+                             'their streams would count once more per extra '
+                             'one, as when selections from overlapping unit '
+                             'lists (such as a unit and an auxiliary unit of '
+                             'it) give the same heat utility twice; give the '
+                             'heat utilities of units none of which owns '
+                             'another, such as bst.process_tools.heat_'
+                             'exchanger_utilities_from_units(sys.units)')
         # only those that a network has written over: a duty may differ from
         # its stream's for another reason (biosteam's MESHDistillation total
         # condenser, 0.1 % off), which the targets, the streams', ignore
@@ -1268,7 +1321,6 @@ class PinchTargets:
                   'streams it serves completely have none and are left out; '
                   f"take {' or '.join(f'{ID}.targets()' for ID in IDs)} "
                   'instead')
-        if key_units is not None: key_units = _with_auxiliaries(key_units)
         values = _explicit_contributions(hus, approach_contributions, T_min_app,
                                          key_units)
         arranged, N_heating = _arrange_heat_utilities(hus, sort_hus_by_T)
@@ -1278,13 +1330,30 @@ class PinchTargets:
             value_of = dict(zip(map(id, hus), values))
             contributions = [value_of[id(hu)] for hu in arranged]
         is_hot = [False] * N_heating + [True] * (len(arranged) - N_heating)
-        holders = _held_owners([hu.unit for hu in hus] + (key_units or []))
-        self = cls._from_exchangers([hu.unit for hu in arranged], is_hot,
-                                    T_min_app, contributions,
-                                    force_ideal_thermo, None, arranged,
-                                    holders)
+        hxs = [hu.unit for hu in arranged]
+        labels = [_unit_label(hx, holders) for hx in hxs]
+        # before the targets, whose streams a changed inlet may reverse
+        _warn_stale(_stale_labels(hxs, labels))
+        try:
+            self = cls._from_exchangers(hxs, is_hot, T_min_app, contributions,
+                                        force_ideal_thermo, labels, arranged,
+                                        holders)
+        except ValueError as error:
+            reversed_ = getattr(error, '_hensmith_reversed', None)
+            if reversed_ is None: raise
+            j, dH = reversed_
+            hu = arranged[j]
+            raise ValueError(
+                f'the heat utility of {labels[j]!r} '
+                f"{'heats' if hu.duty > 0. else 'cools'} (hu.duty = "
+                f'{hu.duty:+.6g} kJ/hr), but its stream, from its unit\'s '
+                'inlet now to its outlet as last simulated, is '
+                f"{'heated' if dH > 0. else 'cooled'} ({dH:+.6g} kJ/hr): its "
+                'inlet has changed since its unit was simulated (a feed '
+                'changed, or a recycle converged loosely?); simulate the '
+                'system (or its units) first, converging any recycle more '
+                'tightly') from None
         self.key_units = key_units
-        _warn_stale(_stale_labels(self.units, self.labels))
         return self
 
     @classmethod
