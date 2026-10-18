@@ -1588,6 +1588,61 @@ def test_utilities_of_another_shift():
     utilities = t.at(0.).utility_targets()
     assert t.units_target(utilities) == t.units_target(t.utility_targets())
 
+def test_h_utilities_keys_of_agents_serving_nothing():
+    # a custom agent serves 10 kW at T_min_app = 20 K and nothing at 5 K
+    # (the curves are 10 K apart): its ID keys h_utilities of area_target
+    # and capital_cost_target at both once the agents the utilities were
+    # priced with are passed in agents, as summary takes them from its
+    # heating_agents and cooling_agents; without them, only where it serves
+    t = targets('test_targeting_key_agents', [('H1', 450., 300., 1.),
+                                             ('C1', 290., 440., 1.)], 10.)
+    LP = agent('low_pressure_steam')
+    oil = bst.UtilityAgent('test_targeting_key_oil', Water=1, T=600., P=1e7,
+                           phase='g', thermo=bst.HeatUtility.thermo_water,
+                           regeneration_price=.5)
+    by_ID_ = {'test_targeting_key_oil': .3}
+    by_agent = {oil: .3}
+    served, idle = t.at(20.), t.at(5.)
+    for at in (served, idle):
+        utilities = at.utility_targets([LP, oil])
+        area = at.area_target(utilities, h_utilities=by_agent)
+        capital = at.capital_cost_target(utilities, h_utilities=by_agent)
+        for agents in ([LP, oil], ['low_pressure_steam', oil], (oil,)):
+            assert at.area_target(utilities, h_utilities=by_ID_,
+                                  agents=agents) == area
+            assert at.capital_cost_target(utilities, h_utilities=by_ID_,
+                                          agents=agents) == capital
+            # they change nothing else
+            assert (at.area_target(utilities, agents=agents)
+                    == at.area_target(utilities))
+        summary = at.summary(heating_agents=[LP, oil], h_utilities=by_ID_)
+        assert (summary['area'], summary['installed_cost']) == (
+            area, capital['installed_cost'])
+    utilities = served.utility_targets([LP, oil])
+    assert 'test_targeting_key_oil' in [u.ID for u in utilities]
+    assert (served.area_target(utilities, h_utilities=by_ID_)
+            == served.area_target(utilities, h_utilities=by_agent)
+            > served.area_target(utilities))
+    assert idle.utility_targets([LP, oil]) == []
+    message = ("h_utilities keys that name no agent of the utilities, of "
+               "agents, or of biosteam's lists: 'test_targeting_key_oil' "
+               r'\(key another agent by the UtilityAgent itself\)')
+    for call in (idle.area_target, idle.capital_cost_target):
+        with pytest.raises(ValueError, match=message):
+            call([], h_utilities=by_ID_)
+        with pytest.raises(ValueError, match=message):
+            call([], h_utilities=by_ID_, agents=[LP])
+    with pytest.raises(ValueError, match='of heating_agents or cooling_agents, or'):
+        idle.summary(heating_agents=[LP], h_utilities=by_ID_)
+    for agents, error, match in (
+            ('low_pressure_steam', TypeError, 'agents must be a sequence'),
+            (oil, TypeError, 'agents must be a sequence'),
+            (['steam'], ValueError, "no agent 'steam' in bst.HeatUtility"),
+            ([1], TypeError, 'agents must be UtilityAgent objects or their IDs')):
+        for call in (idle.area_target, idle.capital_cost_target):
+            with pytest.raises(error, match=match):
+                call([], agents=agents)
+
 def test_bath_independent_integration(quickstart):
     # reference A: the streams plus the four utilities
     t = targets('test_targeting_integration_A', REF_A, 10.)

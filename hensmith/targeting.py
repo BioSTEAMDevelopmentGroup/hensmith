@@ -79,6 +79,9 @@ _SUMMARY_OPTIONS = ('heating_agents', 'cooling_agents', 'h', 'h_utilities',
                     'P', 'heat_exchanger_type', 'material', 'interest',
                     'years', 'operating_hours', 'tea')
 
+#: The options of `PinchTargets.summary` whose agents `h_utilities` may key.
+_OPTION_AGENTS = 'heating_agents or cooling_agents'
+
 UtilityTarget = namedtuple('UtilityTarget', (
     'ID', 'agent', 'heating', 'level', 'duty', 'utility_duty', 'flow', 'cost',
     'T_in', 'T_out', 'T_utility_in', 'T_utility_out', 'shift'),
@@ -358,17 +361,18 @@ def _film_value(x, label):
         if math.isfinite(value) and value > 0.: return value
     raise ValueError(f'{label} must be a finite number > 0 kW/m2/K, not {x!r}')
 
-def _utility_films(utilities, h_utilities, agents=()):
+def _utility_films(utilities, h_utilities, agents=(), where='agents'):
     """
     The film coefficient [kW/m²/K] of each of `utilities` from
     `h_utilities`: None (`_H_DEFAULT`), a number, or a mapping from agent
-    IDs or agents to numbers (`_H_DEFAULT` for an agent it leaves out). A
-    key must name an agent of `utilities`, of `agents` or of biosteam's
-    default lists.
+    IDs or agents to numbers (`_H_DEFAULT` for an agent it leaves out). An
+    ID key must name an agent of `utilities`, of `agents` (the option
+    `where` names in the error) or of biosteam's default lists.
     """
-    return _agent_films([u.agent for u in utilities], h_utilities, agents)
+    return _agent_films([u.agent for u in utilities], h_utilities, agents,
+                        where)
 
-def _agent_films(of, h_utilities, agents=()):
+def _agent_films(of, h_utilities, agents=(), where='agents'):
     """`_utility_films` of the agents `of` (None for an unserved utility)."""
     if h_utilities is None: return [_H_DEFAULT] * len(of)
     if not isinstance(h_utilities, Mapping):
@@ -394,8 +398,10 @@ def _agent_films(of, h_utilities, agents=()):
                              f'{ID!r} different values: {other_value!r} and '
                              f'{value!r}')
     if unknown:
-        raise ValueError('h_utilities keys that name no agent: '
-                         f"{', '.join(map(repr, unknown))}")
+        raise ValueError('h_utilities keys that name no agent of the '
+                         f"utilities, of {where}, or of biosteam's lists: "
+                         f"{', '.join(map(repr, unknown))} (key another agent "
+                         'by the UtilityAgent itself)')
     return [values[a.ID][1] if a is not None and a.ID in values
             else _H_DEFAULT for a in of]
 
@@ -596,6 +602,31 @@ def _agents(agents, heating):
         if not right:
             raise ValueError(f'{agent.ID!r} is not a {kind} agent; pass it in '
                              f'{other}_agents')
+        resolved.append(agent)
+    return resolved
+
+def _key_agents(agents):
+    """The `agents` of `PinchTargets.area_target` as a list (None is
+    none), each ID resolved among biosteam's heating and cooling agents as
+    they are now; a ValueError for an unknown ID."""
+    if agents is None: return []
+    if isinstance(agents, (str, bst.UtilityAgent)):
+        raise TypeError('agents must be a sequence of agents (or their IDs), '
+                        f'not {type(agents).__name__!r}')
+    known = [*bst.HeatUtility.heating_agents, *bst.HeatUtility.cooling_agents]
+    resolved = []
+    for agent in agents:
+        if isinstance(agent, str):
+            match = [a for a in known if a.ID == agent]
+            if not match:
+                raise ValueError(
+                    f'no agent {agent!r} in bst.HeatUtility.heating_agents or '
+                    'cooling_agents; pass the UtilityAgent itself for another '
+                    'one')
+            agent = match[0]
+        elif not isinstance(agent, bst.UtilityAgent):
+            raise TypeError('agents must be UtilityAgent objects or their IDs '
+                            f'(str), not {type(agent).__name__!r} ({agent!r})')
         resolved.append(agent)
     return resolved
 
@@ -1907,7 +1938,8 @@ class PinchTargets:
             utilities, 1. / h, [1. / x for x in h_utilities])
         return _bath(hot, cold)
 
-    def area_target(self, utilities=None, h=None, h_utilities=None):
+    def area_target(self, utilities=None, h=None, h_utilities=None,
+                    agents=None):
         """
         The area target [m²] of vertical heat transfer between the balanced
         composite curves: Bath's formula (see Notes of the class).
@@ -1939,8 +1971,17 @@ class PinchTargets:
             for every stream.
         h_utilities : float or Mapping, optional
             Film coefficient of the utilities [kW/m²/K]: one for all, or a
-            mapping from agent IDs or agents (the others take 1). Defaults
-            to 1.
+            mapping from agent IDs or agents (the others take 1). An ID must
+            name an agent of `utilities`, of `agents` or of biosteam's
+            lists, or a ValueError is raised: key another agent by the
+            UtilityAgent itself, or pass it in `agents`. Defaults to 1.
+        agents : Sequence[UtilityAgent or str], optional
+            Agents whose IDs `h_utilities` may key as well, or the IDs of
+            agents of biosteam's lists (which it may key anyway): the
+            `heating_agents` and `cooling_agents` that `utilities` were
+            priced with, so that one `h_utilities` serves at every
+            `T_min_app`, an agent that serves nothing at one included, as
+            for `summary`. They change nothing else. Defaults to none.
 
         Returns
         -------
@@ -1952,7 +1993,8 @@ class PinchTargets:
         """
         if utilities is None: utilities = self.utility_targets()
         return self._area(utilities, self._film_coefficients(h),
-                          _utility_films(utilities, h_utilities))
+                          _utility_films(utilities, h_utilities,
+                                         _key_agents(agents)))
 
     def units_target(self, utilities=None):
         """
@@ -2042,7 +2084,7 @@ class PinchTargets:
 
     def capital_cost_target(self, utilities=None, h=None, h_utilities=None,
                             P=101325., heat_exchanger_type='Floating head',
-                            material='Carbon steel/carbon steel'):
+                            material='Carbon steel/carbon steel', agents=None):
         """
         The capital cost target: the area target in as many shells as the
         units target (less a furnace), split equally over all of them or
@@ -2071,6 +2113,9 @@ class PinchTargets:
         material : str, optional
             biosteam's shell and tube material. Defaults to 'Carbon
             steel/carbon steel'.
+        agents : Sequence[UtilityAgent or str], optional
+            Agents whose IDs `h_utilities` may key as well, as `area_target`
+            takes them.
 
         Returns
         -------
@@ -2087,7 +2132,8 @@ class PinchTargets:
         """
         if utilities is None: utilities = self.utility_targets()
         return self._capital(utilities, self._film_coefficients(h),
-                             _utility_films(utilities, h_utilities), P,
+                             _utility_films(utilities, h_utilities,
+                                            _key_agents(agents)), P,
                              heat_exchanger_type, material)[0]
 
     def _check_options(self, options):
@@ -2115,7 +2161,7 @@ class PinchTargets:
         self._film_coefficients(get('h'))
         _utility_films((), get('h_utilities'),
                        [*(get('heating_agents') or ()),
-                        *(get('cooling_agents') or ())])
+                        *(get('cooling_agents') or ())], _OPTION_AGENTS)
         return options
 
     def summary(self, **options):
@@ -2161,7 +2207,7 @@ class PinchTargets:
         utilities = self.utility_targets(heating_agents, cooling_agents)
         h_utilities = _utility_films(
             utilities, get('h_utilities'),
-            [*(heating_agents or ()), *(cooling_agents or ())])
+            [*(heating_agents or ()), *(cooling_agents or ())], _OPTION_AGENTS)
         capital, N = self._capital(
             utilities, self._film_coefficients(get('h')), h_utilities,
             get('P', 101325.), get('heat_exchanger_type', 'Floating head'),
@@ -2651,7 +2697,8 @@ def _network_areas(HXN, targets, h, h_utilities, agents):
             _profile_area(x, T_h(x) - T_c(x), 1. / h[i] + 1. / h[j], hx.ID),
             hx.design_results.get('Area', 0.) / _FT2_PER_M2)
     for hx, agent, h_agent in zip(utility, of,
-                                  _agent_films(of, h_utilities, agents)):
+                                  _agent_films(of, h_utilities, agents,
+                                               _OPTION_AGENTS)):
         if agent.isfuel:
             areas[hx.ID] = (0., 0.)
             continue
