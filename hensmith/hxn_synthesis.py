@@ -1006,31 +1006,39 @@ def _key_universe(units, held=None):
     universe = _owner_chains(units, owners)
     return universe, {id(u) for u in universe}, owners
 
-def _auxiliary_slots(key, universe, owners=None):
+def _auxiliary_attributes(key, universe, owners=None):
     """
-    Where the units of `universe` hold the auxiliary unit of the tuple key
-    `key` by the ID that `biosteam.Unit.auxiliary` gives an auxiliary:
-    ``(owner.ID, 'name[k]')`` for the k-th of a list under the attribute
-    `name`, ``(owner.ID, name)`` for a single one, with `name` one of the
+    The attributes that the tuple key `key`, of the ID that
+    `biosteam.Unit.auxiliary` gives an auxiliary, may name: ``(owner.ID,
+    'name[k]')`` the k-th unit of a list under the attribute `name`, and
+    ``(owner.ID, name)`` a single unit there, with `name` one of the
     `auxiliary_unit_names` of a unit under the top owner ``owner.ID``
-    (along `_parent` with `owners`). Yields ``(unit, held)`` for each such
-    unit whose attribute takes that form or holds nothing (None or
-    missing), with `held` the `biosteam.Unit` there, or None if there is
-    none (nothing, an object that is not a unit, or a list too short).
+    (along `_parent` with `owners`). Yields ``(unit, name, k, held)`` for
+    each such unit, with k None for the single form and `held` what the
+    unit holds there (None if missing).
     """
     owner_ID, ID = key
     match = re.fullmatch(r'(.+)\[(0|[1-9]\d*)\]', ID)
-    name = match[1] if match else ID
+    name, k = (match[1], int(match[2])) if match else (ID, None)
     for unit in universe:
-        if (_top(unit, owners).ID != owner_ID
-                or name not in getattr(unit, 'auxiliary_unit_names', ())):
-            continue
-        held = getattr(unit, name, None)
-        if held is not None and isinstance(held, list) != bool(match):
-            continue
-        if match and held is not None:
-            k = int(match[2])
-            held = held[k] if k < len(held) else None
+        if (_top(unit, owners).ID == owner_ID
+                and name in getattr(unit, 'auxiliary_unit_names', ())):
+            yield unit, name, k, getattr(unit, name, None)
+
+def _auxiliary_slots(key, universe, owners=None):
+    """
+    Where the units of `universe` hold the auxiliary unit of the tuple key
+    `key` by the ID that `biosteam.Unit.auxiliary` gives an auxiliary (see
+    `_auxiliary_attributes`). Yields ``(unit, held)`` for each such unit
+    whose attribute takes that form (a list for ``'name[k]'``) or holds
+    nothing (None or missing), with `held` the `biosteam.Unit` there, or
+    None if there is none (nothing, an object that is not a unit, or a
+    list too short).
+    """
+    for unit, name, k, held in _auxiliary_attributes(key, universe, owners):
+        if held is not None:
+            if isinstance(held, list) != (k is not None): continue
+            if k is not None: held = held[k] if k < len(held) else None
         yield unit, held if isinstance(held, bst.Unit) else None
 
 def _other_form_hints(key, universe, owners=None):
@@ -1043,17 +1051,10 @@ def _other_form_hints(key, universe, owners=None):
     ..."``), and for ``(owner.ID, 'name[k]')`` where it holds one unit,
     that unit's key (``"D1.condenser is ('D1', 'condenser')"``).
     """
-    owner_ID, ID = key
-    match = re.fullmatch(r'(.+)\[(0|[1-9]\d*)\]', ID)
-    name = match[1] if match else ID
     hints = []
-    for unit in universe:
-        if (_top(unit, owners).ID != owner_ID
-                or name not in getattr(unit, 'auxiliary_unit_names', ())):
-            continue
-        held = getattr(unit, name, None)
-        if held is None or isinstance(held, list) == bool(match): continue
-        if match:
+    for unit, name, k, held in _auxiliary_attributes(key, universe, owners):
+        if held is None or isinstance(held, list) == (k is not None): continue
+        if k is not None:
             if isinstance(held, bst.Unit):
                 hints.append(f'; {unit.ID}.{name} is '
                              f'{_unit_name(held, owners)!r}')
@@ -1226,6 +1227,14 @@ def _mapping_contributions(hus, mapping, units, held=None):
                          'the ID of a unit without an owner, or (owner.ID, '
                          'unit.ID)'
                          f'{_unknown_key_hints(unknown, universe, owners)})')
+    _check_key_levels(items, universe, live, owners, 'approach_contributions')
+    return [_nearest_key_value(items, hu.unit, live, owners) for hu in hus]
+
+def _check_key_levels(items, universe, live, owners, what):
+    """Raise a ValueError if two keys of `items` (``(key, value)`` pairs
+    of unit keys) of the same level for a unit of `universe` (see
+    `_contribution_key_level`, which takes `live` and `owners`) give it
+    different values; `what` names the keys (``'h'``, say)."""
     for unit in universe:
         first = {} # level -> (key, value)
         for key, value in items:
@@ -1234,19 +1243,21 @@ def _mapping_contributions(hus, mapping, units, held=None):
             other, other_value = first.setdefault(level, (key, value))
             if other_value != value:
                 raise ValueError(
-                    f'approach_contributions keys {other!r} and {key!r} '
-                    f'give unit {_unit_message_name(unit, owners)} different '
-                    f'values at the same level: {other_value!r} and '
-                    f'{value!r}')
-    values = []
-    for hu in hus:
-        best = None # (level, value) of the nearest key
-        for key, value in items:
-            level = _contribution_key_level(key, hu.unit, live, owners)
-            if level is not None and (best is None or level < best[0]):
-                best = (level, value)
-        values.append(None if best is None else best[1])
-    return values
+                    f'{what} keys {other!r} and {key!r} give unit '
+                    f'{_unit_message_name(unit, owners)} different values '
+                    f'at the same level: {other_value!r} and {value!r}')
+
+def _nearest_key_value(items, unit, live, owners, default=None):
+    """The value of the key of `items` (``(key, value)`` pairs of unit
+    keys) of the lowest level on the owner chain of `unit` (see
+    `_contribution_key_level`, which takes `live` and `owners`; the first
+    of that level), or `default` if none names it."""
+    best = None # (level, value) of the nearest key
+    for key, value in items:
+        level = _contribution_key_level(key, unit, live, owners)
+        if level is not None and (best is None or level < best[0]):
+            best = (level, value)
+    return default if best is None else best[1]
 
 def _stream_contributions(hus, approach_contributions, units=None,
                           held=None):

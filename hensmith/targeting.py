@@ -34,9 +34,8 @@ from ._curves import StreamCurve, _T_EQ, _copy
 from ._planner import _approach_contributions, _given_contributions
 from .hxn_synthesis import (_problem_table, _pinch_cut, _format_H,
     _arrange_heat_utilities, _process_streams, _explicit_contributions,
-    _contribution_key_level, _key_universe, _unknown_keys,
-    _unknown_key_hints, _unit_message_name, _held_owners, _top,
-    _with_auxiliaries)
+    _check_key_levels, _nearest_key_value, _key_universe, _unknown_keys,
+    _unknown_key_hints, _held_owners, _top, _with_auxiliaries)
 
 __all__ = ('PinchTargets', 'supertarget', 'Supertargets', 'network_report',
            'plot_composite_curves', 'plot_grand_composite_curve',
@@ -1944,29 +1943,12 @@ class PinchTargets:
                              f'{_unknown_key_hints(unknown, universe, owners)}'
                              ')')
         unit_items = [(k, v) for k, v in items if not isinstance(k, Integral)]
-        for unit in universe:
-            first = {} # level -> (key, value)
-            for key, value in unit_items:
-                level = _contribution_key_level(key, unit, live, owners)
-                if level is None: continue
-                other, other_value = first.setdefault(level, (key, value))
-                if other_value != value:
-                    raise ValueError(
-                        f'h keys {other!r} and {key!r} give unit '
-                        f'{_unit_message_name(unit, owners)} different values '
-                        f'at the same level: {other_value!r} and {value!r}')
+        _check_key_levels(unit_items, universe, live, owners, 'h')
+        by_index = {k: v for k, v in items if isinstance(k, Integral)}
         values = np.full(N, _H_DEFAULT)
-        for j in range(N):
-            best = None # (level, value) of the nearest key
-            for key, value in items:
-                if isinstance(key, Integral):
-                    level = -1 if key == j else None
-                else:
-                    level = _contribution_key_level(key, units[j], live,
-                                                    owners)
-                if level is not None and (best is None or level < best[0]):
-                    best = (level, value)
-            if best is not None: values[j] = best[1]
+        for j in range(N): # a stream index is below its unit
+            values[j] = (by_index[j] if j in by_index else _nearest_key_value(
+                unit_items, units[j], live, owners, _H_DEFAULT))
         return values
 
     def _area(self, utilities, h, h_utilities):

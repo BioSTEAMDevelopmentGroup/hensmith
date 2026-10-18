@@ -16,7 +16,10 @@ A. Default unchanged: unspecified contributions (None, nan, an empty
    ``T_min_app / 2``) give the default plans, problem tables and facility
    networks bit for bit, compared in-process with ``float.hex`` and
    ``tobytes``; a numpy float32 ``T_min_app`` keeps its own float32
-   arithmetic in every exchanger's guard.
+   arithmetic in every exchanger's guard. Without contributions, the
+   facility's simulations (cached or writing over the heat utilities) do
+   not depend on the key machinery: they run the same with its helpers
+   raising.
 B. Uniform contributions: every stream at ``x`` plans the network of
    ``T_min_app = 2x`` on a shifted scale offset by a constant, and on
    real-thermo cases all hot streams at ``a`` and all cold ones at ``b``
@@ -55,7 +58,9 @@ import numpy as np
 import pytest
 import biosteam as bst
 from numpy.testing import assert_allclose
-from hensmith import hxn_synthesis, HeatExchangerNetwork, PinchTargets
+from hensmith import (hxn_synthesis, targeting, HeatExchangerNetwork,
+                      PinchTargets)
+from hensmith import _heat_exchanger_network as network_module
 from hensmith import _planner as P
 from hensmith.hxn_synthesis import problem_table, synthesize_network, _pinch_cut
 from test_hxn import (cp_units, KEMP, R002 as R002_UNITS, planned_split,
@@ -368,6 +373,120 @@ def test_default_float32_T_min_app_keeps_its_own_arithmetic(name):
         assert network_record(HXN) == reference
         assert (float(HXN.synthesis_info['min_approach_margin']).hex()
                 == float(HXN.synthesis_info['min_approach'] - T).hex())
+
+#: The helpers of the key machinery: key resolution, the walks of
+#: auxiliaries and the owners of auxiliaries held without one.
+KEY_HELPERS = ('_parent', '_top', '_held_owners', '_unit_name', '_id_path',
+               '_unit_message_name', '_names_unit',
+               '_contribution_key_level', '_check_contribution_key',
+               '_owner_chains', '_nested_auxiliaries', '_heat_utility_units',
+               '_with_auxiliaries', '_key_universe', '_auxiliary_slots',
+               '_other_form_hints', '_auxiliary_attributes', '_stage_tickets',
+               '_is_stage_ID', '_check_key_levels', '_nearest_key_value',
+               '_names_unbuilt_stage', '_names_unbuilt_auxiliary',
+               '_unknown_keys', '_unknown_key_hints',
+               '_mapping_contributions', '_stream_contributions')
+
+def break_key_machinery(monkeypatch):
+    """Make every helper of the key machinery raise wherever hensmith
+    takes it from, `HeatExchangerNetwork._candidate_units` too; returns the
+    list that the names of those called are added to."""
+    called = []
+
+    def broken(name):
+        def helper(*args, **kwargs):
+            called.append(name)
+            raise RuntimeError(f'{name} called')
+        return helper
+
+    for name in KEY_HELPERS:
+        assert hasattr(hxn_synthesis, name), name # still the machinery's
+        for module in (hxn_synthesis, network_module, targeting):
+            if hasattr(module, name):
+                monkeypatch.setattr(module, name, broken(name))
+    monkeypatch.setattr(HeatExchangerNetwork, '_candidate_units',
+                        broken('_candidate_units'))
+    return called
+
+def compressor_system(name, **options):
+    """A MultistageCompressor K1, whose intercoolers have no owner, and a
+    cold stream's heater C1, with a facility HXN of `options`."""
+    bst.main_flowsheet.set_flowsheet(name)
+    bst.settings.set_thermo(['Water', 'Methane'], cache=True)
+    gas = bst.Stream('gas', Methane=100., units='kmol/hr', T=300.,
+                     P=101325., phase='g')
+    K1 = bst.MultistageCompressor('K1', ins=gas, pr=3., n_stages=3, eta=0.7)
+    cold = bst.Stream('cold', Water=200., units='kmol/hr', T=290., P=5e5)
+    C1 = bst.HXutility('C1', ins=cold, T=350., rigorous=False)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5., **options)
+    return bst.System.from_units(name, units=[K1, C1, HXN]), HXN, K1.ins[0]
+
+def quickstart_system(name, **options):
+    """`quickstart`'s units with a facility HXN of `options`."""
+    D1, D1_H1, D1_H2, F1 = quickstart(name)
+    HXN = HeatExchangerNetwork('HXN', T_min_app=5., **options)
+    return (bst.System.from_units(name, units=[D1, D1_H1, D1_H2, F1, HXN]),
+            HXN, D1.ins[0])
+
+@pytest.mark.parametrize('system, options', [
+    (quickstart_system, {}),
+    (quickstart_system, dict(cache_network=True)),
+    (quickstart_system, dict(replace_unit_heat_utilities=True)),
+    (compressor_system, {}),
+], ids=['quickstart', 'quickstart_cached', 'quickstart_replacing',
+        'compressor'])
+def test_default_facility_needs_none_of_the_key_machinery(system, options,
+                                                         monkeypatch):
+    # without approach contributions, a facility's simulations do not
+    # depend on the key machinery: with each of its helpers raising, the
+    # network of the quickstart system (a column with its condenser and
+    # reboiler, product coolers, a flash) is synthesized, reused from the
+    # cache after a feed change, or written over its units' heat utilities
+    # just the same, and none of them is called; the intercoolers of a
+    # compressor are held without an owner, so their holders are taken,
+    # for the labels of targets() only, and are None if that fails
+    exchanger_duties = lambda units: [(u.ID, float(u.Q).hex())
+                                      for u in units]
+
+    def run(name, broken):
+        sys, HXN, feed = system(name, **options)
+        called = break_key_machinery(monkeypatch) if broken else []
+        records = []
+        for scale in (1., 1.02):
+            feed.F_mass *= scale
+            # (biosteam warns that methane has no Dortmund groups)
+            if system is compressor_system: sys.simulate()
+            else: simulate_strictly(sys)
+            duties = [hu.duty for unit in sys.units if unit is not HXN
+                      for hu in unit.heat_utilities]
+            records.append((exchanger_duties(HXN.new_HXs),
+                            exchanger_duties(HXN.new_HX_utils), duties,
+                            HXN.HXN_sys))
+        monkeypatch.undo()
+        return records, called, HXN
+
+    name = '_'.join([system.__name__, *options])
+    reference, _, HXN0 = run(f'contributions_unbroken_{name}', False)
+    records, called, HXN = run(f'contributions_broken_{name}', True)
+    assert [r[:3] for r in records] == [r[:3] for r in reference]
+    assert records[0][0] # process exchangers
+    cached = options.get('cache_network', False)
+    assert (records[1][3] is records[0][3]) == cached
+    assert (reference[1][3] is reference[0][3]) == cached
+    if system is quickstart_system:
+        assert not called
+        assert HXN._holders is None is HXN0._holders
+    else: # the holders, best-effort, fail
+        assert called and HXN._holders is None
+        assert HXN0._holders is not None
+    # with the machinery back, the targets are those of the network
+    # taken without it, labeled by the units as they are
+    targets, targets0 = HXN.targets(), HXN0.targets()
+    assert targets.labels == targets0.labels
+    assert targets.summary() == targets0.summary()
+    if system is compressor_system:
+        assert targets.labels == ['C1', 'K1 - K1_H1', 'K1 - K1_H2',
+                                  'K1 - K1_H3']
 
 # ---------------------------------------------------------------------------
 # B. Uniform contributions

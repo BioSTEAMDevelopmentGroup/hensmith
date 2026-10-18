@@ -587,6 +587,35 @@ class HeatExchangerNetwork(bst.Facility):
                                        units=self._candidate_units(units),
                                        held=held)
 
+    def _synthesis_holders(self, hx_utils, units):
+        """
+        The holders of the auxiliaries held without an owner (see
+        `hensmith.hxn_synthesis._held_owners`) at a synthesis of the heat
+        utilities `hx_utils` of `units`, which `targets` keeps for the keys
+        and labels of exchangers that a unit has rebuilt since. With
+        approach contributions, they are those the keys were resolved by.
+        Without (the default path), they serve labels only, and the
+        synthesis never depends on them: they are taken only if an
+        exchanger's owner chain ends outside `units` (an exchanger held
+        without an owner, as the intercoolers of a
+        `biosteam.MultistageCompressor`), so that none of the key machinery
+        runs otherwise, and are None on any error (labels then go by the
+        units as they are, plain unit IDs at worst).
+        """
+        hxs = [hu.unit for hu in hx_utils]
+        if self.approach_contributions is not None:
+            return _held_owners(hxs + self._candidate_units(units))
+        try:
+            at_hand = {id(unit) for unit in units}
+            for hx in hxs:
+                while getattr(hx, '_owner', None) is not None: hx = hx._owner
+                if id(hx) not in at_hand: break
+            else:
+                return None
+            return _held_owners(hxs + self._candidate_units(units))
+        except Exception:
+            return None
+
     def _get_original_heat_utilties(self, units=None):
         if units is None: units = self._get_units()
         ignored = self.ignored
@@ -669,7 +698,9 @@ class HeatExchangerNetwork(bst.Facility):
         units = list(self._get_units())
         hx_utils = self._get_original_heat_utilties(units)
         # the explicit approach contributions by heat utility (resolved
-        # once per simulation; None without any)
+        # once per simulation; None without any, and with
+        # approach_contributions None, the default path, none of the key
+        # machinery runs here or in `_synthesis_holders`)
         values = self._network_contributions(hx_utils, units)
         value_of = (None if values is None
                     else {id(hu): v for hu, v in zip(hx_utils, values)})
@@ -753,13 +784,7 @@ class HeatExchangerNetwork(bst.Facility):
                 # Signed-duty order is the default matching priority of the
                 # synthesis passes: smallest heating duty first among the cold
                 # streams, largest cooling duty first among the hot streams.
-                # The holders of the auxiliaries held without an owner, as
-                # the contributions were resolved by (see `targets`, which
-                # labels by them with or without contributions; the walk
-                # reads auxiliaries of units only, see
-                # `hensmith.hxn_synthesis._nested_auxiliaries`).
-                holders = _held_owners([hu.unit for hu in hx_utils]
-                                       + self._candidate_units(units))
+                holders = self._synthesis_holders(hx_utils, units)
                 hx_utils.sort(key = lambda x: x.duty)
                 self.HXN_flowsheet = HXN_F = flowsheet
                 for i in HXN_F.registries: i.clear()
@@ -1181,7 +1206,7 @@ class HeatExchangerNetwork(bst.Facility):
             # synthesis, which a holder that has rebuilt them since (a
             # MultistageCompressor simulated alone) no longer holds
             held = getattr(self, '_holders', None)
-            if x is not None and not isinstance(x, Mapping) and callable(x):
+            if callable(x) and not isinstance(x, Mapping):
                 # Never called again: with replace_unit_heat_utilities, the
                 # heat utilities it would read now hold the network's
                 # utilities (or nothing, for a stream the process exchangers
