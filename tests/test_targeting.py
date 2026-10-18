@@ -614,6 +614,16 @@ def test_pricing_is_isolated():
     for a, (dump, items) in zip(agents, dumps):
         assert a.utility_stream_dump is dump and a.utility_stream_dump == items
     assert fresh_price(10 * kW, 450., 500., gas)[0] == before
+    # a flowsheet of the temporary one's ID that is already registered is
+    # registered again on exit, and gets none of the pricing's streams
+    flowsheets = bst.Flowsheet.flowsheet.__dict__
+    mine = bst.Flowsheet('_hensmith_targets')
+    try:
+        assert [u.cost for u in t.utility_targets()] == [u.cost for u in first]
+        assert flowsheets['_hensmith_targets'] is mine and not mine.stream.data
+        assert registered() == registry
+    finally:
+        flowsheets.pop('_hensmith_targets', None)
 
 def vacuum_condenser(name, T_sat):
     """A vacuum condenser and a liquid cooler of water: 40 kmol/hr of vapour
@@ -1233,6 +1243,147 @@ def test_levels_of_streams_past_a_zero():
         results.append([(u.level, u.duty, u.cost) for u in cool])
     assert_allclose(results[0], results[1], rtol=1e-12)
 
+def latent_water(ID, T, phase, **prices):
+    """A latent water agent at `T` [K] (no `T_limit`): condensing steam
+    (`phase` 'g', a heating agent) or boiling water ('l', a cooling one)."""
+    water = bst.HeatUtility.thermo_water
+    return bst.UtilityAgent(ID, Water=1, T=T, P=water.chemicals.Water.Psat(T),
+                            phase=phase, thermo=water, **prices)
+
+def test_levels_of_streams_between_zeros():
+    # of several zeros of the balanced curve beyond the pinch, the heat of a
+    # level reaches only the furthest (the highest above the pinch, the
+    # lowest below it): a stream between two zeros moves no level, though it
+    # reaches beyond the agent's limit. Cooling: the curve is zero at
+    # shifted 450 K (the pinch), 445, 400 and 360 K. S (shifted 395 -> 365
+    # K) lies between the zeros at 400 and 360 K and gives all its heat to
+    # CS; in reach, it would cap the boiling water (latent at 370 K, R = 375
+    # K real) at S's limit, shifted 369.5 K, short of the zero at 360 K,
+    # where the water gets nothing, and chilled water would serve HL. The
+    # water serves HL (shifted 355 -> 335 K, 400 -> 380 K real) whole, at
+    # HL's limit, shifted 330 K.
+    dT = bst.HeatUtility.dT
+    rows = [('C1', 450., 500., 1.), ('HA', 455., 415., 1.), ('CA', 400., 440., 1.),
+            ('S', 400.5, 370.5, 1.), ('CS', 360., 390., 1.), ('HL', 400., 380., 1.)]
+    t = targets('test_targeting_between_zeros_cool', rows, 10.,
+                approach_contributions={'S': .5, 'HL': 40.})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['S'], shift['HL'], t.pinch_T) == (5.5, 45., 450.)
+    assert (t.Q_hot, t.Q_cold) == (pytest.approx(50. * kW, rel=1e-12),
+                                   pytest.approx(20. * kW, rel=1e-12))
+    T, H = t.grand_composite_curve()
+    assert np.abs(H[np.isin(T, [450., 445., 400., 360.])]).max() <= 1e-6
+    assert_allclose(H[np.isin(T, [390., 365.])], 5. * kW, rtol=1e-9)
+    boiling = latent_water('test_targeting_between_zeros_boiling', 370., 'l',
+                           heat_transfer_price=1e-7)
+    cool = [u for u in t.utility_targets(None, [boiling, agent('chilled_water')])
+            if not u.heating]
+    assert [u.ID for u in cool] == [boiling.ID]
+    u, = cool
+    assert u.level == pytest.approx(boiling.T + boiling.dT + dT - shift['HL'], abs=1e-9)
+    assert u.level == pytest.approx(330., abs=1e-9)
+    assert u.duty == pytest.approx(20. * kW, rel=1e-12)
+    assert (u.T_in, u.T_out) == (pytest.approx(400., abs=1e-9),
+                                 pytest.approx(380., abs=1e-9))
+    assert u.cost == pytest.approx(fresh_price(-u.duty, 400., 380., boiling)[0],
+                                   rel=1e-9)
+    # heating: the curve has no zero above the pinch (shifted 400 K). A1
+    # (latent at 415 K, R = 410 K real) serves 5 kW at shifted 420 K, where
+    # S, reaching beyond A1's limit (shifted 405.5 K), starts, and leaves
+    # zeros at 420 and 440 K, with Hb's heat between them. S (shifted 420 ->
+    # 430 K) lies between the two; in reach, it would cap A2 (latent at 431
+    # K, R = 426 K real) at S's limit, shifted 421.5 K, short of the zero at
+    # 440 K, where A2 gets nothing, and natural gas would serve CL. A2
+    # serves CL (shifted 440 -> 460 K, 405 -> 425 K real) whole, at CL's
+    # limit, shifted 461 K.
+    rows = [('C0', 400., 410., 1.), ('Ha', 430., 420., .5), ('S', 424.5, 434.5, 1.),
+            ('Hb', 450., 440., 1.), ('CL', 405., 425., 1.), ('Hlow', 410., 380., 1.)]
+    t = targets('test_targeting_between_zeros_heat', rows, 10.,
+                approach_contributions={'S': .5, 'CL': 40.})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['C0'], shift['S'], shift['CL'], t.pinch_T) == (0., 4.5, -35., 400.)
+    assert (t.Q_hot, t.Q_cold) == (pytest.approx(25. * kW, rel=1e-12),
+                                   pytest.approx(30. * kW, rel=1e-12))
+    T, H = t.grand_composite_curve()
+    assert np.abs(H[T > 400.]).min() == pytest.approx(5. * kW, rel=1e-9)
+    assert_allclose(H[np.isin(T, [440., 420.])], 5. * kW, rtol=1e-9)
+    A1 = latent_water('test_targeting_between_zeros_A1', 415., 'g',
+                      regeneration_price=0.2)
+    A2 = latent_water('test_targeting_between_zeros_A2', 431., 'g',
+                      regeneration_price=0.2)
+    heat = [u for u in t.utility_targets([A1, A2, agent('natural_gas')], None)
+            if u.heating]
+    assert [u.ID for u in heat] == [A1.ID, A2.ID]
+    assert_allclose([u.level for u in heat], [420., 461.], atol=1e-9)
+    assert heat[1].level == pytest.approx(A2.T - A2.dT - dT - shift['CL'], abs=1e-9)
+    assert_allclose([u.duty for u in heat], [5. * kW, 20. * kW], rtol=1e-12)
+    assert_allclose([(u.T_in, u.T_out) for u in heat], [(400., 410.), (405., 425.)],
+                    atol=1e-9)
+    for u, a in zip(heat, (A1, A2)):
+        assert u.cost == pytest.approx(fresh_price(u.duty, u.T_in, u.T_out, a)[0],
+                                       rel=1e-9)
+
+def test_levels_of_streams_across_the_pinch():
+    # an agent serves only the streams with heat on its side of the pinch
+    # (cold streams above it, hot ones below it): a stream wholly on the
+    # other side moves no level, though it reaches beyond the agent's limit.
+    # Heating: the pinch is at shifted 400 K. CB (shifted 380 -> 398 K) lies
+    # below it and gets all its heat from H1; served, it would cap the steam
+    # (latent at 407 K, R = 402 K real) at CB's limit, shifted 397.5 K,
+    # below the pinch, where the steam gets nothing, and natural gas would
+    # serve all of Cup. The steam serves Cup (400 -> 410 K) up to its limit,
+    # 402 K, and natural gas the rest.
+    dT = bst.HeatUtility.dT
+    rows = [('Cup', 400., 410., 1.), ('CB', 384.5, 402.5, 1.), ('H1', 410., 380., 2.)]
+    t = targets('test_targeting_across_pinch_heat', rows, 10.,
+                approach_contributions={'CB': .5})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['Cup'], shift['CB'], t.pinch_T) == (0., 4.5, 400.)
+    assert (t.Q_hot, t.Q_cold) == (pytest.approx(10. * kW, rel=1e-12),
+                                   pytest.approx(42. * kW, rel=1e-12))
+    steam = latent_water('test_targeting_across_pinch_steam', 407., 'g',
+                         regeneration_price=0.2)
+    gas = agent('natural_gas')
+    heat = [u for u in t.utility_targets([steam, gas], None) if u.heating]
+    assert [u.ID for u in heat] == [steam.ID, gas.ID]
+    u, fuel = heat
+    assert u.level == pytest.approx(steam.T - steam.dT - dT - shift['Cup'], abs=1e-9)
+    assert u.level == pytest.approx(402., abs=1e-9)
+    assert_allclose([u.duty for u in heat], [2. * kW, 8. * kW], rtol=1e-12)
+    assert_allclose([(u.T_in, u.T_out) for u in heat], [(400., 402.), (402., 410.)],
+                    atol=1e-9)
+    for u, a in zip(heat, (steam, gas)):
+        assert u.cost == pytest.approx(fresh_price(u.duty, u.T_in, u.T_out, a)[0],
+                                       rel=1e-9)
+    # cooling, its mirror: HB (shifted 420 -> 402 K) lies above the pinch
+    # (shifted 400 K) and gives all its heat to C1; served, it would cap the
+    # boiling water (latent at 403 K, R = 408 K real) at HB's limit, shifted
+    # 402.5 K, above the pinch, and cooling water would serve all of Hdown.
+    # The water serves Hdown (410 -> 400 K) down to its limit, 408 K, and
+    # cooling water the rest.
+    rows = [('Hdown', 410., 400., 1.), ('HB', 425.5, 407.5, 1.), ('C1', 400., 430., 2.)]
+    t = targets('test_targeting_across_pinch_cool', rows, 10.,
+                approach_contributions={'HB': .5})
+    shift = dict(zip(t.labels, t.shift))
+    assert (shift['Hdown'], shift['HB'], t.pinch_T) == (10., 5.5, 400.)
+    assert (t.Q_hot, t.Q_cold) == (pytest.approx(42. * kW, rel=1e-12),
+                                   pytest.approx(10. * kW, rel=1e-12))
+    boiling = latent_water('test_targeting_across_pinch_boiling', 403., 'l',
+                           heat_transfer_price=1e-6)
+    CW = agent('cooling_water')
+    cool = [u for u in t.utility_targets(None, [boiling, CW]) if not u.heating]
+    assert [u.ID for u in cool] == [boiling.ID, CW.ID]
+    u = cool[0]
+    assert u.level == pytest.approx(boiling.T + boiling.dT + dT - shift['Hdown'],
+                                    abs=1e-9)
+    assert u.level == pytest.approx(398., abs=1e-9)
+    assert_allclose([u.duty for u in cool], [2. * kW, 8. * kW], rtol=1e-12)
+    assert_allclose([(u.T_in, u.T_out) for u in cool], [(410., 408.), (408., 400.)],
+                    atol=1e-9)
+    for u, a in zip(cool, (boiling, CW)):
+        assert u.cost == pytest.approx(fresh_price(-u.duty, u.T_in, u.T_out, a)[0],
+                                       rel=1e-9)
+
 def test_sensible_agent_without_driving_force():
     # a sensible agent with agent.dT = 0 (UtilityAgent's default) has no
     # driving force left at a point load at its limit, agent.T - dT
@@ -1379,6 +1530,18 @@ def test_utilities_must_be_of_the_targets(quickstart):
         for call in calls:
             with pytest.raises(ValueError, match='duties of utilities add up to'):
                 call(utilities)
+    # they must add up to rounding: a heating or a cooling duty off by 1e-6
+    # (far above the remainders of at most _tol that utility_targets leaves
+    # out) raises, one off by 1e-12 does not
+    for i in (0, -1):
+        for f, raises in ((1e-6, True), (-1e-6, True), (1e-12, False)):
+            off = list(own)
+            off[i] = own[i]._replace(duty=own[i].duty * (1. + f))
+            if raises:
+                with pytest.raises(ValueError, match='duties of utilities add up to'):
+                    t20.balanced_grand_composite_curve(off)
+            else:
+                t20.balanced_grand_composite_curve(off)
     for utilities in (own, partial):
         assert t20.units_target(utilities)['total'] > 0
         t20.balanced_composite_curves(utilities)
@@ -1836,6 +1999,20 @@ def test_from_heat_utilities_after_replaced_heat_utilities(kemp_hxn, kemp_hxn_re
     assert t.labels == facility.labels
     assert (t.Q_hot, t.Q_cold) == (pytest.approx(facility.Q_hot, rel=1e-12),
                                    pytest.approx(facility.Q_cold, rel=1e-12))
+    # a duty off by 1e-4 of its stream's is another than the stream's; one
+    # off by 1e-9 is the stream's up to rounding
+    units = cp_units('test_targeting_duty_off', REF_A)
+    hus = [u.heat_utilities[0] for u in units]
+    dH = units[0].outs[0].H - units[0].ins[0].H
+    for f, off in ((1e-4, True), (-1e-4, True), (1e-9, False)):
+        hus[0].unit_duty = dH * (1. + f)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            PinchTargets.from_heat_utilities(hus, 10.)
+        messages = [str(x.message) for x in w
+                    if 'other than their process' in str(x.message)]
+        assert len(messages) == off
+        if off: assert messages[0].startswith("the heat utilities of 'H1' have duties")
 
 def test_is_hot_validated():
     # is_hot must agree with each stream's direction (a stream without duty
