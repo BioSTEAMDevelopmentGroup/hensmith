@@ -76,8 +76,12 @@ built without a facility, from the heat utilities of heat exchangers with
 ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``, is the
 one to give it: a heat utility that a unit adds for itself (a reactor's or a
 heated mixer's, ``hu.hxn_ok`` False) raises a ``ValueError``, as its unit's
-first inlet and outlet need not be the stream it heats or cools. A heat
-utility counts as a stream each time it is given, as in the synthesis:
+first inlet and outlet need not be the stream it heats or cools. A selection
+is valid until its units are simulated again: biosteam then gives each unit
+new heat utilities, emptying the former ones, so select them again after any
+simulation (a former one, no longer among its unit's ``heat_utilities``,
+raises a ``ValueError`` rather than drop out as a heat utility without duty).
+A heat utility counts as a stream each time it is given, as in the synthesis:
 biosteam lists the heat utility of a unit in parallel once per unit (a
 fermentor's recirculation cooler, for one, once per reactor of its
 ``parallel['self']``), and so does the selection. One given more often than

@@ -2028,9 +2028,15 @@ def test_from_heat_utilities_takes_exchangers():
     facility = HXN.targets()
     assert facility.labels == t.labels == ['C', 'H']
     assert (facility.Q_hot, facility.Q_cold) == (t.Q_hot, t.Q_cold)
-    # a non-exchanger heat utility without duty is dropped, as any is
+    # a non-exchanger heat utility without duty is dropped, as any is, once
+    # its unit holds it (one that it does not hold raises, see
+    # test_from_heat_utilities_of_a_former_selection)
     idle = bst.HeatUtility(unit=M)
     assert not idle.hxn_ok and idle.duty == 0.
+    with pytest.raises(ValueError, match=r"the heat utilities of 'M' are not \(or no "
+                                         r"longer\) among their units' heat_utilities"):
+        PinchTargets.from_heat_utilities([idle, *selected], 10.)
+    M.heat_utilities.append(idle)
     same = PinchTargets.from_heat_utilities(
         [idle, *sorted(selected, key=lambda hu: hu.duty)], 10.)
     assert same.labels == t.labels and (same.Q_hot, same.Q_cold) == (t.Q_hot, t.Q_cold)
@@ -2209,6 +2215,9 @@ def test_from_heat_utilities_reversed_stream():
         with pytest.raises(ValueError, match=message) as error:
             PinchTargets.from_heat_utilities(hus, 10.)
     assert 'is_hot' not in str(error.value)
+    assert str(error.value).endswith('simulate the system (or its units) first, '
+                                     'converging any recycle more tightly, then '
+                                     'select the heat utilities again')
     assert not [x for x in w if 'differ in flow' in str(x.message)]
     a.imol['Water'] = 120.
     with warnings.catch_warnings(record=True) as w:
@@ -2221,6 +2230,54 @@ def test_from_heat_utilities_reversed_stream():
     H1.simulate()
     t = PinchTargets.from_heat_utilities([H1.heat_utilities[0], hus[1]], 10.)
     assert t.labels == ['H1', 'C1'] and list(t.is_hot) == [True, True]
+
+def test_from_heat_utilities_of_a_former_selection():
+    # biosteam gives a unit new heat utilities each time it is simulated,
+    # emptying the former ones (no duty): a selection kept from before is
+    # refused, naming the units simulated since, rather than leaving their
+    # streams out as zero-duty ones (the cold utility target 60 % off here)
+    # or, once the whole system is simulated, finding no stream at all. The
+    # warning of a changed inlet, which comes first, says to select them
+    # again after simulating; a selection made after a simulation is right
+    name = 'test_targeting_former_selection'
+    units = cp_units(name, [('H1', 400., 300., 1.), ('C1', 330., 440., 1.),
+                            ('H3', 420., 340., .5)])
+    H1, C1, H3 = units
+    sys = bst.System.from_units(name, units)
+    sys.simulate()
+    select = lambda: bst.process_tools.heat_exchanger_utilities_from_units(sys.units)
+    hus = select()
+    assert [hu.unit for hu in hus] == units
+    assert PinchTargets.from_heat_utilities(hus, 10.).labels == ['C1', 'H1', 'H3']
+    H3.ins[0].F_mol *= 2.
+    with pytest.warns(RuntimeWarning, match=r"the inlet and outlet of 'H3' differ in "
+                                            r"flow .*simulate the system \(or its "
+                                            r"units\) first, then select the heat "
+                                            r"utilities again$"):
+        PinchTargets.from_heat_utilities(hus, 10.)
+    H3.simulate() # as the warning says
+    assert hus[2].duty == 0. and not any(hu is hus[2] for hu in H3.heat_utilities)
+    message = (r"the heat utilities of {} are not \(or no longer\) among their "
+               r"units' heat_utilities: biosteam gives a unit new heat utilities "
+               r"each time it is simulated, emptying the former ones, so a "
+               r"selection is valid until its units are simulated again; select "
+               r"them again after any simulation, e\.g\. bst\.process_tools\."
+               r"heat_exchanger_utilities_from_units\(sys\.units\)$")
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', RuntimeWarning)
+        with pytest.raises(ValueError, match=message.format("'H3'")):
+            PinchTargets.from_heat_utilities(hus, 10.)
+    now = PinchTargets.from_heat_utilities(select(), 10.)
+    assert now.labels == ['C1', 'H1', 'H3']
+    assert (now.Q_hot, now.Q_cold) == (pytest.approx(1.08e5, rel=1e-9),
+                                       pytest.approx(3.6e5, rel=1e-9))
+    # the whole system simulated: every heat utility of the former selection
+    # is empty, and each unit is named
+    sys.simulate()
+    with pytest.raises(ValueError, match=message.format("'H1', 'C1', 'H3'")):
+        PinchTargets.from_heat_utilities(hus, 10.)
+    again = PinchTargets.from_heat_utilities(select(), 10.)
+    assert (again.Q_hot, again.Q_cold) == (now.Q_hot, now.Q_cold)
 
 def test_from_heat_utilities_after_replaced_heat_utilities(kemp_hxn, kemp_hxn_replaced):
     # biosteam's selection after a simulation with
@@ -2714,7 +2771,7 @@ def test_facility_targets_changed_inlet():
         "the inlet and outlet of 'C1' differ in flow (its inlet changed since "
         'its unit was simulated?): the targets take its stream from its inlet '
         'now to its former outlet, a state of no process; simulate the system '
-        '(or its units) first']
+        '(or its units) first, then select the heat utilities again']
     assert [x.filename for x in w] == [__file__]
     assert (selection.Q_hot, selection.Q_cold) == (t.Q_hot, t.Q_cold)
     # the report raises, without the warning

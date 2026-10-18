@@ -1165,7 +1165,10 @@ class PinchTargets:
             ``bst.process_tools.heat_exchanger_utilities_from_units(sys.units)``
             (those a heat exchanger network may take, ``hu.hxn_ok``, as
             `HeatExchangerNetwork` selects them), not ``sys.heat_utilities``
-            (sums by agent, of no unit). Zero-duty ones are dropped. Each
+            (sums by agent, of no unit). A selection is valid until its
+            units are simulated again: biosteam then gives each unit new
+            heat utilities, emptying the former ones, so select them again
+            after any simulation. Zero-duty ones are dropped. Each
             counts once per occurrence, a stream each, as in the synthesis:
             biosteam lists the heat utility of a unit in parallel
             (``Unit.parallel``, as the recirculation heat exchanger of a
@@ -1214,9 +1217,11 @@ class PinchTargets:
         Raises
         ------
         ValueError
-            If a heat utility belongs to no unit, or one with duty is not a
-            heat exchanger's (``hu.hxn_ok`` False, as for the heat utilities
-            that reactors, mixers or compressors add with
+            If a heat utility belongs to no unit, or is not (or no longer)
+            among its unit's ``heat_utilities`` (of a selection made before
+            its unit was simulated again), or one with duty is not a heat
+            exchanger's (``hu.hxn_ok`` False, as for the heat utilities that
+            reactors, mixers or compressors add with
             ``Unit.add_heat_utility``: their unit's first inlet and outlet
             need not be the stream they heat or cool). If the heat utilities
             with duty of a unit are given more often than its
@@ -1252,11 +1257,11 @@ class PinchTargets:
             (a feed changed, its unit not simulated since), and the targets
             take its stream from that new inlet to the outlet of the former
             state, a state of no process: simulate the system (or the
-            units) first. A change of temperature alone keeps the flows
-            equal and warns of nothing: the targets are then of the new
-            inlet and of the outlet as last simulated, which is the
-            outlet's state now if the unit sets it by temperature (as a
-            `biosteam.HXutility` with ``T`` does).
+            units) first, then select the heat utilities again. A change of
+            temperature alone keeps the flows equal and warns of nothing:
+            the targets are then of the new inlet and of the outlet as last
+            simulated, which is the outlet's state now if the unit sets it
+            by temperature (as a `biosteam.HXutility` with ``T`` does).
 
         """
         hus = list(hus)
@@ -1272,6 +1277,21 @@ class PinchTargets:
                              'exchanger (hu.unit), not be one of '
                              'System.heat_utilities (sums by agent, of no '
                              f'unit): {selection}')
+        # biosteam gives a unit new heat utilities each time it is simulated,
+        # emptying the former ones (no duty), which would drop out silently
+        former = [hu for hu in hus
+                  if not any(i is hu for i in hu.unit.heat_utilities)]
+        if former:
+            names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
+                                            for hu in former))
+            raise ValueError(f'the heat utilities of {names} are not (or no '
+                             "longer) among their units' heat_utilities: "
+                             'biosteam gives a unit new heat utilities each '
+                             'time it is simulated, emptying the former ones, '
+                             'so a selection is valid until its units are '
+                             'simulated again; select them again after any '
+                             'simulation, e.g. bst.process_tools.heat_'
+                             'exchanger_utilities_from_units(sys.units)')
         others = [hu for hu in hus if hu.duty and not hu.hxn_ok]
         if others:
             names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
@@ -1333,7 +1353,7 @@ class PinchTargets:
         hxs = [hu.unit for hu in arranged]
         labels = [_unit_label(hx, holders) for hx in hxs]
         # before the targets, whose streams a changed inlet may reverse
-        _warn_stale(_stale_labels(hxs, labels))
+        _warn_stale(_stale_labels(hxs, labels), reselect=True)
         try:
             self = cls._from_exchangers(hxs, is_hot, T_min_app, contributions,
                                         force_ideal_thermo, labels, arranged,
@@ -1352,7 +1372,7 @@ class PinchTargets:
                 'inlet has changed since its unit was simulated (a feed '
                 'changed, or a recycle converged loosely?); simulate the '
                 'system (or its units) first, converging any recycle more '
-                'tightly') from None
+                'tightly, then select the heat utilities again') from None
         self.key_units = key_units
         return self
 
@@ -2759,23 +2779,25 @@ def _stale_labels(hxs, labels):
             stale.append(label)
     return stale
 
-def _warn_stale(labels, of=''):
+def _warn_stale(labels, of='', reselect=False):
     """Warn (see `_warn`) of the streams of `labels` (see `_stale_labels`),
-    if any, in the targets `of` names (e.g. ``' of HXN'``)."""
+    if any, in the targets `of` names (e.g. ``' of HXN'``); with `reselect`
+    (targets of a selection of heat utilities, which a simulation of their
+    units leaves behind), saying to select them again after simulating."""
     if not labels: return
     names = ', '.join(map(repr, labels))
+    advice = 'simulate the system (or its units) first'
+    if reselect: advice += ', then select the heat utilities again'
     if len(labels) == 1:
         _warn(f'the inlet and outlet of {names} differ in flow (its inlet '
               'changed since its unit was simulated?): the targets'
               f'{of} take its stream from its inlet now to its former '
-              'outlet, a state of no process; simulate the system (or its '
-              'units) first')
+              f'outlet, a state of no process; {advice}')
     else:
         _warn(f'the inlets and outlets of {names} differ in flow (their '
               'inlets changed since their units were simulated?): the '
               f'targets{of} take their streams from their inlets now to '
-              'their former outlets, states of no process; simulate the '
-              'system (or its units) first')
+              f'their former outlets, states of no process; {advice}')
 
 def _rebuilt_label(hxs, labels, units):
     """The label (of `labels`, aligned with `hxs`) of the first of the
