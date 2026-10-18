@@ -1418,6 +1418,8 @@ def test_sensible_agent_without_driving_force():
     assert [str(x.message) for x in w] == [
         f'no heating agent can serve {steam.duty:.6g} kJ/hr of the hot utility '
         'target; it is left unserved']
+    # at the caller's line, not at hensmith's
+    assert [x.filename for x in w] == [__file__]
     # cooling: a condenser at a coolant's limit goes to the next coolant
     test_hxn_targets.setup('test_targeting_stuck_condenser', ['Water'])
     P = bst.settings.chemicals.Water.Psat(305.)
@@ -2049,8 +2051,9 @@ def test_from_heat_utilities_after_replaced_heat_utilities(kemp_hxn, kemp_hxn_re
                r"than their process streams' .*they hold the utilities of "
                r"HeatExchangerNetwork 'HXN', simulated with "
                r"replace_unit_heat_utilities=True.*take HXN.targets\(\) instead")
-    with pytest.warns(RuntimeWarning, match=message):
+    with pytest.warns(RuntimeWarning, match=message) as record:
         t = PinchTargets.from_heat_utilities(hus, 10.)
+    assert [w.filename for w in record] == [__file__] # the caller's line
     assert t.labels == ['C1', 'H4']
     facility = HXN.targets()
     assert facility.labels == ['C1', 'C3', 'H2', 'H4']
@@ -2489,6 +2492,81 @@ def test_facility_targets_reversed_stream():
         assert t.Q_hot == pytest.approx(fresh.Q_hot, abs=1e-6)
         assert t.Q_cold == pytest.approx(fresh.Q_cold, rel=1e-12)
         assert t.Q_cold > 1e6 > HXN.synthesis_info['Q_cold_target']
+
+def test_facility_targets_changed_inlet():
+    # A feed changed in flow since its unit was simulated: each stream runs
+    # from its exchanger's inlet now to its outlet as last simulated, so the
+    # targets mix a new inlet with a former outlet (a state of no process),
+    # with a RuntimeWarning at the caller's line; the report raises instead
+    def stale_warnings(f, *args):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter('always')
+            result = f(*args)
+        return result, [x for x in w if 'differ in flow' in str(x.message)]
+    units = cp_units('test_targeting_changed_inlet', KEMP, K)
+    sys, HXN = simulate_HXN(units, 10.)
+    C1, C3 = units[0], units[2]
+    assert (C1.ID, C3.ID) == ('C1', 'C3')
+    hus = [u.heat_utilities[0] for u in units]
+    simulated, w = stale_warnings(HXN.targets)
+    assert not w
+    C1.ins[0].F_mass *= 2.
+    t, w = stale_warnings(HXN.targets)
+    assert [str(x.message) for x in w] == [
+        "the inlet and outlet of 'C1' differ in flow (its inlet changed since "
+        'its unit was simulated?): the targets of HXN take its stream from '
+        'its inlet now to its former outlet, a state of no process; simulate '
+        'the system (or its units) first']
+    assert [x.filename for x in w] == [__file__]
+    # (the stale targets are of neither state)
+    assert t.Q_hot != simulated.Q_hot
+    selection, w = stale_warnings(PinchTargets.from_heat_utilities, hus, 10.)
+    assert [str(x.message) for x in w] == [
+        "the inlet and outlet of 'C1' differ in flow (its inlet changed since "
+        'its unit was simulated?): the targets take its stream from its inlet '
+        'now to its former outlet, a state of no process; simulate the system '
+        '(or its units) first']
+    assert [x.filename for x in w] == [__file__]
+    assert (selection.Q_hot, selection.Q_cold) == (t.Q_hot, t.Q_cold)
+    # the report raises, without the warning
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter('always')
+        with pytest.raises(ValueError, match='not of the current states of C1.*simulate the system'):
+            network_report(HXN)
+    assert not [x for x in w if 'differ in flow' in str(x.message)]
+    # two streams: both named
+    C3.ins[0].F_mass *= 0.5
+    stale, w = stale_warnings(HXN.targets)
+    assert len(w) == 1 and str(w[0].message).startswith(
+        "the inlets and outlets of 'C1', 'C3' differ in flow (their inlets "
+        'changed since their units were simulated?): the targets of HXN take '
+        'their streams')
+    # the units simulated alone: the targets of the process now, which the
+    # system's simulation synthesizes to
+    C1.simulate(); C3.simulate()
+    now, w = stale_warnings(HXN.targets)
+    assert not w and now.Q_hot != stale.Q_hot
+    simulate_strictly(sys)
+    info = HXN.synthesis_info
+    assert (now.Q_hot, now.Q_cold) == (pytest.approx(info['Q_hot_target'], rel=1e-12),
+                                       pytest.approx(info['Q_cold_target'], rel=1e-12))
+    # a change of temperature alone keeps the flows equal: no warning, and
+    # the targets of a unit that sets its outlet by temperature are right
+    C1.ins[0].T -= 5.
+    t, w = stale_warnings(HXN.targets)
+    assert not w
+    C1.simulate()
+    assert HXN.targets().Q_hot == t.Q_hot
+    # before any simulation of the facility: the targets of the units' heat
+    # utilities warn (once)
+    units = cp_units('test_targeting_changed_inlet_alone', KEMP, K)
+    for u in units: u.simulate()
+    HXN = HeatExchangerNetwork('HXN', T_min_app=10., units=units)
+    units[3].ins[0].F_mass *= 1.5
+    _, w = stale_warnings(HXN.targets)
+    assert len(w) == 1 and str(w[0].message).startswith(
+        "the inlet and outlet of 'H4' differ in flow (its inlet changed")
+    assert w[0].filename == __file__
 
 def test_facility_targets_replaced_callable():
     # replace_unit_heat_utilities overwrites the heat utilities a callable

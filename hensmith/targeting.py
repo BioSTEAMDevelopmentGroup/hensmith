@@ -20,6 +20,7 @@ compares a synthesized network with its targets. `plot_composite_curves`,
 `plot_grand_composite_curve` and `plot_supertargets` draw them.
 """
 import math
+import os
 from collections import namedtuple
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -81,6 +82,15 @@ _SUMMARY_OPTIONS = ('heating_agents', 'cooling_agents', 'h', 'h_utilities',
 
 #: The options of `PinchTargets.summary` whose agents `h_utilities` may key.
 _OPTION_AGENTS = 'heating_agents or cooling_agents'
+
+#: The frames that a warning of `_warn` skips: those of hensmith itself.
+_PACKAGE_FRAMES = (os.path.dirname(os.path.abspath(__file__)) + os.sep,)
+
+#: The difference between the flows of an exchanger's first inlet and
+#: outlet, relative to the larger, beyond which its inlet has changed since
+#: its unit was simulated (see `_stale_labels`): far above a legitimate one,
+#: as of the total condenser of a `biosteam.MESHDistillation` (about 0.1 %).
+_STALE_FLOW = 1e-2
 
 UtilityTarget = namedtuple('UtilityTarget', (
     'ID', 'agent', 'heating', 'level', 'duty', 'utility_duty', 'flow', 'cost',
@@ -441,8 +451,8 @@ def _bath(hot, cold):
     zero = np.flatnonzero(np.minimum(d1, d2) <= _DT_ZERO)
     if zero.size:
         k = zero[0]
-        warn('vertical heat transfer at a non-positive driving force between '
-             f'H = {x[k]:.6g} and {y[k]:.6g} kJ/hr', RuntimeWarning)
+        _warn('vertical heat transfer at a non-positive driving force between '
+              f'H = {x[k]:.6g} and {y[k]:.6g} kJ/hr')
         return math.inf
     LMTD = _lmtd(d1, d2)
     return float(np.sum((y - x) * (hot[4][i] + cold[4][j]) / 3600. / LMTD))
@@ -1191,6 +1201,18 @@ class PinchTargets:
             of a `biosteam.MESHDistillation` with ``full_condenser=True``
             reports a duty about 0.1 % off the enthalpy change of its own
             streams, for instance).
+        RuntimeWarning
+            If the first inlet and outlet of a heat utility's unit differ in
+            flow (``ins[0].mol`` and ``outs[0].mol``) by more than 1 % of
+            the larger: its inlet has changed since its unit was simulated
+            (a feed changed, its unit not simulated since), and the targets
+            take its stream from that new inlet to the outlet of the former
+            state, a state of no process: simulate the system (or the
+            units) first. A change of temperature alone keeps the flows
+            equal and warns of nothing: the targets are then of the new
+            inlet and of the outlet as last simulated, which is the
+            outlet's state now if the unit sets it by temperature (as a
+            `biosteam.HXutility` with ``T`` does).
 
         """
         hus = list(hus)
@@ -1238,14 +1260,14 @@ class PinchTargets:
             names = ', '.join(dict.fromkeys(repr(_unit_label(hu.unit))
                                             for hu in replaced))
             IDs = list(dict.fromkeys(networks[id(hu)].ID for hu in replaced))
-            warn(f'the heat utilities of {names} have duties (hu.unit_duty) '
-                 'other than their process streams\' (outs[0].H - ins[0].H), '
-                 'which the targets use: they hold the utilities of '
-                 f"HeatExchangerNetwork {', '.join(map(repr, IDs))}, "
-                 'simulated with replace_unit_heat_utilities=True, and the '
-                 'streams it serves completely have none and are left out; '
-                 f"take {' or '.join(f'{ID}.targets()' for ID in IDs)} "
-                 'instead', RuntimeWarning)
+            _warn(f'the heat utilities of {names} have duties (hu.unit_duty) '
+                  'other than their process streams\' (outs[0].H - ins[0].H), '
+                  'which the targets use: they hold the utilities of '
+                  f"HeatExchangerNetwork {', '.join(map(repr, IDs))}, "
+                  'simulated with replace_unit_heat_utilities=True, and the '
+                  'streams it serves completely have none and are left out; '
+                  f"take {' or '.join(f'{ID}.targets()' for ID in IDs)} "
+                  'instead')
         if key_units is not None: key_units = _with_auxiliaries(key_units)
         values = _explicit_contributions(hus, approach_contributions, T_min_app,
                                          key_units)
@@ -1262,6 +1284,7 @@ class PinchTargets:
                                     force_ideal_thermo, None, arranged,
                                     holders)
         self.key_units = key_units
+        _warn_stale(_stale_labels(self.units, self.labels))
         return self
 
     @classmethod
@@ -1661,13 +1684,13 @@ class PinchTargets:
             fuels = [a for a in heating_agents if a.isfuel]
             heat.append((math.inf, remaining, fuels[0] if fuels else None))
             if not fuels:
-                warn(f'no heating agent can serve {remaining:.6g} kJ/hr of the '
-                     'hot utility target; it is left unserved', RuntimeWarning)
+                _warn(f'no heating agent can serve {remaining:.6g} kJ/hr of '
+                      'the hot utility target; it is left unserved')
         cool, remaining = self._allocate(cooling_agents, self.Q_cold, False)
         if remaining > tol:
             cool.append((-math.inf, remaining, None))
-            warn(f'no cooling agent can serve {remaining:.6g} kJ/hr of the '
-                 'cold utility target; it is left unserved', RuntimeWarning)
+            _warn(f'no cooling agent can serve {remaining:.6g} kJ/hr of the '
+                  'cold utility target; it is left unserved')
         # the stretch each agent serves: from its level, clipped to the grid,
         # to the next zero of the balanced curve, the pinch or a utility pinch
         Ts, arr, lea = self._gcc()
@@ -2481,14 +2504,13 @@ def supertarget(targets, T_min_apps=None, refine=3, n_refine=8,
     sweep = Supertargets(targets, records, options, scale_contributions)
     unserved = int(np.isnan(sweep['utility_cost']).sum())
     if unserved:
-        warn(f'{unserved} of the {len(records)} minimum approach temperatures '
-             'evaluated leave part of a utility target unserved (no agent '
-             'given can serve it), so their TAC is nan', RuntimeWarning)
+        _warn(f'{unserved} of the {len(records)} minimum approach '
+              'temperatures evaluated leave part of a utility target '
+              'unserved (no agent given can serve it), so their TAC is nan')
     if not np.isfinite(sweep['TAC']).any():
-        warn('no minimum approach temperature of the sweep has a finite TAC '
-             '(each has an unserved utility or an infinite area), so it is '
-             'not refined and its optimum, the smallest, is meaningless',
-             RuntimeWarning)
+        _warn('no minimum approach temperature of the sweep has a finite TAC '
+              '(each has an unserved utility or an infinite area), so it is '
+              'not refined and its optimum, the smallest, is meaningless')
     return sweep
 
 
@@ -2584,8 +2606,8 @@ def _profile_area(x, dT, inv_U, ID, cause=''):
     (followed by `cause`) at a driving force of `_DT_ZERO` or less.
     """
     if dT.min() <= _DT_ZERO:
-        warn(f'{ID} transfers heat at a driving force of {dT.min():.6g} K'
-             f'{cause}', RuntimeWarning)
+        _warn(f'{ID} transfers heat at a driving force of {dT.min():.6g} K'
+              f'{cause}')
         return math.inf
     LMTD = _lmtd(dT[:-1], dT[1:])
     return float(np.sum(np.diff(x) / LMTD)) * inv_U / 3600.
@@ -2648,6 +2670,43 @@ def _check_targets(HXN, targets):
                              f'{_unit_label(hx, targets._holders)} '
                              '(simulated since?): make '
                              'them again with HXN.targets()')
+
+def _warn(message):
+    """Warn `message` (a RuntimeWarning) at the line that called hensmith,
+    the first frame outside the package, not at a line of the package."""
+    warn(message, RuntimeWarning, skip_file_prefixes=_PACKAGE_FRAMES)
+
+def _stale_labels(hxs, labels):
+    """The labels (of `labels`, aligned with `hxs`) of the exchangers `hxs`
+    whose first inlet and outlet differ in flow (``ins[0].mol`` and
+    ``outs[0].mol``) by more than `_STALE_FLOW` of the larger: an inlet
+    changed since its unit was simulated, whose stream the targets would
+    take from that new inlet to the outlet of the former state."""
+    stale = []
+    for hx, label in zip(hxs, labels):
+        a, b = hx.ins[0].mol, hx.outs[0].mol
+        if a.size == b.size and (np.abs(a - b).sum()
+                                 > _STALE_FLOW * max(a.sum(), b.sum())):
+            stale.append(label)
+    return stale
+
+def _warn_stale(labels, of=''):
+    """Warn (see `_warn`) of the streams of `labels` (see `_stale_labels`),
+    if any, in the targets `of` names (e.g. ``' of HXN'``)."""
+    if not labels: return
+    names = ', '.join(map(repr, labels))
+    if len(labels) == 1:
+        _warn(f'the inlet and outlet of {names} differ in flow (its inlet '
+              'changed since its unit was simulated?): the targets'
+              f'{of} take its stream from its inlet now to its former '
+              'outlet, a state of no process; simulate the system (or its '
+              'units) first')
+    else:
+        _warn(f'the inlets and outlets of {names} differ in flow (their '
+              'inlets changed since their units were simulated?): the '
+              f'targets{of} take their streams from their inlets now to '
+              'their former outlets, states of no process; simulate the '
+              'system (or its units) first')
 
 def _rebuilt_label(hxs, labels, units):
     """The label (of `labels`, aligned with `hxs`) of the first of the
@@ -2948,7 +3007,8 @@ def network_report(HXN, targets=None, **options):
     if not hasattr(HXN, 'new_HXs_hot_side'):
         raise RuntimeError('simulate the heat exchanger network before '
                            'reporting on it')
-    # (without the warning of stages rebuilt since: _check_network raises)
+    # (without the warnings of stages rebuilt since and of inlets changed
+    # in flow since: _check_network raises)
     if targets is None: targets = HXN._pinch_targets()[0]
     else: _check_targets(HXN, targets)
     _check_network(HXN, targets)

@@ -640,8 +640,10 @@ report keeps BioSTEAM's specification of the utility, whose cost it reports;
 the target, which keeps a sensible agent's line inside the grand composite
 curve, stays finite. The report checks that its targets and the network's
 streams are both of the units' current states: after a stream or a unit
-changes, it raises a ``ValueError`` until the system is simulated again. The
-comparison has limits:
+changes, it raises a ``ValueError`` until the system is simulated again
+(``HXN.targets()`` warns meanwhile of a stream whose inlet has changed in flow
+since its unit was simulated, whose targets would run from that new inlet to
+its former outlet). The comparison has limits:
 
 - the Bath target bounds the area only with equal film coefficients and the
   same utilities;

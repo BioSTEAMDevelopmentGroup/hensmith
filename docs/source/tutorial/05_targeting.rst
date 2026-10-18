@@ -60,7 +60,11 @@ duty by its agent's heat transfer efficiency, 0.95 for steam, and 2.828e+08 /
 
 Nothing is stored on the facility, and nothing is re-synthesized: the targets
 are those of the units' current states, which, with ``cache_network=True``,
-can differ from the cached network's. The same object can be built without a
+can differ from the cached network's. Each stream runs from its unit's inlet
+now to its outlet as the unit was last simulated, so after a feed changes,
+simulate the system (or the units) before targeting: a stream whose inlet has
+changed in flow since warns that its targets mix the new inlet with the former
+outlet, a state of no process. The same object can be built without a
 facility, from the heat utilities of heat exchangers with
 :meth:`PinchTargets.from_heat_utilities <hensmith.PinchTargets.from_heat_utilities>`
 (as the trade-off example below does) or from streams as

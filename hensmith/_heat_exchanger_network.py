@@ -1091,6 +1091,12 @@ class HeatExchangerNetwork(bst.Facility):
             exchanger no longer among the facility's units and their nested
             auxiliaries (rebuilt since the facility's last simulation, see
             Notes): the targets are of its former state.
+        RuntimeWarning
+            If the first inlet and outlet of a stream's exchanger differ in
+            flow (``ins[0].mol`` and ``outs[0].mol``) by more than 1 % of
+            the larger: its inlet has changed since its unit was simulated
+            (see Notes), and the targets take the stream from that new
+            inlet to the outlet of the former state, a state of no process.
 
         Notes
         -----
@@ -1128,7 +1134,14 @@ class HeatExchangerNetwork(bst.Facility):
         states, until the system is simulated again: the targets are then
         of those former states, not of the process now, with a
         RuntimeWarning (`hensmith.targeting.network_report` raises
-        meanwhile).
+        meanwhile). Each stream runs from its exchanger's inlet now to its
+        outlet as its unit last left it: after a feed or another stream
+        changes, simulate the system before targeting (or the units alone,
+        which gives the targets of the process now). A stream whose inlet
+        has changed in flow meanwhile warns (see Warns); a change of
+        temperature alone keeps the flows equal and warns of nothing, its
+        targets being right only if its unit sets its outlet by
+        temperature (as a `biosteam.HXutility` with ``T`` does).
 
         Examples
         --------
@@ -1169,22 +1182,29 @@ class HeatExchangerNetwork(bst.Facility):
         <PinchTargets: 4 streams, T_min_app = 20 K, Q_hot = 4.834e+05 kJ/hr, Q_cold = 8.658e+05 kJ/hr>
 
         """
-        targets, rebuilt = self._pinch_targets(T_min_app)
+        from .targeting import _warn_stale
+        targets, rebuilt, stale = self._pinch_targets(T_min_app)
         if rebuilt is not None:
             warn(f'the targets of {self.ID} are of the former state of '
                  f"{rebuilt}, which is no longer one of the facility's units "
                  "nor an auxiliary of one (rebuilt since the facility's last "
                  'simulation?): simulate the system for those of the process '
                  'now', RuntimeWarning, stacklevel=2)
+        _warn_stale(stale, f' of {self.ID}')
         return targets
 
     def _pinch_targets(self, T_min_app=None):
-        """`targets` (see there) and the label of the first of their
-        streams whose exchanger is no longer among the facility's units,
-        their nested auxiliaries and the exchangers they hold through their
-        heat utilities only (rebuilt since the last simulation), or None
-        (always before a simulation)."""
-        from .targeting import PinchTargets, _rebuilt_label
+        """`targets` (see there), the label of the first of their streams
+        whose exchanger is no longer among the facility's units, their
+        nested auxiliaries and the exchangers they hold through their heat
+        utilities only (rebuilt since the last simulation), or None, and
+        the labels of the streams whose exchanger's inlet has changed in
+        flow since its unit was simulated (see
+        `hensmith.targeting._stale_labels`). Both are None and empty
+        before a simulation, whose targets,
+        `PinchTargets.from_heat_utilities`, warn of the latter
+        themselves."""
+        from .targeting import PinchTargets, _rebuilt_label, _stale_labels
         if T_min_app is None: T_min_app = self.T_min_app
         if (hasattr(self, 'original_heat_exchangers')
                 and hasattr(self, 'original_heat_utils')):
@@ -1221,7 +1241,8 @@ class HeatExchangerNetwork(bst.Facility):
                 None, hus, _held_owners([*hxs, *key_units], held))
             targets.key_units = key_units
             targets.system = self.system
-            return targets, _rebuilt_label(hxs, targets.labels, key_units)
+            return (targets, _rebuilt_label(hxs, targets.labels, key_units),
+                    _stale_labels(hxs, targets.labels))
         if self.system is None and not self.units:
             raise RuntimeError('simulate the system (or give the facility its '
                                'units) before targeting')
@@ -1232,7 +1253,7 @@ class HeatExchangerNetwork(bst.Facility):
             hx_utils, T_min_app, self._network_contributions(hx_utils, units),
             self.force_ideal_thermo, self.sort_hus_by_T, key_units=units)
         targets.system = self.system
-        return targets, None
+        return targets, None, []
 
     def get_original_hxs_associated_with_streams(self): # pragma: no cover
         original_units = self.system.units
