@@ -6,7 +6,9 @@ temperature of 5 K, every unit of the system in scope, and one small
 five-stream flowsheet. This chapter varies all three. It sweeps ``T_min_app``
 over the quickstart system to expose the trade-off between recovered heat and
 added area, lets hensmith split streams where the targets need it
-(``stream_splitting=True``), narrows the analysis with ``ignored=``, goes
+(``stream_splitting=True``), gives some streams their own approach
+temperature contributions (``approach_contributions=``), narrows the
+analysis with ``ignored=``, goes
 through the remaining constructor options of :class:`~hensmith.HeatExchangerNetwork` one by one, and
 finishes by synthesizing a ten-stream network with ten process exchangers.
 
@@ -80,7 +82,9 @@ every breakpoint of both streams' temperature-enthalpy curves, and verified on
 their exact states. A smaller approach therefore admits more matches and lets
 each one transfer more heat, but the exchangers that do so work across a
 smaller temperature difference and need more area for the same duty -- which
-is what the right-hand panel below prices.
+is what the right-hand panel below prices. ``T_min_app`` holds every match to
+the same floor; `Approach temperature contributions`_ below relaxes it for
+the streams that need less.
 
 The cost does not fall monotonically, though: it rises from 6.004e+05 USD at
 10 K to 6.684e+05 USD at 15 K, and the last three columns say why. Up to 10 K
@@ -124,8 +128,9 @@ makes the split instead.
    part of the cost curve: 2.977e+08 kJ/hr of heating, 1.936e+06 kJ/hr of
    cooling and 1.112e+06 USD of added installed cost. Choosing ``T_min_app`` is
    choosing a point on these two curves; the economically sensible one depends
-   on utility prices and on the cost of exchanger area, neither of which the
-   network optimizes for you.
+   on utility prices and on the cost of exchanger area; synthesis does not
+   optimize them, but :doc:`05_targeting` targets both and finds the
+   ``T_min_app`` that minimizes their sum.
 
 Splitting streams
 -----------------
@@ -166,6 +171,62 @@ described in ``HXN.synthesis_info['splits']``. A side that a network without
 splits serves is planned exactly as without the option, so the MER networks of
 the sweep at 2, 5 and 10 K would come out the same. :doc:`../concepts`
 describes the method and its guarantee.
+
+Approach temperature contributions
+----------------------------------
+
+``T_min_app`` is one number for every match, but the film coefficients behind
+it are not: a condensing or boiling stream transfers heat far more readily
+than a liquid that is only cooled, and can work across a smaller temperature
+difference for the same area. ``approach_contributions`` gives streams their
+own approach temperature contribution, in K. A match between a hot and a cold
+stream must then keep the sum of their two contributions instead of
+``T_min_app``, everywhere inside it, and a stream without a contribution
+contributes ``T_min_app / 2``, so that two such streams still need
+``T_min_app``. Like ``stream_splitting`` it is a plain attribute of the
+facility. Its keys name units: ``'D1'`` covers both auxiliary exchangers of
+the column, its condenser and its reboiler, and ``F1``, the flash itself,
+covers the auxiliary heater of its feed.
+
+.. literalinclude:: /../_demo_src/examples/ch04_configuring.py
+   :language: python
+   :start-after: # [start:contributions]
+   :end-before: # [end:contributions]
+   :dedent:
+
+.. literalinclude:: /_generated/ch04_contributions.txt
+   :language: text
+
+``synthesis_info['approach_contributions']`` lists the contributions as used,
+in the stream order of ``original_heat_exchangers``: the reboiler (stream 0),
+the flash's heater (1) and the condenser (3) contribute 1 K each, and the two
+product coolers (2 and 4) the default 2.5 K. Each match requires the sum over
+its two streams, read off the stream life cycles: 3.5 K for ``HX_1_2_hs`` and
+``HX_0_4_hs``, which each pair a cooler with a phase-changing stream, and
+2.0 K for ``HX_0_3_hs``, which pairs the condenser with the reboiler. Each of
+these exchangers is a ``HXprocess`` whose ``dT`` is its own requirement less
+1e-6 K.
+
+The network reaches its targets -- status ``mer`` -- with three process
+exchangers. Compared with the 5 K network of the sweep (four exchangers,
+2.977e+08 kJ/hr of heating, 1.936e+06 kJ/hr of cooling and 1.112e+06 USD of
+added installed cost), it uses 2.967e+08 kJ/hr of heating and 1.014e+06 kJ/hr
+of cooling, for 1.449e+06 USD. All three numbers lie between those of the
+5 K network and of the 2 K one (2.957e+08 and 9.219e+04 kJ/hr, 2.02e+06 USD):
+more heat is recovered than at 5 K, at the price of more area, but every
+match with a cooler still needs 3.5 K rather than the 2 K that the sweep's
+first point allows every match. The smallest approach inside any of the
+three exchangers is 3.500 K, so the 2.0 K match stays well clear of its
+requirement; the margin over the requirement, -1.3e-12 K, says that a 3.5 K
+match is held at exactly its requirement, to round-off (the exact check
+allows 1e-6 K below it). Setting ``approach_contributions`` back to ``None``
+restores the default on the next simulation. :doc:`../concepts` gives the
+shifted scale that makes the targets exact for any contributions, and the
+full key rules:
+``(owner.ID, unit.ID)`` keys for the auxiliary units of that ID under the
+top owner, the nearest key
+along a unit's owners winning, and keys that are checked even while their
+unit is idle.
 
 Scoping the analysis
 --------------------
@@ -218,10 +279,12 @@ Other options
 The remaining keyword arguments of :class:`~hensmith.HeatExchangerNetwork` are
 listed in the :doc:`../API/api` reference; what each of them does to the
 synthesis is described below (``stream_splitting`` in `Splitting streams`_
+and ``approach_contributions`` in `Approach temperature contributions`_
 above). Five of them -- ``Qmin``, ``force_ideal_thermo``, ``avoid_recycle``,
 ``sort_hus_by_T`` and ``stream_splitting`` -- are passed straight through to
 :func:`~hensmith.synthesize_network`, which can also be called directly on a
-list of heat utilities.
+list of heat utilities; ``approach_contributions`` is first resolved by the
+facility to one value per heat utility (keys naming idle units ignored).
 
 ``Qmin`` is a duty floor, in kJ/hr, defaulting to 1e-3. A planned exchanger
 whose duty is below it (``Q < Qmin``) is dropped from the plan and its duty
@@ -238,8 +301,11 @@ stream that finishes on process heat alone carries no utility symbol.
 simulations, which is worth doing when the same system is simulated many times
 with slightly different inputs, as in a Monte Carlo or a sensitivity analysis.
 When it is on and a network has already been synthesized, the units owning the
-current heat utilities are compared with the exchangers behind the cached one;
-if the sets are identical the cached network is kept and only the stream states
+current heat utilities are compared with the exchangers behind the cached one
+(each as often as it gives a stream, as a unit in parallel does once per unit),
+and the explicit approach contributions, resolved to one value per stream,
+with those the cached network was synthesized with; if both match, the cached
+network is kept and only the stream states
 and the exchanger specifications are updated. Each life cycle's first inlet is
 copied from the current stream. Each process exchanger keeps, as the enthalpy
 limit of the stream its side of the pinch must serve completely (the hot
@@ -380,6 +446,9 @@ the real streams.
 Where to next
 -------------
 
+- :doc:`05_targeting` -- targeting the area, units and cost that this
+  chapter's sweep traded against the utilities, and the ``T_min_app`` that
+  minimizes the total annualized cost.
 - :doc:`../concepts` -- the pinch concepts, the MER planner and the
   validation behind everything shown in this tutorial.
 - :doc:`../API/api` -- the full API reference, including a table of every

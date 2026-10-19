@@ -34,7 +34,10 @@ are collapsed to the conservative temperature: the lowest for a hot stream,
 the highest for a cold one. Interior knots within ``_KNOT_TOL`` K of the
 chord through their neighbours are dropped, so a constant-CP stream becomes
 a single segment and the fast paths apply. On the *shifted* scale ``T*``,
-hot streams are moved down by ``T_min_app`` and cold streams are not moved.
+stream j is moved down by its shift ``s_j``: ``T_min_app`` for hot and 0
+for cold streams, or ``T_min_app/2 + c_j`` (hot) and ``T_min_app/2 - c_j``
+(cold) with approach contributions ``c_j``, so a pair feasible on the
+shifted scale keeps ``c_h + c_c``.
 Shifted temperatures closer than ``_LEVEL_EQ`` K are merged, exactly as the
 problem table merges its grid.
 
@@ -54,10 +57,10 @@ stream gets a non-decreasing *level curve* ``phi(q)``:
 ====== ====== ===== =======================
 side   stream role  level ``y``
 ====== ====== ===== =======================
-above  hot    must  ``T - T_min_app``
-above  cold   flex  ``T``
-below  cold   must  ``-T``
-below  hot    flex  ``-(T - T_min_app)``
+above  hot    must  ``T - s_j``
+above  cold   flex  ``T - s_j``
+below  cold   must  ``-(T - s_j)``
+below  hot    flex  ``-(T - s_j)``
 ====== ====== ===== =======================
 
 A *must* stream has to be served completely by process matches on its side:
@@ -176,7 +179,8 @@ the targets.
 Guarantees and limits
 ---------------------
 - The utilities are never below the targets. Every planned exchanger keeps
-  ``T_min_app`` on the knot curves at its ends and at every knot inside it.
+  its pair's required approach (``T_min_app``, or ``c_h + c_c``) on the
+  knot curves at its ends and at every knot inside it.
   The heat balance closes on every stream, and ``'mer'`` is never claimed
   falsely. Results are deterministic.
 - Every pruning test is a necessary condition. A missed MER network can
@@ -229,6 +233,7 @@ References
 import math
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
+from numbers import Real
 
 import numpy as np
 
@@ -1862,11 +1867,81 @@ def _simplify(T, H, hot):
     return np.array(Tk), np.array(Hk)
 
 
-def _stream_curves(knots, is_hot, T_min_app):
-    """Validate, shift, snap and simplify every stream's knots; None for a
-    stream without duty."""
+def _contribution_value(x, label):
+    """
+    A stream's approach temperature contribution [K]: None for None or nan
+    (unspecified), ``float(x)`` for a finite real number > 0 (not a bool);
+    a ValueError naming `label` otherwise.
+    """
+    if x is None: return None
+    if isinstance(x, Real) and not isinstance(x, (bool, np.bool_)):
+        value = float(x)
+        if math.isnan(value): return None
+        if math.isfinite(value) and value > 0.: return value
+    raise ValueError(f'the approach contribution of {label} must be a '
+                     f'finite number > 0 K, or None, not {x!r}')
+
+
+def _given_contributions(N, T_min_app, contributions):
+    """
+    The validated contributions of `N` streams (a list of `N` values, see
+    `_contribution_value`), or None if `contributions` is None or every
+    value is unspecified (the default path, for any `T_min_app`). The
+    length is checked first, then every value, then, only when a value is
+    given, that `T_min_app` is finite and > 0.
+    """
+    if contributions is None: return None
+    contributions = list(contributions)
+    if len(contributions) != N:
+        raise ValueError(f'{len(contributions)} approach contributions given '
+                         f'for {N} streams')
+    values = [_contribution_value(x, f'stream {j}')
+              for j, x in enumerate(contributions)]
+    if all(x is None for x in values): return None
+    if not (math.isfinite(T_min_app) and T_min_app > 0.):
+        raise ValueError('T_min_app must be finite and > 0 with approach '
+                         f'contributions, not {T_min_app!r}')
+    return values
+
+
+def _approach_contributions(N, T_min_app, contributions=None):
+    """
+    The (N,) approach temperature contributions [K] of `N` streams:
+    `contributions` (one entry per stream, see `_given_contributions`) with
+    every unspecified one, or all of them if `contributions` is None, at
+    ``T_min_app / 2``.
+    """
+    half = T_min_app / 2.
+    values = _given_contributions(N, T_min_app, contributions)
+    if values is None: return np.full(N, half)
+    return np.array([half if x is None else x for x in values], dtype=float)
+
+
+def _approach_shifts(is_hot, T_min_app, contributions=None):
+    """
+    Each stream's shift onto the shifted scale, ``T* = T - shift``:
+    ``T_min_app`` for hot and 0 for cold streams without `contributions`
+    (or with every value unspecified), else ``T_min_app/2 + c`` for hot and
+    ``T_min_app/2 - c`` for cold streams (`_approach_contributions`), so
+    that a hot and a cold stream that touch on the shifted scale are ``c_h
+    + c_c`` apart. Unspecified contributions next to given ones keep the
+    default shifts bit for bit (``x/2 + x/2 == x``, ``x/2 - x/2 == 0.``).
+    """
+    is_hot = np.asarray(is_hot, dtype=bool)
+    values = _given_contributions(is_hot.size, T_min_app, contributions)
+    if values is None:
+        return np.where(is_hot, T_min_app, 0.)
+    half = T_min_app / 2.
+    c = np.array([half if x is None else x for x in values], dtype=float)
+    return np.where(is_hot, half + c, half - c)
+
+
+def _stream_curves(knots, is_hot, T_min_app, shift=None):
+    """Validate, shift (by `shift`, default `_approach_shifts`), snap and
+    simplify every stream's knots; None for a stream without duty."""
+    if shift is None: shift = _approach_shifts(is_hot, T_min_app)
     raw = []
-    for kn, hot in zip(knots, is_hot):
+    for j, (kn, hot) in enumerate(zip(knots, is_hot)):
         T, H = kn
         T = np.asarray(T, float).ravel()
         H = np.asarray(H, float).ravel()
@@ -1885,7 +1960,7 @@ def _stream_curves(knots, is_hot, T_min_app):
                              'non-decreasing')
         T = np.maximum.accumulate(T)
         H = np.maximum.accumulate(H)
-        raw.append(_simplify(T - (T_min_app if hot else 0.), H, hot))
+        raw.append(_simplify(T - shift[j], H, hot))
     if not raw:
         return []
     u = np.unique(np.concatenate([r[0] for r in raw]))
@@ -2042,7 +2117,8 @@ class Plan:
         Targets of the planner's cascade.
     pinch_T : float
         Pinch on the shifted scale (hot streams shifted down by
-        ``T_min_app``).
+        ``T_min_app`` by default): stream j's real pinch is at ``pinch_T +
+        shift_j`` (``plan.info['shift']`` with approach contributions).
     cut : {'above', 'below'}
         Side of the pinch the point loads at `pinch_T` belong to.
     exchangers : list[Exchanger]
@@ -2077,8 +2153,12 @@ class Plan:
         ``candidate`` and ``signature`` None),
         ``qmin_dropped`` (list of (side, hot, cold, Q)), ``dropped`` (matches
         removed by the safety net; always empty unless there is a bug),
-        ``min_approach`` (on the knot curves), ``work``, ``scale``,
-        ``tolQ``, ``cascade`` (the planner's problem table).
+        ``min_approach`` (the smallest real approach on the knot curves),
+        ``work``, ``scale``, ``tolQ``, ``cascade`` (the planner's problem
+        table); with `approach_contributions` also ``shift`` (each stream's
+        shift, ``T* = T - shift``) and ``min_approach_margin`` (the smallest
+        approach less its pair's required approach, on the shifted scale;
+        None without exchangers).
     """
     __slots__ = ('status', 'Q_hot_target', 'Q_cold_target', 'pinch_T', 'cut',
                  'exchangers', 'stages', 'utility', 'Q_hot', 'Q_cold',
@@ -2140,7 +2220,8 @@ def _walk(curves, recs, N):
 
 
 def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
-                 work_scale=1., stream_splitting=False, _split_exclude=None,
+                 work_scale=1., stream_splitting=False,
+                 approach_contributions=None, _split_exclude=None,
                  _split_prefer=None):
     """
     Plan a heat exchanger network at minimum energy requirement, unsplit
@@ -2158,7 +2239,8 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
     is_hot : sequence[bool]
         True for streams that are cooled.
     T_min_app : float
-        Minimum approach temperature.
+        Minimum approach temperature: the required approach of every pair
+        unless `approach_contributions` are given.
     avoid_recycle : bool, optional
         Never match the same (hot, cold) pair twice anywhere.
     Qmin : float, optional
@@ -2183,6 +2265,14 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
         each side's chosen candidate; `synthesize_network` realizes them. With
         `avoid_recycle`, a split that would repeat a stream pair is not
         used, and MER is then not guaranteed. Defaults to False.
+    approach_contributions : sequence[float or None], optional
+        Approach temperature contribution of each stream [K], in the order
+        of `knots`: None or nan (unspecified: ``T_min_app / 2``), or a
+        finite number > 0 (then `T_min_app` must be finite and > 0). A
+        match between hot stream h and cold stream c keeps ``c_h + c_c``:
+        stream j is planned on the shifted scale ``T - s_j``, with ``s_j =
+        T_min_app/2 + c_j`` for a hot and ``T_min_app/2 - c_j`` for a cold
+        stream. Defaults to None (every pair keeps `T_min_app`).
     _split_exclude : dict[str, set[tuple]], optional
         Private (the refine loop): per side, network signatures a split
         candidate may not have unless it is the side's last candidate.
@@ -2262,7 +2352,8 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
     dT = float(T_min_app)
     if not math.isfinite(dT):
         raise ValueError('T_min_app must be finite')
-    curves = _stream_curves(knots, is_hot, dT)
+    shift = _approach_shifts(is_hot, dT, approach_contributions)
+    curves = _stream_curves(knots, is_hot, dT, shift)
     act = [c for c in curves if c is not None]
     scale = float(sum(c.duty for c in act))
     tolQ = _REL_Q * max(scale, 1.)
@@ -2365,11 +2456,26 @@ def plan_network(knots, is_hot, T_min_app, *, avoid_recycle=False, Qmin=0.,
                   if g > 0.})
         if stream_splitting:
             side_info[name]['split'] = p.split
+    if approach_contributions is None:
+        min_approach = (dT + min_dT) if recs else None
+    else:
+        # each exchanger's real approach: its shifted one plus its pair's
+        # required approach (the difference of the two streams' shifts)
+        if split_mode:
+            from ._splitting import _approach_violation_split as violation
+        else:
+            violation = _approach_violation
+        min_approach = min(
+            (violation(curves[e.hot], curves[e.cold], e)
+             + float(shift[e.hot] - shift[e.cold]) for e in recs),
+            default=None)
     plan.info = dict(sides=side_info, qmin_dropped=qmin_dropped,
-                     dropped=dropped,
-                     min_approach=(dT + min_dT) if recs else None,
+                     dropped=dropped, min_approach=min_approach,
                      work=sum(p.work for p in plans.values()),
                      scale=scale, tolQ=tolQ, cascade=table)
+    if approach_contributions is not None:
+        plan.info.update(shift=shift,
+                         min_approach_margin=min_dT if recs else None)
     return plan
 
 
@@ -2380,7 +2486,8 @@ def _plan_numeric(streams, dTmin, knots=1, **kwargs):
     Plan a constant-CP problem given as dicts ``{name, kind ('hot' |
     'cold'), T_in, T_out, CP}``; `knots` > 1 splits every stream into that
     many collinear pieces (discretisation tests). Keywords go to
-    :func:`plan_network`.
+    :func:`plan_network`; ``approach_contributions`` is in the order of
+    `streams`.
 
     Returns a dict in the certificate format of the scratch oracle:
     ``matches`` (side, hot, cold, Q, T_hot_in, T_hot_out, T_cold_in,

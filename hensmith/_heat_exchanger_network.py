@@ -17,10 +17,14 @@ Created on Sat Aug 22 21:58:19 2020
 @author: sarangbhagwat and yoelcp
 """
 import heapq
+import weakref
+from collections import Counter
+from collections.abc import Mapping
 import biosteam as bst
 import numpy as np
 from .hxn_synthesis import (
     synthesize_network, StreamLifeCycle, plot_pinch_diagram, _first_inlet,
+    _explicit_contributions, _held_owners, _with_auxiliaries,
 )
 from warnings import warn
 
@@ -33,6 +37,26 @@ __all__ = ('HeatExchangerNetwork',)
 #: 1e-10 of the duty over the test suite, where the smallest utility duty a
 #: network does leave is 3e-7 of the stream's duty).
 _SERVED_RTOL = 1e-9
+
+#: The facilities whose `_replace_unit_heat_utilities` has written their
+#: utilities over heat utilities of their units that
+#: `_restore_unit_heat_utilities` has not given back yet (see
+#: `_replacing_networks`).
+_REPLACING = weakref.WeakSet()
+
+def _replacing_networks(hus):
+    """
+    The facilities that hold heat utilities of `hus` written over by
+    `HeatExchangerNetwork._replace_unit_heat_utilities` and not given back
+    yet, by the ``id`` of each such heat utility (a unit simulated again
+    since holds new heat utilities, which are not among them).
+    """
+    ids = set(map(id, hus))
+    networks = {}
+    for network in list(_REPLACING):
+        for hu, _ in getattr(network, '_replaced_heat_utilities', None) or ():
+            if id(hu) in ids: networks.setdefault(id(hu), network)
+    return networks
 
 def _pass_through_served_streams(stream_life_cycles, original_units):
     """
@@ -201,7 +225,9 @@ class HeatExchangerNetwork(bst.Facility):
     ID : str
         Unique name for the facility.
     T_min_app : float
-        Minimum approach temperature observed during synthesis of heat exchanger network.
+        Minimum approach temperature observed during synthesis of heat
+        exchanger network: the default approach temperature, required of
+        every pair of streams unless `approach_contributions` are given.
     units : Iterable[Unit], optional
         All unit operations available to the heat exchanger network. Defaults
         to all unit operations in the system.
@@ -220,6 +246,19 @@ class HeatExchangerNetwork(bst.Facility):
         and ``synthesis_info['splits']`` (`HeatExchangerNetwork`). With
         `avoid_recycle`, a split that would repeat a stream pair is not
         used, and MER is then not guaranteed. Defaults to False.
+    approach_contributions : Mapping or callable, optional
+        Approach temperature contribution of each process stream [K]: a
+        match between hot stream h and cold stream c must keep ``c_h +
+        c_c`` instead of `T_min_app`, and a stream without one contributes
+        ``T_min_app / 2`` (see Notes, "Approach temperature
+        contributions"). A mapping ``{key: value}`` whose keys name units
+        (a unit, its ID if it has no owner, or ``(owner.ID, unit.ID)``;
+        the nearest key along a unit's chain of owners applies), or a
+        callable ``f(hu)`` returning the value of a heat utility. A value
+        is None or nan (unspecified) or a finite number > 0. A sequence
+        raises a TypeError: the order of the facility's streams is
+        internal. May be changed between simulations. Defaults to None
+        (every stream contributes ``T_min_app / 2``).
 
     Notes
     -----
@@ -227,15 +266,16 @@ class HeatExchangerNetwork(bst.Facility):
     splits by :func:`~hensmith.hxn_synthesis.synthesize_network`: a problem
     table on the streams' temperature-enthalpy curves gives the minimum
     energy requirement (MER) targets, and a planner builds each side of the
-    pinch from the pinch outward [1]_ [2]_, keeping `T_min_app` everywhere
-    inside every exchanger on the exact stream states. It reaches the
-    targets whenever its search finds an unsplit network that does; the same
-    pair of streams may then be matched more than once (IDs with a suffix
-    ``_<n>``, e.g. ``HX_3_2_cs_2``), since series alternation can replace a
-    split. Where the pinch design rules prove that MER needs stream
-    splitting, the network is a best-effort one close to the targets, or,
-    with `stream_splitting`, one that splits streams to reach them. The
-    outcome is recorded in `synthesis_info` (a dict; see the `info` keyword
+    pinch from the pinch outward [1]_ [2]_, keeping each pair's required
+    approach (`T_min_app` by default) everywhere inside every exchanger on
+    the exact stream states. It reaches the targets whenever its search
+    finds an unsplit network that does; the same pair of streams may then be
+    matched more than once (IDs with a suffix ``_<n>``, e.g.
+    ``HX_3_2_cs_2``), since series alternation can replace a split. Where
+    the pinch design rules prove that MER needs stream splitting, the
+    network is a best-effort one close to the targets, or, with
+    `stream_splitting`, one that splits streams to reach them. The outcome
+    is recorded in `synthesis_info` (a dict; see the `info` keyword
     of `synthesize_network`): 'status' is 'mer' when the network's utilities
     equal the targets and 'best_effort' otherwise, with the targets, the
     planned utilities and, per side of the pinch, any proof that a split is
@@ -257,6 +297,75 @@ class HeatExchangerNetwork(bst.Facility):
     the exchangers of every branch), and a split stream's life cycle lists
     its branch stages with their branch and fraction.
 
+    *Approach temperature contributions.* With `approach_contributions`,
+    each process stream contributes its own approach temperature ``c_j``
+    (``T_min_app / 2`` unless given), and every process exchanger keeps
+    the sum of its two streams' contributions instead of `T_min_app` (see
+    `synthesize_network`, Notes); each stream's utility exchanger gets its
+    agent as usual. A key names a unit: the unit itself, the ID of a unit
+    without an owner (e.g. ``'D1'``), or ``(owner.ID, unit.ID)`` for an
+    auxiliary unit (e.g. ``('D1', 'condenser')``; a bare auxiliary ID names
+    nothing). ``owner`` is the top owner, so the pair names every auxiliary
+    of that ID under it: the heaters of two auxiliary flash drums of one
+    unit, say, are told apart by keying the heater objects or the drums. A
+    heat utility takes the value of the key nearest to its unit along the
+    unit's chain of owners, so ``'D1'`` covers the condenser and the
+    reboiler of column D1 and ``('D1', 'condenser')`` overrides it for the
+    condenser; a None or nan value is an explicit default that wins at its
+    level like any other, and two keys of the same level for a unit must
+    agree. A unit's owner is its direct owner (the unit it was made an
+    auxiliary of; `biosteam.Unit.owner` gives the top one) or, for an
+    auxiliary that a unit available to the network holds without setting
+    its owner, or an exchanger without one whose heat utilities a unit takes
+    without holding it as an auxiliary (``self.heat_utilities =
+    self.hx.heat_utilities``), that unit: a `biosteam.MultistageCompressor`
+    K1 builds its compressors and intercoolers anew whenever `pr` or
+    `n_stages` changes, without an owner, and ``'K1'`` still covers the
+    intercoolers and
+    ``('K1', 'K1_H1')`` names one in every simulation (the bare ``'K1_H1'``
+    names nothing, though it is the key of that intercooler outside the
+    facility, see `synthesize_network`; user objects are not changed). ID
+    keys are the robust form: a
+    unit that rebuilds its auxiliary units at every simulation (e.g.
+    `biosteam.HXutilities`) leaves a key holding an old auxiliary, which
+    then names the auxiliary that took its place (the one of the same ID
+    under owners of the same IDs), if any; an old auxiliary that never had
+    an owner (an old intercooler of K1) names none, and raises (heat
+    utility keys are rejected, since BioSTEAM replaces them at every
+    simulation). The keys and values are checked against every unit
+    available to the network, its nested auxiliary units and the exchangers
+    they hold through their heat utilities only, before the
+    heat utilities are taken: a key that names none of them, a bad value
+    or two conflicting keys raise a ValueError, even while their unit is
+    idle, but a valid key whose unit holds no heat utility in a simulation
+    (no duty, `ignored`, or not available to a heat exchanger network) has
+    no effect, so that, e.g., Monte Carlo samples do not fail. A key of an
+    auxiliary that a unit may build but does not hold in a simulation is
+    valid too, and has no effect: an old auxiliary object of the unit that
+    none took the place of, or the ID that `biosteam.Unit.auxiliary` gives
+    an auxiliary under a name of the `auxiliary_unit_names` of the owner or
+    of one of its auxiliaries, unless that place holds a unit of another
+    ID: ``(owner.ID, 'name[k]')`` where the attribute `name` holds a list of
+    auxiliaries (e.g. ``('X1', 'heat_exchangers[2]')`` while a
+    `biosteam.HXutilities` X1, which builds one exchanger per agent it needs,
+    needs fewer), and ``(owner.ID, name)`` where it holds a single one (so
+    ``('X1', 'heat_exchangers')`` raises); or the ID that a
+    `biosteam.MultistageCompressor` K1 gives its stage n, for any n >= 1
+    (``('K1', 'K1_H3')`` while K1 has 2 stages). Not every unit gives its
+    auxiliaries that ID: the heater of a `biosteam.EnzymeTreatment` T1 has
+    the ID '', so ``('T1', 'heat_exchanger')`` raises, with a message that
+    gives the heater's key, ``('T1', '')``. A callable is
+    called once per heat utility at every simulation (also to check a
+    cached network, and again if a failed cache synthesizes anew), in the
+    order of the facility's heat utilities: it should be pure. After a
+    simulation, `targets` takes the values that simulation resolved instead
+    of calling it again.
+    ``synthesis_info`` reports the contributions as used by stream
+    ('approach_contributions', in the order of `original_heat_exchangers`)
+    and the smallest margin over each exchanger's required approach
+    ('min_approach_margin'), and `pinch_Ts` holds each stream's own pinch
+    temperature.
+
     Original system stream and heat exchanger objects are preserved. All
     stream copies and new HX objects can be found in a newly created
     flowsheet '<sys>_HXN' where <sys> is the name of the system associated
@@ -268,13 +377,16 @@ class HeatExchangerNetwork(bst.Facility):
     its planned state, so the loops are at their fixed point after one
     pass).
 
-    With `cache_network`, a network is reused while the set of heat
-    exchangers and `stream_splitting` are the same: each process exchanger
-    keeps, as its enthalpy limit, the share of the stream's duty it had at
-    synthesis (on the stream that the plan serves completely on that side of
-    the pinch; its partner transfers that share, but never past its own
-    outlet, and takes the rest to its utility), and the utility exchangers
-    bring every stream to its new outlet. The splitters keep their
+    With `cache_network`, a network is reused while the multiset of heat
+    exchangers (each as often as it gives a stream: biosteam lists the heat
+    utility of a unit in parallel once per unit, by ``Unit.parallel``, which
+    a reactor may set by its volume), `stream_splitting` and the explicit
+    approach contributions (resolved per stream) are the same: each process
+    exchanger keeps, as its enthalpy limit, the share of the stream's duty
+    it had at synthesis (on the stream that the plan serves completely on
+    that side of the pinch; its partner transfers that share, but never
+    past its own outlet, and takes the rest to its utility), and the
+    utility exchangers bring every stream to its new outlet. The splitters keep their
     fractions, so a branch exchanger's limit is its branch's fraction of the
     whole stream's. If the cached network does not reproduce the outlets, or
     its energy balance is off, the network is synthesized again.
@@ -386,13 +498,28 @@ class HeatExchangerNetwork(bst.Facility):
     >>> HXN.synthesis_info['splits']
     [<StreamSplit Split_0_hs: stream 0 above, 2 branches (0.5201, 0.4799)>]
 
+    With approach temperature contributions of 2 K for C1 and H3 (the other
+    streams keep ``T_min_app / 2 = 5`` K), C1 needs 7 K against H1 and H2
+    but only 4 K against H3, and each exchanger's `dT` guard is its pair's
+    requirement less 1e-6 K:
+
+    >>> HXN.stream_splitting = False
+    >>> HXN.approach_contributions = {'C1': 2., 'H3': 2.}
+    >>> sys.simulate()
+    >>> HXN.synthesis_info['status']
+    'best_effort'
+    >>> [round(hx.dT, 6) for hx in HXN.new_HXs]
+    [6.999999, 6.999999, 6.999999, 6.999999, 6.999999, 3.999999]
+
     """
     ticket_name = 'HXN'
     acceptable_energy_balance_error = 0.02
     raise_energy_balance_error = False
-    # Default of an instance without it (e.g. one from before stream
-    # splitting); `__init__` sets it on every new facility.
+    # Defaults of an instance without them (e.g. one from before stream
+    # splitting or approach contributions); `__init__` sets them on every
+    # new facility.
     stream_splitting = False
+    approach_contributions = None
     network_priority = -2
     _N_ins = 0
     _N_outs = 0
@@ -402,7 +529,8 @@ class HeatExchangerNetwork(bst.Facility):
     def __init__(self, ID='', T_min_app=5., units=None, ignored=None, Qmin=1e-3,
                  force_ideal_thermo=False, cache_network=False, avoid_recycle=False,
                  acceptable_energy_balance_error=None, replace_unit_heat_utilities=False,
-                 sort_hus_by_T=False, stream_splitting=False):
+                 sort_hus_by_T=False, stream_splitting=False,
+                 approach_contributions=None):
         bst.Facility.__init__(self, ID, None, None)
         self.T_min_app = T_min_app
         self.units = units
@@ -414,16 +542,85 @@ class HeatExchangerNetwork(bst.Facility):
         self.replace_unit_heat_utilities = replace_unit_heat_utilities
         self.sort_hus_by_T = sort_hus_by_T
         self.stream_splitting = stream_splitting
+        self.approach_contributions = approach_contributions
         if acceptable_energy_balance_error is not None:
             self.acceptable_energy_balance_error = acceptable_energy_balance_error
         
-    def _get_original_heat_utilties(self):
+    def _get_units(self):
+        """The units whose heat utilities the network may take: the `units`
+        option (called if callable), or else the system's units."""
         sys = self.system
         if self.units:
             units = self.units
             if callable(units): units = units()
         else:
             units = sys.units
+        return units
+
+    def _candidate_units(self, units=None):
+        """The units that approach contribution keys may name: each unit of
+        `units` (defaults to `_get_units`) followed by its nested auxiliary
+        units and the exchangers they hold through their heat utilities
+        only, whether or not it holds a heat utility the network takes (see
+        `hensmith.hxn_synthesis._with_auxiliaries`)."""
+        if units is None: units = self._get_units()
+        return _with_auxiliaries(units)
+
+    def _network_contributions(self, hx_utils, units=None, held=None):
+        """
+        The explicit approach contributions of `hx_utils` (aligned with
+        it; None where unspecified), or None if none is given (see
+        `hensmith.hxn_synthesis._explicit_contributions`). The keys are
+        checked against every candidate unit (`_candidate_units` of `units`,
+        the units `hx_utils` were taken from if given), so a bad key or
+        value raises even while its unit holds no heat utility. `held`, the
+        holders of auxiliaries held without an owner as taken earlier (see
+        `hensmith.hxn_synthesis._held_owners`), comes before those of the
+        units now.
+        """
+        x = self.approach_contributions
+        if x is None: return None
+        if not (isinstance(x, Mapping) or callable(x)):
+            raise TypeError('HeatExchangerNetwork.approach_contributions must '
+                            'be a mapping or a callable (the order of the '
+                            "facility's streams is internal, so a sequence "
+                            f'has nothing to align with), not '
+                            f'{type(x).__name__!r}')
+        return _explicit_contributions(hx_utils, x, self.T_min_app,
+                                       units=self._candidate_units(units),
+                                       held=held)
+
+    def _synthesis_holders(self, hx_utils, units):
+        """
+        The holders of the auxiliaries held without an owner (see
+        `hensmith.hxn_synthesis._held_owners`) at a synthesis of the heat
+        utilities `hx_utils` of `units`, which `targets` keeps for the keys
+        and labels of exchangers that a unit has rebuilt since. With
+        approach contributions, they are those the keys were resolved by.
+        Without (the default path), they serve labels only, and the
+        synthesis never depends on them: they are taken only if an
+        exchanger's owner chain ends outside `units` (an exchanger held
+        without an owner, as the intercoolers of a
+        `biosteam.MultistageCompressor`), so that none of the key machinery
+        runs otherwise, and are None on any error (labels then go by the
+        units as they are, plain unit IDs at worst).
+        """
+        hxs = [hu.unit for hu in hx_utils]
+        if self.approach_contributions is not None:
+            return _held_owners(hxs + self._candidate_units(units))
+        try:
+            at_hand = {id(unit) for unit in units}
+            for hx in hxs:
+                while getattr(hx, '_owner', None) is not None: hx = hx._owner
+                if id(hx) not in at_hand: break
+            else:
+                return None
+            return _held_owners(hxs + self._candidate_units(units))
+        except Exception:
+            return None
+
+    def _get_original_heat_utilties(self, units=None):
+        if units is None: units = self._get_units()
         ignored = self.ignored
         if ignored:
             if callable(ignored): ignored = ignored()
@@ -465,6 +662,7 @@ class HeatExchangerNetwork(bst.Facility):
             else: hu.empty() # a stream the process exchangers serve
             _load_utility_costs(hu.unit)
         self._replaced_heat_utilities = replaced
+        _REPLACING.add(self)
 
     def _restore_unit_heat_utilities(self):
         """
@@ -481,6 +679,7 @@ class HeatExchangerNetwork(bst.Facility):
         left, would drop out of the next network.
         """
         replaced = getattr(self, '_replaced_heat_utilities', None)
+        _REPLACING.discard(self)
         if not replaced: return
         self._replaced_heat_utilities = None
         for hu, original in replaced:
@@ -497,7 +696,17 @@ class HeatExchangerNetwork(bst.Facility):
         flowsheet = bst.Flowsheet(sys.ID + '_HXN')
         with flowsheet.temporary():
             self._restore_unit_heat_utilities()
-        hx_utils = self._get_original_heat_utilties()
+        # once per simulation, for both the heat utilities and the keys (a
+        # callable `units` is called, an iterable read, once)
+        units = list(self._get_units())
+        hx_utils = self._get_original_heat_utilties(units)
+        # the explicit approach contributions by heat utility (resolved
+        # once per simulation; None without any, and with
+        # approach_contributions None, the default path, none of the key
+        # machinery runs here or in `_synthesis_holders`)
+        values = self._network_contributions(hx_utils, units)
+        value_of = (None if values is None
+                    else {id(hu): v for hu, v in zip(hx_utils, values)})
         use_cached_network = False
         # A network synthesized with other options (stream splitting on or
         # off), or by a facility from before stream splitting (no options
@@ -506,10 +715,21 @@ class HeatExchangerNetwork(bst.Facility):
                 and hasattr(self, '_stage_fractions')
                 and getattr(self, '_synthesis_options', None)
                     == (self.stream_splitting,)):
-            # Units are a stable key to compare whether system has changed configuration.
+            # Units are a stable key to compare whether system has changed
+            # configuration, each as often as it gives a stream: biosteam
+            # lists the heat utility of a unit in parallel once per unit
+            # (Unit.parallel, which a reactor may set by its volume), so a
+            # change of that number changes the streams; the explicit
+            # contributions, resolved per stream, must be those the network
+            # was synthesized with.
             hu_by_unit = {hu.unit: hu for hu in hx_utils}
             use_cached_network = (
-                hu_by_unit.keys() == set(self.original_heat_exchangers)
+                Counter([hu.unit for hu in hx_utils])
+                    == Counter(self.original_heat_exchangers)
+                and getattr(self, '_resolved_contributions', None) == (
+                    None if value_of is None else tuple(
+                        value_of[id(hu_by_unit[hx])]
+                        for hx in self.original_heat_exchangers))
             )
         with flowsheet.temporary(), bst.IgnoreDockingWarnings():
             if use_cached_network:
@@ -572,6 +792,7 @@ class HeatExchangerNetwork(bst.Facility):
                 # Signed-duty order is the default matching priority of the
                 # synthesis passes: smallest heating duty first among the cold
                 # streams, largest cooling duty first among the hot streams.
+                holders = self._synthesis_holders(hx_utils, units)
                 hx_utils.sort(key = lambda x: x.duty)
                 self.HXN_flowsheet = HXN_F = flowsheet
                 for i in HXN_F.registries: i.clear()
@@ -582,7 +803,10 @@ class HeatExchangerNetwork(bst.Facility):
                 synthesize_network(hx_utils, self.T_min_app, self.Qmin,
                                    self.force_ideal_thermo, self.avoid_recycle,
                                    self.sort_hus_by_T, info=synthesis_info,
-                                   stream_splitting=self.stream_splitting)
+                                   stream_splitting=self.stream_splitting,
+                                   approach_contributions=(
+                                       None if value_of is None else
+                                       [value_of[id(hu)] for hu in hx_utils]))
                 new_HXs = HXs_hot_side + HXs_cold_side
                 # the realized splits (none without stream splitting)
                 splits = synthesis_info.get('splits', ())
@@ -594,6 +818,7 @@ class HeatExchangerNetwork(bst.Facility):
                 self.new_HXs_cold_side = HXs_cold_side
                 self.cold_indices = cold_indices
                 self.original_heat_exchangers = hxs
+                self._holders = holders
                 self.new_HXs = new_HXs
                 self.new_HX_utils = new_HX_utils
                 self.streams_inlet = streams_inlet
@@ -626,10 +851,16 @@ class HeatExchangerNetwork(bst.Facility):
                 # of the flow) has f times the whole stream's limit: its
                 # share is that of the whole stream's limit (on the parent
                 # basis), and f is kept in `_stage_scales`. The options the
-                # network was synthesized with are the cache's key.
+                # network was synthesized with, and its explicit approach
+                # contributions (unfilled, in the order of
+                # `original_heat_exchangers`; None without any), are the
+                # cache's key.
                 self._stage_fractions = stage_fractions = {}
                 self._stage_scales = stage_scales = {}
                 self._synthesis_options = (self.stream_splitting,)
+                self._resolved_contributions = (
+                    None if value_of is None else tuple(
+                        value_of[id(hu)] for hu in hx_heat_utils_rearranged))
                 for i, life_cycle in enumerate(stream_life_cycles):
                     hx = hx_heat_utils_rearranged[i].unit
                     H_in = hx.ins[0].H
@@ -829,6 +1060,231 @@ class HeatExchangerNetwork(bst.Facility):
             Qmin=self.Qmin, original_hxs=self.original_heat_exchangers,
             file=file, **kwargs,
         )
+
+    def targets(self, T_min_app=None):
+        """
+        The pinch analysis targets of the facility's process streams (see
+        `hensmith.targeting.PinchTargets`): energy, utilities, area, units,
+        capital and total annualized cost.
+
+        Parameters
+        ----------
+        T_min_app : float, optional
+            Minimum approach temperature [K], finite and >= 0 (> 0 with
+            approach contributions). Defaults to the facility's `T_min_app`.
+
+        Returns
+        -------
+        PinchTargets
+            The targets, with the facility's `approach_contributions` and
+            `force_ideal_thermo`, and its `system`, whose operating hours
+            (if it has them, a TEA's for instance) `PinchTargets.summary`
+            and `hensmith.targeting.supertarget` then use by default, as
+            `hensmith.targeting.network_report` does. Their `key_units` are
+            the units that the facility's approach contribution keys may
+            name, so that a film coefficient key (``h=``) of a unit without
+            a stream in a simulation has no effect, as such an approach
+            contribution key has none.
+
+        Raises
+        ------
+        RuntimeError
+            If the facility has neither `units` nor a system (it learns its
+            system when the system is first simulated).
+
+        Warns
+        -----
+        RuntimeWarning
+            After a simulation, if a stream of the network is that of an
+            exchanger no longer among the facility's units and their nested
+            auxiliaries (rebuilt since the facility's last simulation, see
+            Notes): the targets are of its former state.
+        RuntimeWarning
+            After a simulation, if an exchanger gives more or fewer streams
+            than the facility's units list its heat utility now: a unit in
+            parallel whose number (``Unit.parallel``, which a reactor may
+            set by its volume) has changed since, simulated alone (see
+            Notes). The targets keep a stream per unit of the facility's
+            last simulation.
+        RuntimeWarning
+            If the first inlet and outlet of a stream's exchanger differ in
+            flow (``ins[0].mol`` and ``outs[0].mol``) by more than 1 % of
+            the larger: its inlet has changed since its unit was simulated
+            (see Notes), and the targets take the stream from that new
+            inlet to the outlet of the former state, a state of no process.
+
+        Notes
+        -----
+        After a simulation, the streams are those of
+        `original_heat_exchangers`, in the network's stream order, at the
+        units' current states, each hot or cold by its current direction (a
+        stream that has reversed since the synthesis, its unit simulated
+        alone or the network reused by `cache_network`, changes sides; one
+        without duty keeps its side): right after a synthesis, the energy
+        targets at the facility's `T_min_app` equal
+        ``synthesis_info['Q_hot_target']`` and
+        ``synthesis_info['Q_cold_target']`` bit for bit. The targets'
+        `heat_utilities` are `original_heat_utils`, which with
+        `replace_unit_heat_utilities` hold the network's utilities, not the
+        streams' (see `hensmith.targeting.PinchTargets`). A mapping of
+        approach contributions is resolved again by the units of
+        `original_heat_utils`, so a mapping changed since applies (an
+        auxiliary that a unit held without an owner at the synthesis, such
+        as an intercooler of a `biosteam.MultistageCompressor` K1, is still
+        that unit's, as are the targets' film coefficient keys, even after
+        K1 has rebuilt its stages: K1 simulated alone, or a later sample of
+        stored targets; the targets keep that relation); a
+        callable is not called again (with `replace_unit_heat_utilities`, the
+        heat utilities it would read hold the network's utilities by then):
+        its values are those the last simulation resolved, and a callable set
+        since takes effect at the next simulation. Before any simulation,
+        the streams are those of the heat utilities the next simulation
+        would take, prepared as the synthesis prepares them, and a callable
+        is called once per heat utility.
+        Nothing is stored: with `cache_network`, the targets follow the
+        units' current states, not those of the network's synthesis. A
+        unit that rebuilds its auxiliaries when simulated alone (K1 above,
+        after a change of its `pr`) leaves the streams on its former
+        stages, which are no longer in the process and keep their former
+        states, until the system is simulated again: the targets are then
+        of those former states, not of the process now, with a
+        RuntimeWarning (`hensmith.targeting.network_report` raises
+        meanwhile). Each stream runs from its exchanger's inlet now to its
+        outlet as its unit last left it: after a feed or another stream
+        changes, simulate the system before targeting (or the units alone,
+        which gives the targets of the process now, unless a unit in
+        parallel changes its number of units: biosteam lists its heat
+        utilities once per unit, and the streams stay one per unit at the
+        facility's last simulation, with a RuntimeWarning;
+        `hensmith.targeting.network_report` raises). A stream whose inlet
+        has changed in flow meanwhile warns (see Warns); a change of
+        temperature alone keeps the flows equal and warns of nothing, its
+        targets being right only if its unit sets its outlet by
+        temperature (as a `biosteam.HXutility` with ``T`` does).
+
+        Examples
+        --------
+        The liquids of the second example of the class at 10 K (whose
+        unsplit network falls short of the energy targets):
+
+        >>> import biosteam as bst
+        >>> bst.main_flowsheet.set_flowsheet('HXN_targets_example')
+        >>> bst.settings.set_thermo(['Water', 'Ethanol'], cache=True)
+        >>> def process_stream(ID, T_in, T_out, P, **kmol_hr):
+        ...     inlet = bst.Stream(ID + '_in', T=T_in, P=P, phase='l',
+        ...                        units='kmol/hr', **kmol_hr)
+        ...     return bst.HXutility(ID, ins=inlet, T=T_out, rigorous=False)
+        >>> units = [process_stream('H1', 400., 320., 5e5, Water=60.),
+        ...          process_stream('H2', 390., 330., 5e5, Ethanol=30.),
+        ...          process_stream('C1', 310., 410., 5e5, Water=150.),
+        ...          process_stream('H3', 360., 300., 101325., Water=200.)]
+        >>> HXN = bst.HeatExchangerNetwork('HXN', T_min_app=10.)
+        >>> sys = bst.System.from_units('sys', units=[*units, HXN])
+        >>> sys.simulate()
+        >>> HXN.synthesis_info['status']
+        'best_effort'
+
+        The targets [kW] are the synthesis's own, bit for bit:
+
+        >>> targets = HXN.targets()
+        >>> targets.labels
+        ['C1', 'H3', 'H1', 'H2']
+        >>> round(targets.Q_hot / 3600, 3), round(targets.Q_cold / 3600, 3)
+        (102.821, 209.035)
+        >>> info = HXN.synthesis_info
+        >>> targets.Q_hot == info['Q_hot_target'], targets.Q_cold == info['Q_cold_target']
+        (True, True)
+
+        At another minimum approach temperature:
+
+        >>> HXN.targets(20.)
+        <PinchTargets: 4 streams, T_min_app = 20 K, Q_hot = 4.834e+05 kJ/hr, Q_cold = 8.658e+05 kJ/hr>
+
+        """
+        from .targeting import _warn_stale, _miscounted_names
+        targets, rebuilt, miscounted, stale = self._pinch_targets(T_min_app)
+        if rebuilt is not None:
+            warn(f'the targets of {self.ID} are of the former state of '
+                 f"{rebuilt}, which is no longer one of the facility's units "
+                 "nor an auxiliary of one (rebuilt since the facility's last "
+                 'simulation?): simulate the system for those of the process '
+                 'now', RuntimeWarning, stacklevel=2)
+        if miscounted:
+            warn(f'the targets of {self.ID} take a stream per heat utility '
+                 "the facility's units listed at its last simulation, not "
+                 'as they list them now: '
+                 f'{_miscounted_names(miscounted)} (Unit.parallel changed '
+                 'since, its unit simulated alone?): simulate the system for '
+                 'those of the process now', RuntimeWarning, stacklevel=2)
+        _warn_stale(stale, f' of {self.ID}')
+        return targets
+
+    def _pinch_targets(self, T_min_app=None):
+        """`targets` (see there), the label of the first of their streams
+        whose exchanger is no longer among the facility's units, their
+        nested auxiliaries and the exchangers they hold through their heat
+        utilities only (rebuilt since the last simulation), or None, the
+        exchangers of the others that give more or fewer streams than the
+        facility's units list their heat utility now (a unit in parallel
+        whose number has changed since, see
+        `hensmith.targeting._miscounted`), and the labels of the streams
+        whose exchanger's inlet has changed in flow since its unit was
+        simulated (see `hensmith.targeting._stale_labels`). They are None
+        and empty before a simulation, whose targets,
+        `PinchTargets.from_heat_utilities`, take the heat utilities as
+        listed now and warn of the last themselves."""
+        from .targeting import (PinchTargets, _rebuilt_label, _stale_labels,
+                                _miscounted)
+        if T_min_app is None: T_min_app = self.T_min_app
+        if (hasattr(self, 'original_heat_exchangers')
+                and hasattr(self, 'original_heat_utils')):
+            hxs = self.original_heat_exchangers
+            hus = self.original_heat_utils # in stream order
+            cold = set(self.cold_indices)
+            # hot or cold by the current direction of each stream (the heat
+            # utility, which replace_unit_heat_utilities overwrites, cannot
+            # tell): a stream that has reversed since the synthesis changes
+            # sides, one without duty keeps its side
+            is_hot = []
+            for i, hx in enumerate(hxs):
+                dH = hx.outs[0].H - hx.ins[0].H
+                is_hot.append(dH < 0. if dH else i not in cold)
+            x = self.approach_contributions
+            units = list(self._get_units())
+            key_units = self._candidate_units(units)
+            # the holders of the auxiliaries held without an owner as at the
+            # synthesis, which a holder that has rebuilt them since (a
+            # MultistageCompressor simulated alone) no longer holds
+            held = getattr(self, '_holders', None)
+            if callable(x) and not isinstance(x, Mapping):
+                # Never called again: with replace_unit_heat_utilities, the
+                # heat utilities it would read now hold the network's
+                # utilities (or nothing, for a stream the process exchangers
+                # serve). Its values, as the last simulation resolved them,
+                # are in stream order.
+                contributions = getattr(self, '_resolved_contributions', None)
+            else:
+                # by unit only, which the network never changes
+                contributions = self._network_contributions(hus, units, held)
+            targets = PinchTargets._from_exchangers(
+                hxs, is_hot, T_min_app, contributions, self.force_ideal_thermo,
+                None, hus, _held_owners([*hxs, *key_units], held))
+            targets.key_units = key_units
+            targets.system = self.system
+            return (targets, _rebuilt_label(hxs, targets.labels, key_units),
+                    _miscounted(hxs, targets.labels, units, key_units),
+                    _stale_labels(hxs, targets.labels))
+        if self.system is None and not self.units:
+            raise RuntimeError('simulate the system (or give the facility its '
+                               'units) before targeting')
+        units = list(self._get_units())
+        hx_utils = self._get_original_heat_utilties(units)
+        hx_utils.sort(key=lambda x: x.duty) # as `_cost` sorts them
+        targets = PinchTargets.from_heat_utilities(
+            hx_utils, T_min_app, self._network_contributions(hx_utils, units),
+            self.force_ideal_thermo, self.sort_hus_by_T, key_units=units)
+        targets.system = self.system
+        return targets, None, [], []
 
     def get_original_hxs_associated_with_streams(self): # pragma: no cover
         original_units = self.system.units

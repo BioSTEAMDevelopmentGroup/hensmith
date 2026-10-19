@@ -391,6 +391,8 @@ Where to next
 
 - :doc:`04_configuring` -- the constructor options of the facility, what
   ``T_min_app`` and ``ignored`` change, and a ten-stream network.
+- :doc:`05_targeting` -- how this network compares with the targets of
+  utility cost, area, units and total annualized cost.
 - :doc:`../concepts` -- the pinch concepts, the MER planner, and what
   a synthesized network is and is not guaranteed to be.
 - :doc:`../API/api` -- the full API reference.

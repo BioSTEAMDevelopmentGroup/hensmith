@@ -13,7 +13,11 @@ reports the utility loads and capital cost that result. The original units,
 streams and heat exchangers are left untouched: the stream copies and
 synthesized exchangers live in a separate flowsheet named ``<sys>_HXN``. See
 :doc:`../tutorial/index` for a worked example and :doc:`../concepts` for the
-method.
+method. :meth:`~HeatExchangerNetwork.targets` returns the targets of the
+facility's streams (a :class:`PinchTargets`: utilities, area, units, capital
+and total annualized cost) without synthesizing anything, and
+:func:`network_report` compares the synthesized network with them
+(:doc:`targeting`).
 
 .. autoclass:: HeatExchangerNetwork
    :no-members:
@@ -21,12 +25,16 @@ method.
 
 .. automethod:: HeatExchangerNetwork.plot_pinch_diagram
 
+.. automethod:: HeatExchangerNetwork.targets
+
 Constructor options
 -------------------
 
-In addition to ``ID``, ``T_min_app`` and ``units`` documented above, the
-constructor accepts the following options; :doc:`../tutorial/04_configuring`
-shows what each of them changes.
+In addition to ``ID``, ``T_min_app`` (the default pair requirement: each
+stream contributes ``T_min_app / 2`` unless given its own contribution with
+``approach_contributions``) and ``units`` documented above, the constructor
+accepts the following options; :doc:`../tutorial/04_configuring` shows what
+each of them changes.
 
 .. list-table::
    :header-rows: 1
@@ -46,7 +54,7 @@ shows what each of them changes.
      - Run the analysis on stream copies with ideal thermodynamics; the synthesized exchangers inherit that thermo. Defaults to False.
    * - ``cache_network``
      - bool
-     - Reuse the network configuration of the previous simulation when the set of units contributing heat utilities and ``stream_splitting`` are unchanged, updating only stream states and exchanger specifications: each process exchanger keeps the fraction of its stream's duty at which its enthalpy limit sat at synthesis (the splitters keep their branch fractions), and the utility exchangers bring every stream to its new outlet. The reused network is not planned again, so it need not be at MER for the new duties. Defaults to False.
+     - Reuse the network configuration of the previous simulation when the units contributing heat utilities (each as often as it gives a stream, as a unit in parallel does once per unit), ``stream_splitting`` and the explicit approach contributions (resolved per stream) are unchanged, updating only stream states and exchanger specifications: each process exchanger keeps the fraction of its stream's duty at which its enthalpy limit sat at synthesis (the splitters keep their branch fractions), and the utility exchangers bring every stream to its new outlet. The reused network is not planned again, so it need not be at MER for the new duties. Defaults to False.
    * - ``avoid_recycle``
      - bool
      - Never match the same hot/cold stream pair twice anywhere (on one side of the pinch or across the two), so that no two exchangers connect the same pair and form a recycle loop; this forbids the repeated matches some unsplit MER networks need. Defaults to False.
@@ -62,6 +70,9 @@ shows what each of them changes.
    * - ``stream_splitting``
      - bool
      - Allow a process stream to be split into parallel branches that re-join. A side of the pinch that no unsplit network serves at MER is planned with splits and reaches the targets exactly on the planner's knots; sides that an unsplit network serves are never split, so a problem that needs no split gets the same network as with the default. Each split is a chain of ``Splitter`` units and a rigorous ``Mixer`` (adiabatic, no cost), listed in ``new_splitters`` and ``new_mixers``. With ``avoid_recycle``, a split that would repeat a stream pair is not used, and MER is then not guaranteed. Stored as an attribute of the same name, and part of the ``cache_network`` key. Defaults to False.
+   * - ``approach_contributions``
+     - Mapping or callable
+     - Approach temperature contribution of each process stream, in K: a match between hot stream *h* and cold stream *c* must keep :math:`c_h + c_c` instead of ``T_min_app`` everywhere inside it, and a stream without a contribution contributes ``T_min_app / 2``; the utility exchangers keep BioSTEAM's own approach rule. A mapping's keys name units -- a unit, the ID of a unit without an owner (``'D1'``), or ``(owner.ID, unit.ID)`` for an auxiliary unit (``('D1', 'condenser')``; with the top owner, so it names every auxiliary of that ID under it) -- and a heat utility takes the value of the key nearest to its unit along the unit's chain of owners (two keys of the same level must agree); ID keys stay valid when a unit rebuilds its auxiliaries, and heat utility keys are rejected (``TypeError``). A callable ``f(hu)`` is called once per heat utility at every simulation and should be pure; a sequence raises a ``TypeError``. A value is None or nan (unspecified, an explicit default at its level) or a finite number > 0. Keys and values are checked against every available unit and its auxiliaries before any filtering, so an unknown key, a bad value or a conflict raises a ``ValueError`` even while its unit is idle, but a valid key whose unit holds no heat utility in a simulation has no effect, as does a key of an auxiliary that its unit may build but does not build in that simulation (``('X1', 'heat_exchangers[2]')`` of a ``biosteam.HXutilities`` that needs fewer exchangers, say, or ``('K1', 'K1_H3')`` of a ``biosteam.MultistageCompressor`` K1 with 2 stages). The resolved values are part of the ``cache_network`` key. May be changed between simulations. Defaults to None (every stream contributes ``T_min_app / 2``, so every pair requires ``T_min_app``).
 
 Class attributes
 ----------------
@@ -123,7 +134,7 @@ the cached network.
      - Percent deviation from one of the ratio (twice the duty of each process exchanger, plus the new utility duties weighted by their agents' heat-transfer efficiency) / (the original utility duties weighted the same way), as computed in ``_cost``.
    * - ``synthesis_info``
      - dict
-     - The synthesis report (see the ``info`` keyword of :func:`synthesize_network`): ``'status'`` is ``'mer'`` when the network's utilities equal the MER targets and ``'best_effort'`` otherwise; next to it the targets, the planned and realized utilities, the penalty, per side of the pinch any proof that a split is needed, and the smallest approach inside any process exchanger. With ``stream_splitting``, also ``'stream_splitting'``, ``'splits'`` (the realized splits, :class:`~hensmith.hxn_synthesis.StreamSplit`), ``'split_deviations'`` and, per side, the split candidate chosen (``'split'``). Kept from the synthesis that produced a cached network.
+     - The synthesis report (see the ``info`` keyword of :func:`synthesize_network`): ``'status'`` is ``'mer'`` when the network's utilities equal the MER targets and ``'best_effort'`` otherwise; next to it the targets, the planned and realized utilities, the penalty, per side of the pinch any proof that a split is needed, the smallest approach inside any process exchanger (``'min_approach'``) and the smallest margin of an exchanger's approach over its pair's required approach (``'min_approach_margin'``, no less than -1e-6 K, the exact check's rounding guard), and each stream's approach contribution as used (``'approach_contributions'``, ``T_min_app / 2`` where none was given, in stream order). With ``stream_splitting``, also ``'stream_splitting'``, ``'splits'`` (the realized splits, :class:`~hensmith.hxn_synthesis.StreamSplit`), ``'split_deviations'`` and, per side, the split candidate chosen (``'split'``). Kept from the synthesis that produced a cached network.
    * - ``stream_life_cycles``
      - list[StreamLifeCycle]
      - Ordered sequence of exchangers each stream passes through, aligned with ``original_heat_exchangers``; a split stream's life cycle also lists its splits and marks each branch stage with its branch and flow fraction.
@@ -159,7 +170,7 @@ the cached network.
      - The flowsheet ``<sys>_HXN`` holding the network's stream copies and exchangers.
    * - ``pinch_Ts``
      - ndarray, K
-     - Per-stream pinch temperature (informational): the process pinch on the stream's own scale when the stream crosses it, else its inlet temperature (inlet already past the pinch, or an isothermal or non-monotone stream) or its outlet temperature (stream ending before the pinch).
+     - Per-stream pinch temperature (informational): the shifted pinch plus the stream's shift (``T_min_app`` for a hot stream and 0 for a cold one by default; ``T_min_app / 2 + c_j`` for a hot and ``T_min_app / 2 - c_j`` for a cold stream with approach contributions) when the stream crosses it, else its inlet temperature (inlet already past the pinch, or an isothermal or non-monotone stream) or its outlet temperature (stream ending before the pinch).
    * - ``inlet_Ts``
      - ndarray, K
      - Inlet temperature of each stream.

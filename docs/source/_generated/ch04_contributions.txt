@@ -1,0 +1,7 @@
+status: mer, 3 process exchangers, 1.449e+06 USD added installed cost
+heating 2.967e+08 kJ/hr, cooling 1.014e+06 kJ/hr
+contributions by stream [K]: [1.  1.  2.5 1.  2.5]
+HX_1_2_hs  requires 3.5 K, Q = 4.303e+07 kJ/hr
+HX_0_4_hs  requires 3.5 K, Q = 3.338e+04 kJ/hr
+HX_0_3_hs  requires 2.0 K, Q = 1.794e+07 kJ/hr
+smallest approach 3.500 K, margin over the requirement -1.3e-12 K

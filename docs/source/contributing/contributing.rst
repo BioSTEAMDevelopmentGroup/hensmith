@@ -9,8 +9,8 @@ change has to respect.
 Where the code lives
 --------------------
 
-The library is two public modules under ``hensmith/``, and three private ones
-behind them:
+The library is three public modules under ``hensmith/``, and three private
+ones behind them:
 
 ``hensmith/_heat_exchanger_network.py``
     The ``HeatExchangerNetwork`` facility unit: its ``_run``, ``_design`` and
@@ -23,6 +23,12 @@ behind them:
     the planner's network as BioSTEAM exchangers, and its stream splits as
     splitters and mixers, and verifying it on exact stream states), the
     per-stream bookkeeping of ``StreamLifeCycle``, and ``plot_pinch_diagram``.
+
+``hensmith/targeting.py``
+    Targeting and supertargeting on top of the problem table: composite and
+    grand composite curves, multiple-utility targets priced by BioSTEAM,
+    area, units, capital and total annualized cost targets, the
+    ``T_min_app`` sweep (``supertarget``), the network report and the plots.
 
 ``hensmith/_curves.py`` (private)
     The piecewise-linear temperature-enthalpy curve of each process stream,
@@ -42,8 +48,8 @@ behind them:
     lemmas, the constructions and the proof that a split side always has an
     MER candidate. Nothing in it runs when the option is off.
 
-``hensmith/__init__.py`` re-exports the ``__all__`` of the two public modules
-and holds the biosteam registration block described in `The import
+``hensmith/__init__.py`` re-exports the ``__all__`` of the three public
+modules and holds the biosteam registration block described in `The import
 contract`_ below. The public API is documented under :doc:`../API/api`.
 
 Tests live in ``tests/``:
@@ -81,6 +87,21 @@ Tests live in ``tests/``:
     least as much heat as the utility loads documented in the file. Every
     system is synthesized again with ``stream_splitting=True``, and the
     three that need stream splits must then reach their targets.
+
+``tests/test_hxn_contributions.py``
+    Approach temperature contributions: default bit-for-bit identity
+    in-process, uniform contributions against a doubled ``T_min_app`` and
+    against uniform real-thermodynamics runs, closed-form targets and
+    per-pair exact approaches on corpus and real-thermodynamics cases, key
+    resolution and validation, and the ``cache_network`` rule.
+
+``tests/test_targeting.py``
+    ``hensmith.targeting`` against independent references: closed-form
+    composite curves, utility allocations from the agents' attributes,
+    independently integrated areas, units and cost references, the
+    closed-form optimum ``T_min_app`` of a two-stream problem, the facility's
+    targets against the synthesis's, the network report, and the absence of
+    side effects on the flowsheet and the agents.
 
 Development environment
 -----------------------

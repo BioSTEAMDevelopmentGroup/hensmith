@@ -1,0 +1,17 @@
+units: {'above': 5, 'below': 1, 'total': 6}
+6 of 6 shells share the area: 991 m2 each, Floating head
+T_min_app                5
+Q_hot                    2.82781e+08
+Q_cold                   1.93588e+06
+utility_cost             1839.61
+area                     5946.13
+N_units                  6
+N_shells                 6
+N_area_shells            6
+shell_area               991.022
+shell_type               Floating head
+purchase_cost            710660
+installed_cost           2.28172e+06
+annualized_capital_cost  371339
+operating_cost           1.47169e+07
+TAC                      1.50882e+07

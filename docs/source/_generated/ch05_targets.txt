@@ -1,0 +1,5 @@
+<PinchTargets: 5 streams, T_min_app = 5 K, Q_hot = 2.828e+08 kJ/hr, Q_cold = 1.936e+06 kJ/hr>
+streams: ['D1 - reboiler', 'F1 - heat_exchanger', 'D1_H1', 'D1 - condenser', 'D1_H2']
+shifted pinch: 298.15 K
+equal to the synthesis targets: True True
+heating utility of the network: 2.977e+08 kJ/hr

@@ -15,6 +15,7 @@ default and with stream splits where needed if `stream_splitting` (on
 cycles (`StreamLifeCycle`) and pinch diagrams (`plot_pinch_diagram`).
 """
 from collections import namedtuple
+from collections.abc import Iterable, Mapping, Sequence
 import heapq
 import math
 import re
@@ -23,7 +24,8 @@ import biosteam as bst
 from warnings import warn
 from ._curves import (StreamCurve, stream_curves, _end_state, _T_EQ, _T_SIDE,
                       _copy, _point_load_inlet)
-from ._planner import plan_network
+from ._planner import (plan_network, _approach_shifts,
+                       _approach_contributions, _contribution_value)
 from ._splitting import Split, _ISO_TOL, _same_network
 
 __all__ = ('StreamLifeCycle', 'ProblemTable', 'problem_table',
@@ -472,7 +474,8 @@ ProblemTable = namedtuple(
 ProblemTable.__doc__ = """
 Result of `problem_table`: the temperature-interval heat cascade of a set of
 process streams on the *shifted* temperature scale (hot streams shifted down
-by the minimum approach temperature, cold streams unshifted).
+by the minimum approach temperature, cold streams unshifted; with approach
+contributions every stream by its own shift, see `problem_table`).
 
 Attributes
 ----------
@@ -508,8 +511,10 @@ cold_util_load : float
     Minimum cold utility target [kJ/hr].
 pinch_T : float
     Shifted grid temperature of the pinch [K] (``Ts[0]`` for a threshold
-    problem); the hot-stream pinch temperature is `pinch_T + T_min_app`,
-    the cold-stream one is `pinch_T`.
+    problem). Stream j's pinch temperature is ``pinch_T + s_j``, its shift:
+    ``pinch_T + T_min_app`` (hot) and ``pinch_T`` (cold) by default,
+    ``pinch_T + T_min_app/2 + c_j`` (hot) and ``pinch_T + T_min_app/2 -
+    c_j`` (cold) with approach contributions.
 
 See Also
 --------
@@ -518,7 +523,7 @@ problem_table : builds the table and documents the cascade.
 """
 
 def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
-                  curves=None):
+                  curves=None, approach_contributions=None):
     """
     Energy-consistent problem table (temperature-interval heat cascade).
 
@@ -531,11 +536,19 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
     is_hot : Sequence[bool]
         True where the stream is cooled.
     T_min_app : float
-        Minimum approach temperature [K].
+        Minimum approach temperature [K]: the required approach of every
+        pair of streams unless `approach_contributions` are given.
     curves : list, optional
         Prebuilt temperature-enthalpy curves of the same streams, in the
         same order (e.g. shared with the network synthesis); built here if
         not given.
+    approach_contributions : Sequence[float or None], optional
+        Approach temperature contribution of each stream [K], in the order
+        of `streams_inlet`: None or nan (unspecified: ``T_min_app / 2``), or
+        a finite number > 0 (`T_min_app` must then be finite and > 0 too).
+        A hot and a cold stream then need the sum of their contributions
+        between them (see Notes). Defaults to None (every pair needs
+        `T_min_app`).
 
     Returns
     -------
@@ -560,7 +573,8 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
     within 0.002 K of the true curve. Single-phase stretches are evaluated
     with their phases fixed (no flash), so a grid point exactly at a
     saturation temperature is never ambiguous. Hot streams are shifted down
-    by `T_min_app`; cold streams are not. The grid is the union of all
+    by `T_min_app`; cold streams are not (see below for approach
+    contributions). The grid is the union of all
     shifted breakpoints, so every point at which any stream's curve bends
     or jumps is a grid point, every stream is within 0.002 K of linear
     between grid points, and the grid minimum of the cascade is the true
@@ -589,6 +603,14 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
     first location the pinch. With the per-stream identity above,
     hot_util_load - cold_util_load equals the net heating demand.
 
+    With `approach_contributions` ``c_j`` (Kemp 2007), hot streams are
+    shifted down by ``T_min_app/2 + c_j`` and cold streams by
+    ``T_min_app/2 - c_j``, so that a hot and a cold stream at the same
+    shifted temperature are ``c_h + c_c`` apart: every match must keep the
+    sum of its two streams' contributions. An unspecified contribution is
+    ``T_min_app/2``; with none specified, the table is the default one, bit
+    for bit.
+
     Examples
     --------
     A threshold problem: 1000 kmol/hr of water cooled 400 -> 300 K supplies
@@ -614,12 +636,27 @@ def problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
     1445550.0
     >>> table.pinch_T
     395.0
+
+    If the cold stream contributes 10 K and the hot one the default 2.5 K,
+    the cold stream needs 12.5 K against the hot one, which a 400 K inlet
+    cannot give against a 390 K outlet, so hot utility appears. The hot
+    stream's pinch temperature is ``395 + 5 = 400`` K and the cold one's
+    ``395 - 7.5 = 387.5`` K:
+
+    >>> table = problem_table([hot_in, cold_in], [hot_out, cold_out],
+    ...                       [True, False], 5., approach_contributions=[None, 10.])
+    >>> table.Ts[[0, -1]]
+    array([397.5, 295. ])
+    >>> round(table.hot_util_load, 3)
+    171724.348
+    >>> table.pinch_T
+    395.0
     """
     return _problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
-                          curves)[0]
+                          curves, approach_contributions)[0]
 
 def _problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
-                   curves=None):
+                   curves=None, approach_contributions=None):
     """
     Return the `ProblemTable` of `problem_table` together with the stream
     curves it was built from and its grid enthalpies, as ``(table, curves,
@@ -629,8 +666,11 @@ def _problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
 
     * 'Ts': the table's shifted grid temperatures (descending, n);
     * 'shift': each stream's shift (`T_min_app` for hot streams, 0 for
-      cold ones; N), so stream j's real temperature at grid index k is
-      ``Ts[k] + shift[j]``;
+      cold ones by default; ``T_min_app/2 + c_j`` and ``T_min_app/2 - c_j``
+      with `approach_contributions`; N), so stream j's real temperature at
+      grid index k is ``Ts[k] + shift[j]``;
+    * 'contributions': each stream's approach temperature contribution
+      [K], unspecified ones (all by default) at ``T_min_app / 2`` (N);
     * 'Hl', 'Hr': (N x n) each stream's enthalpy at every grid temperature,
       left (low-enthalpy) and right (high-enthalpy) limit; they differ only
       where the stream's curve has a flat (point load) at that grid
@@ -647,7 +687,7 @@ def _problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
     N = len(streams_inlet)
     is_hot = np.asarray(is_hot, dtype=bool)
     sign = np.where(is_hot, 1., -1.)
-    shift = np.where(is_hot, T_min_app, 0.)
+    shift = _approach_shifts(is_hot, T_min_app, approach_contributions)
     if curves is None:
         curves = stream_curves(streams_inlet, streams_quenched, is_hot)
     elif len(curves) != N:
@@ -702,7 +742,9 @@ def _problem_table(streams_inlet, streams_quenched, is_hot, T_min_app,
         cold_util_load = 0.
     table = ProblemTable(Ts, interval_H, point_H, residual,
                          hot_util_load, cold_util_load, Ts[k_pinch])
-    grid = dict(Ts=Ts, shift=shift, Hl=Hl, Hr=Hr, k_hi=k_hi, k_lo=k_lo)
+    grid = dict(Ts=Ts, shift=shift, Hl=Hl, Hr=Hr, k_hi=k_hi, k_lo=k_lo,
+                contributions=_approach_contributions(
+                    N, T_min_app, approach_contributions))
     return table, curves, grid
 
 def _pinch_cut(table):
@@ -726,26 +768,571 @@ def _pinch_cut(table):
     arriving = table.residual - point_total
     return 'below' if arriving[k] <= table.residual[k] else 'above'
 
-def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
-                    sort_hus_by_T=False):
+def _parent(unit, owners=None):
+    """The unit one step up the owner chain of `unit`: ``unit._owner`` or,
+    without one, the unit that holds `unit` by `owners` (see
+    `_held_owners`), or None for a top unit."""
+    owner = getattr(unit, '_owner', None)
+    if owner is None and owners:
+        held = owners.get(id(unit))
+        if held is not None and held[0] is unit: owner = held[1]
+    return owner
+
+def _top(unit, owners=None):
+    """The top owner of `unit` along `_parent` (`unit` itself without an
+    owner)."""
+    while (owner := _parent(unit, owners)) is not None: unit = owner
+    return unit
+
+def _held_owners(units, held=None):
     """
-    The first step of `synthesize_network`: prepare the process streams
-    behind `hus` and run the problem table on them. Returns the 12 values
-    of `temperature_interval_pinch_analysis` (which wraps this function)
-    and then the table's ``table, curves, grid`` (see `_problem_table`),
-    on which the network is planned, so that the curves are built only
-    once.
+    The owners that the units at hand give the auxiliary units they hold
+    without setting their owner: a dict from the id of such an auxiliary to
+    ``(auxiliary, holder)``, for each `biosteam.Unit` without an ``_owner``
+    among the `auxiliary_units` of a unit of `units` or of one on their
+    owner chains (the first holder wins; none that would close a loop).
+    `biosteam.System.from_units` sets the owners of the auxiliaries that
+    exist when it is called, but some units build theirs anew without one:
+    `biosteam.MultistageCompressor` rebuilds its compressors and
+    intercoolers whenever `pr` or `n_stages` changes, so the keys of its
+    ID cover them only by this relation (see `_parent`). `held`, such a
+    dict taken earlier (a snapshot, which keeps its objects alive), comes
+    first: its auxiliaries keep their holders even once a holder has
+    rebuilt them (no longer holds them), and the units at hand add the
+    others, along its owners. Then a unit without an ``_owner`` that none
+    holds as an auxiliary, but whose heat utility is among the
+    `heat_utilities` of units on those chains (an exchanger kept outside
+    the `auxiliary_unit_names`, see `_heat_utility_units`), is held by the
+    lowest of them (an owner lists the heat utilities of its auxiliaries
+    too), none that would close a loop. Nothing is mutated.
     """
-    hx_utils = hus
-    hus_heating = [hu for hu in hx_utils if hu.duty > 0]
-    hus_cooling = [hu for hu in hx_utils if hu.duty < 0]
+    owners = dict(held) if held else {}
+    chains = _owner_chains(units, owners)
+
+    def closes_loop(aux, unit):
+        above = unit
+        while above is not None and above is not aux:
+            above = _parent(above, owners)
+        return above is not None
+
+    for unit in chains:
+        for aux in getattr(unit, 'auxiliary_units', ()):
+            if (not isinstance(aux, bst.Unit)
+                    or getattr(aux, '_owner', None) is not None
+                    or id(aux) in owners):
+                continue
+            if not closes_loop(aux, unit): owners[id(aux)] = (aux, unit)
+    by_heat_utilities = {}
+    for unit in chains:
+        for hx in _heat_utility_units([unit]):
+            if getattr(hx, '_owner', None) is None and id(hx) not in owners:
+                by_heat_utilities.setdefault(id(hx), (hx, []))[1].append(unit)
+    for hx, holders in by_heat_utilities.values():
+        holders = [unit for unit in holders if not closes_loop(hx, unit)]
+        # the lowest holder: one on the chain of no other holder
+        lowest = [unit for unit in holders
+                  if not any(above is unit for other in holders
+                             if other is not unit
+                             for above in _owner_chains([other], owners)[1:])]
+        if lowest: owners[id(hx)] = (hx, lowest[0])
+    return owners
+
+def _unit_name(unit, owners=None):
+    """``(owner.ID, unit.ID)``, with the top owner (``(ID, ID)`` for a unit
+    without an owner; owners along `_parent`): the unit's tuple key."""
+    return _top(unit, owners).ID, unit.ID
+
+def _id_path(unit, owners=None):
+    """The IDs of `unit` and of its owners in turn (along `_parent`),
+    ``(unit.ID, owner.ID, ..., top.ID)``, which tell apart auxiliary units
+    of the same ID under different owners."""
+    path = []
+    while unit is not None:
+        path.append(unit.ID)
+        unit = _parent(unit, owners)
+    return tuple(path)
+
+def _unit_message_name(unit, owners=None):
+    """How messages name a unit: its tuple key (`_unit_name`), followed by
+    its owners below the top one when there are any (the tuple key of an
+    auxiliary of an auxiliary is shared by its namesakes)."""
+    path = _id_path(unit, owners)
+    label = repr(_unit_name(unit, owners))
+    if len(path) <= 2: return label
+    return f"{label} (of {' of '.join(map(repr, path[1:-1]))})"
+
+def _names_unit(key, unit, live=(), owners=None):
+    """
+    Whether the approach contribution key `key` (of a valid type, see
+    `_check_contribution_key`) names `unit`, with owners along `_parent`
+    (`owners`, see `_held_owners`). A unit key names itself; a unit key
+    that is not a unit at hand (its id not in `live`, the ids of the units
+    at hand: a stale auxiliary that its owner rebuilt) names the unit of
+    the same `_id_path` instead. A tuple key names every unit of that
+    `_unit_name` (every auxiliary of that ID under that top owner, at any
+    depth) and a str key the unit of that ID without an owner.
+    """
+    if isinstance(key, bst.Unit):
+        if key is unit: return True
+        return (id(key) not in live
+                and _id_path(key, owners) == _id_path(unit, owners))
+    if isinstance(key, tuple): return key == _unit_name(unit, owners)
+    return key == unit.ID and _parent(unit, owners) is None
+
+def _contribution_key_level(key, unit, live=(), owners=None):
+    """The number of steps along the owner chain of `unit` (`unit`, its
+    owner, ..., along `_parent` with `owners`) to the first unit that `key`
+    names (see `_names_unit`, which takes `live`), or None."""
+    level = 0
+    while unit is not None:
+        if _names_unit(key, unit, live, owners): return level
+        unit = _parent(unit, owners)
+        level += 1
+    return None
+
+def _check_contribution_key(key):
+    """Raise a TypeError unless `key` is a unit, a str or a pair of str."""
+    if isinstance(key, bst.HeatUtility):
+        raise TypeError('a heat utility cannot be an approach_contributions '
+                        'key (biosteam replaces the heat utilities of a unit '
+                        'at every simulation): use its unit (hu.unit), the '
+                        "unit's ID or (owner.ID, unit.ID), or a callable (or, "
+                        'outside a HeatExchangerNetwork, a sequence aligned '
+                        'with the heat utilities)')
+    if isinstance(key, (bst.Unit, str)): return
+    if (isinstance(key, tuple) and len(key) == 2
+            and all(isinstance(i, str) for i in key)): return
+    raise TypeError('approach_contributions keys must be units, unit IDs '
+                    '(str) or (owner.ID, unit.ID) tuples, not '
+                    f'{type(key).__name__!r} ({key!r})')
+
+def _owner_chains(units, owners=None):
+    """Every unit on the owner chains of `units` (along `_parent` with
+    `owners`), once each."""
+    found = {}
+    for unit in units:
+        while unit is not None and id(unit) not in found:
+            found[id(unit)] = unit
+            unit = _parent(unit, owners)
+    return list(found.values())
+
+def _nested_auxiliaries(unit):
+    """
+    The `biosteam.Unit` objects that `unit` holds as auxiliary units, at
+    any depth, in the order of `biosteam.Unit.nested_auxiliary_units`.
+    Unlike that property, this reads the auxiliaries of units only (an
+    object that is not one, such as the `biosteam.VacuumSystem` of a flash
+    drum under vacuum, has none, and the property fails on it one level
+    down), and it takes each unit once, never `unit` itself, and walks
+    into each unit at most once (so units that hold each other end it).
+    """
+    nested = []
+    found = {id(unit)} # the units listed (and `unit`)
+    walked = set() # the units `walk` went into
+
+    def add(aux):
+        if isinstance(aux, bst.Unit) and id(aux) not in found:
+            found.add(id(aux))
+            nested.append(aux)
+
+    def walk(holder):
+        # as `nested_auxiliary_units`: each attribute of `holder` (a unit or
+        # a list of them) before the auxiliaries of its units, and the
+        # auxiliaries of those that are units each before its own
+        walked.add(id(holder))
+        for name in getattr(holder, 'auxiliary_unit_names', ()):
+            held = getattr(holder, name, None)
+            if held is None: continue
+            group = list(held) if isinstance(held, Iterable) else [held]
+            for aux in group: add(aux)
+            for aux in group:
+                if not isinstance(aux, bst.Unit): continue
+                for sub in getattr(aux, 'auxiliary_units', ()):
+                    add(sub)
+                    if isinstance(sub, bst.Unit) and id(sub) not in walked:
+                        walk(sub)
+
+    walk(unit)
+    return nested
+
+def _heat_utility_units(units):
+    """
+    The `biosteam.Unit` objects that the heat utilities of `units` belong
+    to (``hu.unit``), each once, other than the units of `units`: the
+    exchangers that a unit holds through its `heat_utilities` only, outside
+    its `auxiliary_unit_names`, as a unit may keep an exchanger as a plain
+    attribute and take its heat utilities in its `_design`
+    (``self.heat_utilities = self.hx.heat_utilities``; biosteam rejects
+    only the heat utilities of auxiliaries added again). A
+    `HeatExchangerNetwork` takes those heat utilities as any other
+    (`biosteam.process_tools.heat_exchanger_utilities_from_units` reads
+    `unit.heat_utilities`), so such exchangers are among its original
+    heat exchangers. An owner lists the heat utilities of its auxiliaries
+    too, whose units are its nested auxiliaries.
+    """
+    found = {id(unit) for unit in units}
+    held = []
+    for unit in units:
+        for hu in getattr(unit, 'heat_utilities', None) or ():
+            hx = getattr(hu, 'unit', None)
+            if isinstance(hx, bst.Unit) and id(hx) not in found:
+                found.add(id(hx))
+                held.append(hx)
+    return held
+
+def _with_auxiliaries(units):
+    """Each unit of `units` followed by its nested auxiliary units (those
+    that are `biosteam.Unit` objects, see `_nested_auxiliaries`) and by the
+    exchangers that it or they hold through their heat utilities only (see
+    `_heat_utility_units`): the units that keys may name, as
+    `HeatExchangerNetwork` takes those available to it, whether or not they
+    hold a heat utility, and among which its original exchangers are found
+    while no unit has rebuilt them (see
+    `hensmith.targeting._rebuilt_label`)."""
+    candidates = []
+    for unit in units:
+        group = [unit, *_nested_auxiliaries(unit)]
+        candidates.extend(group)
+        candidates.extend(_heat_utility_units(group))
+    return candidates
+
+def _key_universe(units, held=None):
+    """The units that keys may name, given the units at hand `units`:
+    ``(universe, live, owners)``, the owner chains of `units` (see
+    `_owner_chains`) along the owners they give the auxiliaries they hold
+    (`owners`, see `_held_owners`, after those of the snapshot `held`), and
+    the ids of the universe (`live`)."""
+    owners = _held_owners(units, held)
+    universe = _owner_chains(units, owners)
+    return universe, {id(u) for u in universe}, owners
+
+def _auxiliary_attributes(key, universe, owners=None):
+    """
+    The attributes that the tuple key `key`, of the ID that
+    `biosteam.Unit.auxiliary` gives an auxiliary, may name: ``(owner.ID,
+    'name[k]')`` the k-th unit of a list under the attribute `name`, and
+    ``(owner.ID, name)`` a single unit there, with `name` one of the
+    `auxiliary_unit_names` of a unit under the top owner ``owner.ID``
+    (along `_parent` with `owners`). Yields ``(unit, name, k, held)`` for
+    each such unit, with k None for the single form and `held` what the
+    unit holds there (None if missing).
+    """
+    owner_ID, ID = key
+    match = re.fullmatch(r'(.+)\[(0|[1-9]\d*)\]', ID)
+    name, k = (match[1], int(match[2])) if match else (ID, None)
+    for unit in universe:
+        if (_top(unit, owners).ID == owner_ID
+                and name in getattr(unit, 'auxiliary_unit_names', ())):
+            yield unit, name, k, getattr(unit, name, None)
+
+def _auxiliary_slots(key, universe, owners=None):
+    """
+    Where the units of `universe` hold the auxiliary unit of the tuple key
+    `key` by the ID that `biosteam.Unit.auxiliary` gives an auxiliary (see
+    `_auxiliary_attributes`). Yields ``(unit, held)`` for each such unit
+    whose attribute takes that form (a list for ``'name[k]'``) or holds
+    nothing (None or missing), with `held` the `biosteam.Unit` there, or
+    None if there is none (nothing, an object that is not a unit, or a
+    list too short).
+    """
+    for unit, name, k, held in _auxiliary_attributes(key, universe, owners):
+        if held is not None:
+            if isinstance(held, list) != (k is not None): continue
+            if k is not None: held = held[k] if k < len(held) else None
+        yield unit, held if isinstance(held, bst.Unit) else None
+
+def _other_form_hints(key, universe, owners=None):
+    """
+    Hints for the tuple key `key` of the ID that `biosteam.Unit.auxiliary`
+    gives an auxiliary in the other form than the attribute it names takes
+    (see `_auxiliary_slots`, which skips such attributes): for ``(owner.ID,
+    name)`` where a unit under that top owner holds a list there, the keys
+    of its units (``"E1.evaporators is a list: ('E1', 'evaporators[0]'),
+    ..."``), and for ``(owner.ID, 'name[k]')`` where it holds one unit,
+    that unit's key (``"D1.condenser is ('D1', 'condenser')"``).
+    """
+    hints = []
+    for unit, name, k, held in _auxiliary_attributes(key, universe, owners):
+        if held is None or isinstance(held, list) == (k is not None): continue
+        if k is not None:
+            if isinstance(held, bst.Unit):
+                hints.append(f'; {unit.ID}.{name} is '
+                             f'{_unit_name(held, owners)!r}')
+            continue
+        keys = [repr(_unit_name(aux, owners)) for aux in held
+                if isinstance(aux, bst.Unit)]
+        if keys:
+            shown = ', '.join(keys[:3]) + (', ...' if len(keys) > 3 else '')
+            hints.append(f'; {unit.ID}.{name} is a list: {shown}')
+    return hints
+
+def _stage_tickets(compressor=None):
+    """The ticket names that a `biosteam.MultistageCompressor` gives its
+    stages in their IDs (``f'{K.ID}_{ticket}{n}'``): those of the
+    `biosteam.IsentropicCompressor` and `biosteam.HXutility` stages it
+    builds from `pr` and `n_stages`, and those of the stages that
+    `compressor` holds now (given as `compressors` and `hxs`)."""
+    tickets = {getattr(getattr(bst, 'IsentropicCompressor', None),
+                       'ticket_name', None), bst.HXutility.ticket_name}
+    if compressor is not None:
+        for stages in (getattr(compressor, 'compressors', None),
+                       getattr(compressor, 'hxs', None)):
+            tickets.update(getattr(stage, 'ticket_name', None)
+                           for stage in stages or ())
+    return {ticket for ticket in tickets if isinstance(ticket, str) and ticket}
+
+def _is_stage_ID(ID, compressor_ID, tickets):
+    """Whether `ID` is ``f'{compressor_ID}_{ticket}{n}'`` for a ticket name
+    of `tickets` and a stage number n >= 1 (see `_stage_tickets`)."""
+    prefix = f'{compressor_ID}_'
+    return ID.startswith(prefix) and any(
+        re.fullmatch(re.escape(ticket) + r'[1-9]\d*', ID[len(prefix):])
+        for ticket in tickets)
+
+def _names_unbuilt_stage(key, universe, owners=None):
+    """
+    Whether the tuple key `key` gives the ID of a stage that a
+    `biosteam.MultistageCompressor` K of `universe` under the top owner
+    ``key[0]`` (along `_parent` with `owners`) may build:
+    ``f'{K.ID}_{ticket}{n}'`` for any stage number n >= 1 (see
+    `_stage_tickets`). K sets its `auxiliary_unit_names` to the IDs of the
+    stages it builds whenever `pr` or `n_stages` changes, so ``('K1',
+    'K1_H3')`` names an intercooler of K1 with 3 stages or more and no unit
+    with fewer.
+    """
+    MultistageCompressor = getattr(bst, 'MultistageCompressor', None)
+    if MultistageCompressor is None: return False
+    owner_ID, ID = key
+    return any(isinstance(unit, MultistageCompressor)
+               and _is_stage_ID(ID, unit.ID, _stage_tickets(unit))
+               and _top(unit, owners).ID == owner_ID
+               for unit in universe)
+
+def _names_unbuilt_auxiliary(key, universe, live, owners=None):
+    """
+    Whether the key `key` (of a valid type, see `_check_contribution_key`),
+    which names no unit of `universe` (see `_names_unit`; `live` holds the
+    ids of `universe`, `owners` the owners of `_parent`), names an
+    auxiliary unit that a unit of `universe` may build but does not hold
+    now, as a `biosteam.HXutilities` builds one exchanger per agent it
+    needs: an old auxiliary object whose top owner is in `universe`
+    (rebuilt with fewer auxiliaries), or a tuple key of the ID that biosteam
+    gives an auxiliary (see `_auxiliary_slots`) where a unit of `universe`
+    holds no unit, or holds the unit of that ID: ``('X1',
+    'heat_exchangers[2]')`` while the list ``X1.heat_exchangers`` is
+    shorter, say. Or a tuple key of the ID that a
+    `biosteam.MultistageCompressor` of `universe` gives a stage, of any
+    stage number (see `_names_unbuilt_stage`): ``('K1', 'K1_H3')`` while
+    K1 has 2 stages. Such a key is valid but names nothing. A slot that
+    holds a unit of another ID (``T1.heat_exchanger`` of a
+    `biosteam.EnzymeTreatment` T1 is ``('T1', '')``) does not make its key
+    valid (see `_unknown_key_hints`).
+    """
+    if isinstance(key, bst.Unit):
+        top = _top(key, owners)
+        return top is not key and id(top) in live
+    if not isinstance(key, tuple): return False
+    return (any(held is None or held.ID == key[1]
+                for _, held in _auxiliary_slots(key, universe, owners))
+            or _names_unbuilt_stage(key, universe, owners))
+
+def _unknown_keys(keys, universe, owners=None):
+    """The keys of `keys` (units, str or pairs of str) that name neither a
+    unit of `universe` (see `_names_unit`, with owners along `_parent`)
+    nor an auxiliary unit that one of them may build (see
+    `_names_unbuilt_auxiliary`)."""
+    live = {id(u) for u in universe}
+    return [key for key in keys
+            if not any(_names_unit(key, u, live, owners) for u in universe)
+            and not _names_unbuilt_auxiliary(key, universe, live, owners)]
+
+def _unknown_key_hints(keys, universe, owners=None):
+    """
+    Hints for the unknown keys `keys` (see `_unknown_keys`) that name a
+    unit of `universe` (owners along `_parent` with `owners`) by another
+    key: for a str key, each auxiliary unit of that ID (``"'condenser' is
+    ('D1', 'condenser')"``), and for a tuple key of the ID that biosteam
+    gives an auxiliary (see `_auxiliary_slots`), each unit held there under
+    another ID (``"T1.heat_exchanger is ('T1', '')"``), or the keys of the
+    units held there when the key takes the other form (a list's name
+    alone, or an index into a single one, see `_other_form_hints`). A tuple
+    key ``(owner_ID, ID)`` of a unit of `universe` without an owner gets that
+    unit's key (``"('K1', 'K1_H1') is 'K1_H1' (...)"``), and a str key,
+    the stages without an owner that a `biosteam.MultistageCompressor` of
+    that ID gives its IDs (see `_is_stage_ID`), such as the intercoolers
+    of the heat utilities of a compressor K1 outside a HeatExchangerNetwork
+    (which, with the `key_units` of `hensmith.PinchTargets.from_heat_utilities`,
+    alone takes K1 as their owner, see `_held_owners`). Returns them
+    as ``'; <hint>'`` each, joined ('' if none).
+    """
+    hints = {}
+    tickets = _stage_tickets()
+    for key in keys:
+        if isinstance(key, str):
+            stages = []
+            for unit in universe:
+                if unit.ID == key and _parent(unit, owners) is not None:
+                    hints[f'; {key!r} is {_unit_name(unit, owners)!r}'] = None
+                elif (_parent(unit, owners) is None
+                        and _is_stage_ID(unit.ID, key, tickets)):
+                    stages.append(unit.ID)
+            if stages:
+                one = len(stages) == 1
+                keyed = ('its ID is its key' if one
+                         else 'their IDs are their keys')
+                hints[f"; {', '.join(map(repr, stages))} "
+                      f"{'has' if one else 'have'} no owner here, so {keyed}"
+                      f' (a MultistageCompressor {key!r} owns the stages it '
+                      'builds only among the units available to a '
+                      'HeatExchangerNetwork, or the key_units of '
+                      'PinchTargets.from_heat_utilities)'] = None
+        elif isinstance(key, tuple):
+            for unit, held in _auxiliary_slots(key, universe, owners):
+                if held is not None and held.ID != key[1]:
+                    hints[f'; {unit.ID}.{key[1]} is '
+                          f'{_unit_name(held, owners)!r}'] = None
+            for hint in _other_form_hints(key, universe, owners):
+                hints[hint] = None
+            if key[0] != key[1] and any(
+                    unit.ID == key[1] and _parent(unit, owners) is None
+                    for unit in universe):
+                hints[f'; {key!r} is {key[1]!r} (a unit without an owner '
+                      'here)'] = None
+    return ''.join(hints)
+
+def _mapping_contributions(hus, mapping, units, held=None):
+    """
+    `_stream_contributions` of a mapping from keys naming units to
+    contributions: checks the types of keys and values, then that every key
+    names a unit of the universe (the owner chains of the units of `hus`
+    and of `units`, the units at hand of `_names_unit`, along the owners
+    they give the auxiliaries they hold without one, after those of the
+    snapshot `held`, see `_key_universe`) or an auxiliary unit that one of them may build but does not hold now
+    (see `_names_unbuilt_auxiliary`: such a key names nothing), then that
+    no two keys of the same level for a unit of the universe give it
+    different values (None and nan are equal); then each heat utility takes
+    the value of the key of the lowest level on its unit's owner chain
+    (None without one).
+    """
+    items = []
+    for key, value in mapping.items():
+        _check_contribution_key(key)
+        items.append((key, _contribution_value(value, f'key {key!r}')))
+    universe, live, owners = _key_universe([hu.unit for hu in hus]
+                                           + list(units or ()), held)
+    unknown = _unknown_keys([key for key, _ in items], universe, owners)
+    if unknown:
+        raise ValueError('approach_contributions keys that name no unit: '
+                         f"{', '.join(map(repr, unknown))} (a key is a unit, "
+                         'the ID of a unit without an owner, or (owner.ID, '
+                         'unit.ID)'
+                         f'{_unknown_key_hints(unknown, universe, owners)})')
+    _check_key_levels(items, universe, live, owners, 'approach_contributions')
+    return [_nearest_key_value(items, hu.unit, live, owners) for hu in hus]
+
+def _check_key_levels(items, universe, live, owners, what):
+    """Raise a ValueError if two keys of `items` (``(key, value)`` pairs
+    of unit keys) of the same level for a unit of `universe` (see
+    `_contribution_key_level`, which takes `live` and `owners`) give it
+    different values; `what` names the keys (``'h'``, say)."""
+    for unit in universe:
+        first = {} # level -> (key, value)
+        for key, value in items:
+            level = _contribution_key_level(key, unit, live, owners)
+            if level is None: continue
+            other, other_value = first.setdefault(level, (key, value))
+            if other_value != value:
+                raise ValueError(
+                    f'{what} keys {other!r} and {key!r} give unit '
+                    f'{_unit_message_name(unit, owners)} different values '
+                    f'at the same level: {other_value!r} and {value!r}')
+
+def _nearest_key_value(items, unit, live, owners, default=None):
+    """The value of the key of `items` (``(key, value)`` pairs of unit
+    keys) of the lowest level on the owner chain of `unit` (see
+    `_contribution_key_level`, which takes `live` and `owners`; the first
+    of that level), or `default` if none names it."""
+    best = None # (level, value) of the nearest key
+    for key, value in items:
+        level = _contribution_key_level(key, unit, live, owners)
+        if level is not None and (best is None or level < best[0]):
+            best = (level, value)
+    return default if best is None else best[1]
+
+def _stream_contributions(hus, approach_contributions, units=None,
+                          held=None):
+    """
+    Resolve `approach_contributions` to one approach temperature
+    contribution per heat utility of `hus`, in the given order (zero-duty
+    ones included): a list of float, or None where unspecified (nan becomes
+    None; not filled with ``T_min_app / 2``). Accepts the forms of
+    `synthesize_network`'s parameter: None (all unspecified), a mapping
+    whose keys name units (see `_mapping_contributions`), a sequence
+    aligned with `hus` (not a str or bytes), or a callable of a heat
+    utility (called once per heat utility, in order). `units` adds units
+    (with their owner chains) to those that keys may name and that are
+    checked for conflicting keys, whether or not they hold a heat utility
+    of `hus`, and `held` gives the holders of auxiliaries taken earlier
+    (see `_held_owners`).
+    """
+    N = len(hus)
+    x = approach_contributions
+    if x is None: return [None] * N
+    if isinstance(x, Mapping):
+        return _mapping_contributions(hus, x, units, held)
+    if isinstance(x, (Sequence, np.ndarray)) and not isinstance(x, (str, bytes)):
+        values = list(x)
+        if len(values) != N:
+            raise ValueError(f'{len(values)} approach contributions given for '
+                             f'{N} heat utilities')
+        return [_contribution_value(v, f'heat utility {k}')
+                for k, v in enumerate(values)]
+    if callable(x):
+        # labeled with the owners the keys of a mapping would take
+        owners = _held_owners([hu.unit for hu in hus] + list(units or ()),
+                              held)
+        return [_contribution_value(
+                    x(hu), f'unit {_unit_message_name(hu.unit, owners)}')
+                for hu in hus]
+    raise TypeError('approach_contributions must be a mapping, a sequence or '
+                    f'a callable, not {type(x).__name__!r}')
+
+def _explicit_contributions(hus, approach_contributions, T_min_app,
+                            units=None, held=None):
+    """
+    `_stream_contributions` of `hus` (with `units` and `held`), or None if
+    nothing is specified (`approach_contributions` None, or every value
+    None or nan: the default path). With a value, `T_min_app` must be
+    finite and > 0.
+    """
+    if approach_contributions is None: return None
+    values = _stream_contributions(hus, approach_contributions, units, held)
+    if all(v is None for v in values): return None
+    _approach_contributions(len(values), T_min_app, values) # checks T_min_app
+    return values
+
+def _arrange_heat_utilities(hus, sort_hus_by_T):
+    """
+    The heat utilities of `hus` in stream order, ``(hus_rearranged,
+    N_heating)``: the heating ones (``hu.duty > 0``, cold streams), then the
+    cooling ones; zero-duty ones are dropped. With `sort_hus_by_T`, heating
+    utilities are sorted by descending and cooling ones by ascending inlet
+    temperature of their unit.
+    """
+    hus_heating = [hu for hu in hus if hu.duty > 0]
+    hus_cooling = [hu for hu in hus if hu.duty < 0]
     if sort_hus_by_T:
         hus_heating.sort(key=lambda i: i.unit.ins[0].T, reverse=True)
         hus_cooling.sort(key=lambda i: i.unit.ins[0].T)
-    hx_utils_rearranged = hus_heating + hus_cooling
-    hxs = [hu.unit for hu in hx_utils_rearranged]
-    # unregistered copies (see `hensmith._curves._copy`); the inlets are
-    # registered under their own IDs below
+    return hus_heating + hus_cooling, len(hus_heating)
+
+def _process_streams(hxs, force_ideal_thermo):
+    """
+    The process streams of the exchangers `hxs`, ``(streams_inlet,
+    streams_quenched)``: unregistered copies (see `hensmith._curves._copy`)
+    of each inlet and of each outlet re-flashed at its own enthalpy and
+    pressure, with ideal thermodynamics if `force_ideal_thermo`.
+    """
     if force_ideal_thermo:
         streams_inlet = [_copy(hx.ins[0], hx.ins[0].thermo.ideal()) for hx in hxs]
         streams_quenched = [_copy(hx.outs[0], hx.outs[0].thermo.ideal()) for hx in hxs]
@@ -753,11 +1340,29 @@ def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
         streams_inlet = [_copy(hx.ins[0]) for hx in hxs]
         streams_quenched = [_copy(hx.outs[0]) for hx in hxs]
     for i in streams_quenched: i.vle(H=i.H, P=i.P)
+    return streams_inlet, streams_quenched
+
+def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
+                    sort_hus_by_T=False, approach_contributions=None):
+    """
+    The first step of `synthesize_network`: prepare the process streams
+    behind `hus` and run the problem table on them. Returns the 12 values
+    of `temperature_interval_pinch_analysis` (which wraps this function)
+    and then the table's ``table, curves, grid`` (see `_problem_table`),
+    on which the network is planned, so that the curves are built only
+    once. `approach_contributions` (see `_stream_contributions`) is resolved
+    first, before any stream is copied or flashed.
+    """
+    values = _explicit_contributions(hus, approach_contributions, T_min_app)
+    hx_utils_rearranged, N_heating = _arrange_heat_utilities(hus, sort_hus_by_T)
+    hxs = [hu.unit for hu in hx_utils_rearranged]
+    # unregistered copies; the inlets are registered under their own IDs
+    # below
+    streams_inlet, streams_quenched = _process_streams(hxs, force_ideal_thermo)
     for i in range(len(streams_inlet)):
         stream = streams_inlet[i]
         ID = 'Util_%s'%i
         stream.ID = 's_%s__%s'%(i,ID)
-    N_heating = len(hus_heating)
     cold_indices = list(range(N_heating))
     hot_indices = list(range(N_heating, len(hxs)))
     indices = cold_indices + hot_indices
@@ -765,38 +1370,47 @@ def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
     T_out_arr = np.array([i.T for i in streams_quenched])
     is_hot = np.zeros(len(hxs), dtype=bool)
     is_hot[hot_indices] = True
+    if values is None:
+        contributions = None
+    else: # in stream order
+        value_of = dict(zip(map(id, hus), values))
+        contributions = [value_of[id(hu)] for hu in hx_utils_rearranged]
     table, curves, grid = _problem_table(streams_inlet, streams_quenched,
-                                         is_hot, T_min_app)
+                                         is_hot, T_min_app, None,
+                                         contributions)
     hot_util_load = table.hot_util_load
     cold_util_load = table.cold_util_load
-    pinch_cold_stream_T = table.pinch_T
-    pinch_hot_stream_T = pinch_cold_stream_T + T_min_app
+    pinch_T = table.pinch_T # shifted scale
+    shift = grid['shift']
     # Per-stream pinch temperature, for information only (returned as
     # `HeatExchangerNetwork.pinch_Ts`; `load_duties` splits a stream there):
     # the network is planned on the curves (see `synthesize_network`), not
-    # on these temperatures. A stream already entirely on one side of the
-    # process pinch (T_in past pinch_cold_stream_T for a cold stream, or
-    # past pinch_hot_stream_T for a hot stream) is not split; its pinch_T is
-    # its own T_in. So is a non-monotone stream (T_out on the wrong side of
-    # T_in for its duty, e.g. a cold stream whose VLE outlet ends up cooler
-    # than it entered: a point load at T_out), whose whole duty
-    # `load_duties` then puts on a single side (hot side for a cold stream,
-    # cold side for a hot one).
+    # on these temperatures. Stream i's pinch is the shifted pinch plus its
+    # shift, T_p (pinch_T for a cold and pinch_T + T_min_app for a hot
+    # stream by default). A stream already entirely on one side of the
+    # process pinch (T_in past T_p) is not split; its pinch_T is its own
+    # T_in. So is a non-monotone stream (T_out on the wrong side of T_in for
+    # its duty, e.g. a cold stream whose VLE outlet ends up cooler than it
+    # entered: a point load at T_out), whose whole duty `load_duties` then
+    # puts on a single side (hot side for a cold stream, cold side for a hot
+    # one).
     pinch_T_arr = []
     for i in cold_indices:
-        if T_in_arr[i] > pinch_cold_stream_T or T_in_arr[i] > T_out_arr[i]:
+        T_p = pinch_T + shift[i]
+        if T_in_arr[i] > T_p or T_in_arr[i] > T_out_arr[i]:
             pinch_T_arr.append(T_in_arr[i])
-        elif T_out_arr[i] < pinch_cold_stream_T:
+        elif T_out_arr[i] < T_p:
             pinch_T_arr.append(T_out_arr[i])
         else:
-            pinch_T_arr.append(pinch_cold_stream_T)
+            pinch_T_arr.append(T_p)
     for i in hot_indices:
-        if T_in_arr[i] < pinch_hot_stream_T or T_in_arr[i] < T_out_arr[i]:
+        T_p = pinch_T + shift[i]
+        if T_in_arr[i] < T_p or T_in_arr[i] < T_out_arr[i]:
             pinch_T_arr.append(T_in_arr[i])
-        elif T_out_arr[i] > pinch_hot_stream_T:
+        elif T_out_arr[i] > T_p:
             pinch_T_arr.append(T_out_arr[i])
         else:
-            pinch_T_arr.append(pinch_hot_stream_T)
+            pinch_T_arr.append(T_p)
     pinch_T_arr = np.array(pinch_T_arr)
     return pinch_T_arr, hot_util_load, cold_util_load, T_in_arr, T_out_arr,\
            hxs, hot_indices, cold_indices, indices, streams_inlet, hx_utils_rearranged, \
@@ -805,7 +1419,8 @@ def _pinch_analysis(hus, T_min_app=10, force_ideal_thermo=False,
 def temperature_interval_pinch_analysis(hus,
                                         T_min_app=10,
                                         force_ideal_thermo=False,
-                                        sort_hus_by_T=False):
+                                        sort_hus_by_T=False,
+                                        approach_contributions=None):
     """
     Prepare the process streams behind `hus` and run the problem table on
     them, as `synthesize_network` does first; a standalone pinch analysis
@@ -815,7 +1430,8 @@ def temperature_interval_pinch_analysis(hus,
     Heating utilities (``hu.duty > 0``, cold streams) come first, then
     cooling utilities; zero-duty utilities are dropped. Each stream is a
     copy of its exchanger's inlet (renamed ``s_<index>__Util_<index>``) and
-    of its outlet re-flashed at its own enthalpy.
+    of its outlet re-flashed at its own enthalpy. `approach_contributions`
+    takes the forms of `synthesize_network`'s parameter.
 
     Returns
     -------
@@ -836,7 +1452,7 @@ def temperature_interval_pinch_analysis(hus,
 
     """
     return _pinch_analysis(hus, T_min_app, force_ideal_thermo,
-                           sort_hus_by_T)[:12]
+                           sort_hus_by_T, approach_contributions)[:12]
 
 def pinch_state(stream_in, stream_out, T_pinch, side=None, curve=None):
     """
@@ -935,8 +1551,9 @@ def load_duties(streams, streams_quenched, pinch_T_arr, T_out_arr, indices,
 # %% Network synthesis
 
 #: Exact-state approach acceptance [K]. Synthesized process exchangers get
-#: ``HXprocess(dT=T_min_app - _APPROACH_TOL)`` as a guard only: the planner
-#: and the exactness check enforce `T_min_app` on the exact states.
+#: ``HXprocess(dT=required - _APPROACH_TOL)``, with `required` their pair's
+#: required approach, as a guard only: the planner and the exactness check
+#: enforce the required approach on the exact states.
 _APPROACH_TOL = 1e-6
 #: A simulated process-exchanger duty that differs from the planned one by
 #: more than this times the two streams' total duties is a deviation.
@@ -1042,7 +1659,8 @@ def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
     """
     Exact-state check of one counter-current exchanger of duty `Q` in which
     stream `h` enters hot at `H_hot_in` and stream `c` enters cold at
-    `H_cold_in` (enthalpies relative to each stream's H_lo).
+    `H_cold_in` (enthalpies relative to each stream's H_lo); `T_min_app` is
+    the pair's required approach.
 
     With stream splitting, `fh` and `fc` are the flow fractions of the hot
     and the cold branch in the exchanger: a branch at fraction f has its
@@ -1067,9 +1685,10 @@ def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
 
     Returns the smallest approach found [K] (exact where evaluated) and the
     exact states ``(T_hot, H_hot, T_cold, H_cold)`` wherever the exact
-    approach is below ``T_min_app - _APPROACH_TOL``. With ``T_min_app =
-    inf`` every interval is checked, so the approach returned is the exact
-    minimum over the exchanger and the states are all those evaluated.
+    approach is below the pair's required approach less the tolerance,
+    ``T_min_app - _APPROACH_TOL``. With ``T_min_app = inf`` every interval
+    is checked, so the approach returned is the exact minimum over the
+    exchanger and the states are all those evaluated.
     This is the only exact internal-approach check of the synthesis (the
     exchangers themselves, `HXprocess`, check their two terminals only,
     which misses an internal pinch at a phase change).
@@ -1111,14 +1730,32 @@ def _exchanger_approach(curves, knots, h, c, H_hot_in, H_cold_in, Q,
             worst = min(worst, _interval_min(exact, a, fa, b, fb))
     return worst, points
 
-def _exact_approach(plan, duties, ends, curves, knots, T_min_app):
+def _required_approach(required, h, c):
+    """The required approach [K] of hot stream `h` against cold stream `c`:
+    `required` itself if it is a scalar, else ``required[h] - required[c]``
+    (`required` the streams' shifts, ``grid['shift']``)."""
+    if np.ndim(required) == 0: return required
+    return float(required[h] - required[c])
+
+def _check_required(required, knots):
+    """Raise a ValueError unless `required` is a scalar or has one shift per
+    stream of `knots`."""
+    if np.ndim(required) and len(required) != len(knots):
+        raise ValueError(f'{len(required)} shifts given for {len(knots)} '
+                         'streams')
+
+def _exact_approach(plan, duties, ends, curves, knots, required):
     """
     `_exchanger_approach` of every exchanger in `duties` (duty by index into
     ``plan.exchangers``) at the enthalpies of the walk `ends` (see `_walk`),
-    with the flow fractions of its branches (1 on a trunk).
+    with the flow fractions of its branches (1 on a trunk), against its
+    pair's required approach: `required` is the scalar pair requirement, or
+    the per-stream shift vector ``grid['shift']`` (never
+    ``grid['contributions']``; see `_required_approach`).
     Returns the smallest approach [K], the violating exact states by stream,
     ``{stream: [(T_exact, H - H_lo), ...]}``, and the violating exchangers.
     """
+    _check_required(required, knots)
     worst = np.inf
     violations = {}
     bad = []
@@ -1126,8 +1763,8 @@ def _exact_approach(plan, duties, ends, curves, knots, T_min_app):
         e = plan.exchangers[n]
         h, c = e.hot, e.cold
         approach, points = _exchanger_approach(
-            curves, knots, h, c, ends[n, h][0], ends[n, c][0], Q, T_min_app,
-            e.hot_frac, e.cold_frac
+            curves, knots, h, c, ends[n, h][0], ends[n, c][0], Q,
+            _required_approach(required, h, c), e.hot_frac, e.cold_frac
         )
         worst = min(worst, approach)
         if points: bad.append(n)
@@ -1136,12 +1773,31 @@ def _exact_approach(plan, duties, ends, curves, knots, T_min_app):
             violations.setdefault(c, []).append((T_cold, H_cold))
     return worst, violations, bad
 
+def _approach_margin(plan, duties, ends, curves, knots, required):
+    """
+    The smallest approach less its pair's required approach [K] over the
+    exchangers in `duties`, as `_exact_approach` evaluates it (`required`
+    as there).
+    """
+    margin = np.inf
+    for n, Q in duties.items():
+        e = plan.exchangers[n]
+        h, c = e.hot, e.cold
+        req = _required_approach(required, h, c)
+        approach = _exchanger_approach(
+            curves, knots, h, c, ends[n, h][0], ends[n, c][0], Q, req,
+            e.hot_frac, e.cold_frac
+        )[0]
+        margin = min(margin, approach - req)
+    return margin
+
 def _shrink(curves, knots, h, c, H_hot_in, H_cold_in, Q, T_min_app,
             fh=1., fc=1.):
     """
     Largest duty ``Q' <= Q`` (to 1e-9 of Q) at which the exchanger of
     `_exchanger_approach` (branches at flow fractions `fh` and `fc`) keeps
-    ``T_min_app - _APPROACH_TOL`` on the exact states. With both inlets
+    the pair's required approach ``T_min_app`` less `_APPROACH_TOL` on the
+    exact states. With both inlets
     fixed, a smaller duty lowers the cold stream's enthalpy (so its
     temperature) at every position and shortens the exchanger, so the
     approach can only grow: the feasible duties form an interval [0, Q']
@@ -1172,10 +1828,11 @@ def _shrink(curves, knots, h, c, H_hot_in, H_cold_in, Q, T_min_app,
         else: hi = mid
     return lo
 
-def _repair(plan, duties, knots, is_hot, curves, T_min_app):
+def _repair(plan, duties, knots, is_hot, curves, required):
     """
-    Shrink every exchanger that falls short of ``T_min_app - _APPROACH_TOL``
-    on the exact states to its largest feasible duty (`_shrink`); the rest of
+    Shrink every exchanger that falls short of its pair's required approach
+    less `_APPROACH_TOL` on the exact states (`required` as in
+    `_exact_approach`) to its largest feasible duty (`_shrink`); the rest of
     its duty goes to the utilities. Shrinking a match moves the later stages
     of both its streams toward their inlets, which never reduces another
     exchanger's approach (the curves are monotone), so one pass suffices;
@@ -1189,13 +1846,14 @@ def _repair(plan, duties, knots, is_hot, curves, T_min_app):
     changes = []
     for _ in range(len(duties) + 1):
         ends = _walk(plan, duties, knots, is_hot)[0]
-        bad = _exact_approach(plan, duties, ends, curves, knots, T_min_app)[2]
+        bad = _exact_approach(plan, duties, ends, curves, knots, required)[2]
         if not bad: break
         for n in bad:
             e = plan.exchangers[n]
             ends = _walk(plan, duties, knots, is_hot)[0]
             Q = _shrink(curves, knots, e.hot, e.cold, ends[n, e.hot][0],
-                        ends[n, e.cold][0], duties[n], T_min_app,
+                        ends[n, e.cold][0], duties[n],
+                        _required_approach(required, e.hot, e.cold),
                         e.hot_frac, e.cold_frac)
             changes.append((n, duties[n], Q))
             duties[n] = Q
@@ -1272,7 +1930,7 @@ def _first_inlet(stream, point_load, T_point, hot):
     and the partner's outlet is capped at the inlet temperature -/+ `dT`),
     so a point-load stream's real inlet, on the wrong side of `T_point` by
     definition, would make it refuse or cut short a match that the plan
-    keeps `T_min_app` for at `T_point`. E.g. a reboiler fed as a liquid
+    keeps the required approach for at `T_point`. E.g. a reboiler fed as a liquid
     above its boiling point enters as the vapor-liquid mixture it flashes
     to, and a vapor fed below its dew point (e.g. the ideal-thermo copy of
     a saturated vapor whose ideal dew point is higher) as the mixture it
@@ -1500,10 +2158,12 @@ def _discard(units):
         for s in (*unit.ins, *unit.outs): bst.main_flowsheet.stream.discard(s)
         bst.main_flowsheet.unit.discard(unit)
 
-def _realize(plan, duties, curves, knots, streams_inlet, is_hot, T_min_app):
+def _realize(plan, duties, curves, knots, streams_inlet, is_hot, required):
     """
     Build and run one plain `HXprocess` per exchanger in `duties` (duty by
-    index into ``plan.exchangers``), in plan order. Raise
+    index into ``plan.exchangers``), in plan order, each with ``dT`` its
+    pair's required approach less `_APPROACH_TOL` (`required` as in
+    `_exact_approach`). Raise
     `_RealizationError` (after discarding the units built so far) if one of
     them cannot be simulated. Returns ``(units, first, last)``: the units by
     exchanger index, each stream's first exchanger (None if it has none)
@@ -1517,15 +2177,16 @@ def _realize(plan, duties, curves, knots, streams_inlet, is_hot, T_min_app):
     first exchanger of every branch of a split at a stream's inlet takes
     the real inlet (`_split_nodes`).
     """
+    _check_required(required, knots)
     ends, last, pair_index = _walk(plan, duties, knots, is_hot)
     first = [next((n for n in plan.stages[j] if n in duties), None)
              for j in range(len(is_hot))]
     first_nodes = _split_nodes(plan, duties, ends)[0] if plan.splits else {}
     units = {}
-    dT = T_min_app - _APPROACH_TOL
     for n in sorted(duties):
         e = plan.exchangers[n]
         h, c = e.hot, e.cold
+        dT = _required_approach(required, h, c) - _APPROACH_TOL
         suffix = '' if pair_index[n] == 1 else f'_{pair_index[n]}'
         if e.side == 'above':
             ID = f'HX_{c}_{h}_hs{suffix}'
@@ -1689,7 +2350,7 @@ def _realize_splits(plan, duties, units, curves, knots, streams_inlet,
 
 def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                        avoid_recycle=False, sort_hus_by_T=False, info=None,
-                       stream_splitting=False):
+                       stream_splitting=False, approach_contributions=None):
     """
     Synthesize a heat exchanger network for the process streams behind a
     set of utility heat exchangers: pinch analysis (`problem_table`), then a
@@ -1715,7 +2376,9 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     T_min_app : float, optional
         Minimum approach temperature [K]: kept on the exact stream states
         at both ends of and everywhere inside every process exchanger, and
-        used to shift hot streams in the problem table. Defaults to 5.
+        used to shift hot streams in the problem table. With
+        `approach_contributions`, the default approach: each stream without
+        a contribution contributes ``T_min_app / 2``. Defaults to 5.
     Qmin : float, optional
         Planned exchangers with a duty below this [kJ/hr] are dropped and
         their duty left to the utilities (a large value can cost MER).
@@ -1743,14 +2406,22 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         (``Q_hot_plan - Q_hot_target``), 'sides' (per side of the pinch:
         status, method, work, proof of a needed split, gaps, units),
         'plan_targets' (the planner's own cascade in the first round:
-        Q_hot, Q_cold, pinch_T, cut), 'refine_rounds', 'min_approach' (the
-        smallest approach inside any process exchanger [K]; exact on the
-        stream states wherever it is within the curves' linearization
-        tolerance of `T_min_app`, else from the knots),
-        'deviations' (exchangers whose simulated duty differs from the
-        plan), 'qmin_dropped' (matches dropped by `Qmin`), 'repaired'
-        (matches shrunk to keep `T_min_app` on the exact states, see
-        Notes), 'dropped' (matches that could not be simulated;
+        Q_hot, Q_cold, pinch_T on the shifted scale, cut),
+        'refine_rounds', 'min_approach' (the smallest approach inside any
+        process exchanger [K]; exact on the stream states wherever it is
+        within the curves' linearization tolerance of its pair's required
+        approach, else from the knots; None without process exchangers),
+        'min_approach_margin' (the smallest approach less its pair's
+        required approach over the process exchangers [K], as evaluated by
+        the exact check: at least -1e-6 up to round-off; None when
+        'min_approach' is None), 'approach_contributions' (each stream's
+        approach temperature contribution as used [K], unspecified ones at
+        ``T_min_app / 2``, in stream order: that of the returned arrays,
+        not of `hus`), 'deviations' (exchangers whose simulated duty
+        differs from the plan), 'qmin_dropped' (matches dropped by
+        `Qmin`), 'repaired' (matches shrunk to keep their pair's required
+        approach on the exact states, see Notes), 'dropped' (matches that
+        could not be simulated;
         normally empty) and 'point_loads' (the indices of the streams
         whose outlet temperature does not move with their duty, e.g. an
         isothermal condenser or a reboiler fed as a liquid above its
@@ -1782,6 +2453,57 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         and ``synthesis_info['splits']`` (`HeatExchangerNetwork`). With
         `avoid_recycle`, a split that would repeat a stream pair is not
         used, and MER is then not guaranteed. Defaults to False.
+    approach_contributions : Mapping, Sequence or callable, optional
+        Approach temperature contribution of each process stream [K]: a
+        match between hot stream h and cold stream c must keep ``c_h +
+        c_c`` instead of `T_min_app` (see Notes, "Approach
+        contributions"). A value is None or nan (unspecified: ``T_min_app
+        / 2``) or a finite number > 0 (`T_min_app` must then be finite and
+        > 0 too). Given as one of:
+
+        - a mapping ``{key: value}`` whose keys name units: a unit (that
+          very object; a stale auxiliary that its owner rebuilt, no longer
+          among the units of `hus` and their owners, names the one of the
+          same ID under owners of the same IDs instead, if any),
+          ``(owner.ID, unit.ID)`` with the top owner (the unit's own ID
+          twice for a unit without an owner; it names every auxiliary of
+          that ID under that owner, at any depth, so the heaters of two
+          auxiliary flash drums are told apart by keying the drums or the
+          heater objects) or the ID of a unit without an owner (a bare
+          auxiliary ID such as ``'condenser'`` names nothing). Only the
+          units of `hus` and their owners are at hand, so an auxiliary that
+          its unit holds without setting its owner is a unit without an
+          owner here: an intercooler that a `biosteam.MultistageCompressor`
+          K1 built anew is ``'K1_H1'``, and ``'K1'`` raises (a
+          `HeatExchangerNetwork` that K1 is available to takes K1 as its
+          owner instead). A heat utility takes the value of
+          the key nearest to its unit along the unit's chain of owners: a
+          unit's own key beats its owner's, which beats the owner's owner's
+          (e.g. ``'D1'`` covers the condenser and the reboiler of column
+          D1, and ``('D1', 'condenser')`` overrides it for the condenser).
+          A None or nan value wins at its level like any other. Heat
+          utility keys are rejected (BioSTEAM replaces them at every
+          simulation). A key that names neither the unit of a heat utility
+          of `hus` nor one of its owners, nor an auxiliary that one of them
+          may build but does not hold now (such a key has no effect: e.g.
+          ``('X1', 'heat_exchangers[2]')``, biosteam's ID of the third
+          exchanger of a `biosteam.HXutilities` X1, while X1 needs fewer,
+          or an old exchanger of X1 that none took the place of), or two
+          keys of the same level for a unit with different values, raise a
+          ValueError;
+        - a sequence (or `numpy.ndarray`; not a str or bytes) with one
+          value per heat utility, aligned with `hus` as given (before the
+          heating utilities are placed first; zero-duty utilities
+          included); a wrong length raises a ValueError;
+        - a callable ``f(hu)`` returning the value of a heat utility,
+          called once per heat utility in the order of `hus`.
+
+        Anything else raises a TypeError. Checked and resolved before any
+        stream is copied or flashed. If every value is unspecified, the
+        result is the default one. The contributions as used are reported
+        in ``info['approach_contributions']`` in stream order, not in the
+        order of `hus`. Defaults to None (every stream contributes
+        ``T_min_app / 2``).
 
     Returns
     -------
@@ -1807,8 +2529,10 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     pinch_T_arr : numpy.ndarray
         Per-stream pinch temperature [K] (informational): the process pinch
         on the stream's own scale when the stream crosses it
-        (`ProblemTable.pinch_T` for a cold stream, that plus `T_min_app` for
-        a hot one); the inlet temperature of a stream whose inlet already
+        (`ProblemTable.pinch_T` plus the stream's shift: `T_min_app` for a
+        hot stream, 0 for a cold one by default, ``T_min_app/2 + c_j`` and
+        ``T_min_app/2 - c_j`` with approach contributions); the inlet
+        temperature of a stream whose inlet already
         lies past the pinch in its direction of flow, or that is isothermal
         or non-monotone; the outlet temperature of a stream that ends
         before reaching the pinch.
@@ -1845,10 +2569,11 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     below it the cold streams must be served completely by process matches
     ("musts"), while the partners ("flexes") leave any remainder to a
     utility at their far end. A depth-first search builds each side from
-    the pinch outward, one match at a time. Every match keeps `T_min_app`
-    at every knot (so internal pinches, e.g. a condensing vapor against a
-    boiling mixture, are respected), and every step keeps the problem
-    table of the remaining problem feasible (remaining problem analysis
+    the pinch outward, one match at a time. Every match keeps its pair's
+    required approach (`T_min_app` by default) at every knot (so internal
+    pinches, e.g. a condensing vapor against a boiling mixture, are
+    respected), and every step keeps the problem table of the remaining
+    problem feasible (remaining problem analysis
     [Smith05]_, as a closed-form bound on the duty). At every level where
     that table is tight, the pinch design rules [LH83]_ (see also
     [Seider17]_, Chapter 9; number and heat-capacity-flow rules,
@@ -1874,10 +2599,11 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     cold-side matches, then its hot-side matches, then its heater.
     Each match becomes a plain `HXprocess` whose two enthalpy limits
     (`H_lim0`, `H_lim1`) are the planned outlet enthalpies, so that its
-    duty reproduces the plan; its `dT` is ``T_min_app - 1e-6`` K, only a
-    guard against rounding (the approach is enforced by the plan and the
-    check below). A planned outlet whose equilibrium state is not past the
-    stream's state at the exchanger inlet cannot be a limit (`HXprocess`
+    duty reproduces the plan; its `dT` is its pair's required approach
+    (`T_min_app` by default) less 1e-6 K, only a guard against rounding
+    (the approach is enforced by the plan and the check below). A planned
+    outlet whose equilibrium state is not past the stream's state at the
+    exchanger inlet cannot be a limit (`HXprocess`
     rejects it): one strictly inside a non-equilibrium end jump (see
     `StreamCurve.jumps`), or on a point-load stream colder (hotter) than
     its inlet state when heated (cooled). That stream's limit is left out
@@ -1902,16 +2628,16 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     *Exactness.* The knots are exact at grid points but chords in between
     (at most 0.002 K off inside glides and curved single-phase stretches).
     Every planned exchanger is therefore checked on the exact stream states
-    wherever its planned approach is within that margin of `T_min_app`.
-    Where a MER plan falls short by more than 1e-6 K, the exact states are
-    inserted as knots and the network is planned again (at most three
-    rounds). A best-effort plan (or a MER plan still short after the last
-    round) instead has each violating match shrunk to the largest duty that
-    keeps the approach, the rest going to the utilities: with its inlets
-    fixed a smaller duty can only raise a match's approach, and the later
-    stages of both streams move toward their inlets, which never reduces
-    another match's approach. Constant heat capacity streams never need
-    either step.
+    wherever its planned approach is within that margin of its pair's
+    required approach. Where a MER plan falls short by more than 1e-6 K, the
+    exact states are inserted as knots and the network is planned again (at
+    most three rounds). A best-effort plan (or a MER plan still short after
+    the last round) instead has each violating match shrunk to the largest
+    duty that keeps the approach, the rest going to the utilities: with its
+    inlets fixed a smaller duty can only raise a match's approach, and the
+    later stages of both streams move toward their inlets, which never
+    reduces another match's approach. Constant heat capacity streams never
+    need either step.
 
     *Stream splitting.* With `stream_splitting`, a side that no unsplit
     network serves at MER is planned with splits (see
@@ -1937,8 +2663,9 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     dropped, as in ``info['dropped']``).
 
     *Guarantees and limits.* The utilities are never below the targets.
-    Every process exchanger keeps ``T_min_app - 1e-6`` K on the exact
-    states at its ends and at every checked position inside it, and the
+    Every process exchanger keeps its pair's required approach (`T_min_app`
+    by default) less 1e-6 K on the exact states at its ends and at every
+    checked position inside it, and the
     heat balance closes on every stream. 'mer' is reported only if the
     realized network reaches the targets. The result is deterministic.
     Completeness is empirical, not proven: every pruning test is a
@@ -1962,9 +2689,9 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     about 1e-9 of the total duty). The remaining gap is the realization.
     With constant heat capacities the knots are exact, and the realized
     network reaches the targets to round-off. With real thermodynamics
-    the knots are chords, so a split plan can fall short of `T_min_app` on
-    the exact states by up to the chords' tolerance; the refine rounds
-    close that as they do for unsplit plans, with up to two more rounds
+    the knots are chords, so a split plan can fall short of the required
+    approach on the exact states by up to the chords' tolerance; the refine
+    rounds close that as they do for unsplit plans, with up to two more rounds
     that exclude the violating network (see "Stream splitting" above), and
     only an exchanger still short after them is shrunk (reported in
     'repaired', with status 'best_effort'). A rigorous mixer's outlet
@@ -1975,6 +2702,24 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     and on the three such regression systems. The number of exchangers is
     minimized only among the candidate split plans a side generates, and
     splitters and mixers are not costed.
+
+    *Approach contributions.* With `approach_contributions`, each stream j
+    contributes ``c_j`` (``T_min_app / 2`` unless given), and a match
+    between hot stream h and cold stream c must keep ``c_h + c_c`` instead
+    of `T_min_app` [Kemp07]_: e.g. a small contribution for a condensing or
+    boiling stream (high film coefficients) and a large one for a gas.
+    Stream j is shifted down by ``s_j = T_min_app/2 + c_j`` if hot and
+    ``T_min_app/2 - c_j`` if cold, so that ``T*_h >= T*_c`` if and only if
+    ``T_h - T_c >= c_h + c_c``: the problem table, the targets and the
+    planner work on one shared shifted scale, and every guarantee above
+    carries over. A pair's required approach, ``s_h - s_c``, is enforced on
+    the exact states by the exactness check and the repair, is each
+    exchanger's `dT` guard (less 1e-6 K), and ``info['min_approach_margin']``
+    reports the smallest margin over it. Stream j's pinch temperature is
+    the shifted pinch plus ``s_j``. Only the process matches follow the
+    contributions: each stream's `HXutility` gets its agent from BioSTEAM's
+    own rule. With every contribution unspecified, the shifts are the
+    default ones bit for bit (``x/2 + x/2 == x``), and so is the result.
 
     Thermosteam's TP flashes fail silently inside the glides of some
     mixtures (e.g. water-ethanol with 20-50 % ethanol); an exchanger
@@ -2032,6 +2777,22 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     >>> round(info['Q_hot_target'] / 3600., 6), round(info['Q_cold_target'] / 3600., 6)
     (80.0, 450.0)
 
+    With an approach temperature contribution of 2 K for the hot stream
+    (keyed by its unit) and the default ``T_min_app / 2 = 5`` K for the
+    cold streams, every match needs 7 K instead of 10 K, so the targets
+    fall to those of ``T_min_app = 7`` K, and every exchanger's `dT`
+    guard is 7 K less 1e-6 K:
+
+    >>> info = {}
+    >>> result = synthesize_network(hus, T_min_app=10., info=info,
+    ...                             approach_contributions={units[3]: 2.})
+    >>> info['status'], round(info['Q_hot_target'] / 3600., 6), round(info['Q_cold_target'] / 3600., 6)
+    ('mer', 74.0, 444.0)
+    >>> info['approach_contributions']
+    array([5., 5., 5., 2.])
+    >>> sorted({round(hx.dT, 6) for hx in result[0] + result[1]})
+    [6.999999]
+
     References
     ----------
     .. [LH83] Linnhoff, B., & Hindmarsh, E. (1983). The pinch design method
@@ -2050,10 +2811,21 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
         raise ValueError('stream_splitting=True needs an info dict: the '
                          'splitters and mixers are returned in '
                          'info["splits"]')
+    # resolved before any stream is copied or flashed (None: the default)
+    values = _explicit_contributions(hus, approach_contributions, T_min_app)
     pinch_T_arr, hot_util_load, cold_util_load, T_in_arr, T_out_arr, \
         hxs, hot_indices, cold_indices, indices, streams_inlet, \
         hx_utils_rearranged, streams_quenched, table, curves, grid = \
-        _pinch_analysis(hus, T_min_app, force_ideal_thermo, sort_hus_by_T)
+        _pinch_analysis(hus, T_min_app, force_ideal_thermo, sort_hus_by_T,
+                        values)
+    # every pair's required approach is shift[h] - shift[c]; by default it
+    # is the scalar T_min_app itself, passed as given (not the shift vector,
+    # whose float() pair difference in `_required_approach` would promote a
+    # numpy float32 T_min_app to float64 and change the guards), so the
+    # default checks, repair and realization are unchanged to the bit; the
+    # planner gets the contributions only if any is given, likewise
+    shift = T_min_app if values is None else grid['shift']
+    contributions = None if values is None else grid['contributions']
     N = len(hxs)
     is_hot = [False] * N
     for i in hot_indices: is_hot[i] = True
@@ -2083,12 +2855,14 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                             **(dict(stream_splitting=True,
                                     _split_exclude=exclude,
                                     _split_prefer=prefer)
-                               if stream_splitting else {}))
+                               if stream_splitting else {}),
+                            **({} if contributions is None else
+                               dict(approach_contributions=contributions)))
         if not refine_round: plan_targets = plan.info['cascade']
         duties = {n: e.Q for n, e in enumerate(plan.exchangers)}
         ends = _walk(plan, duties, knots, is_hot)[0]
         min_approach, violations, bad = _exact_approach(
-            plan, duties, ends, curves, knots, T_min_app
+            plan, duties, ends, curves, knots, shift
         )
         if stream_splitting and plan.status == 'mer' and (
                 best is None or len(bad) < best[0]):
@@ -2125,7 +2899,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     repaired = []
     if bad:
         duties, changes = _repair(plan, duties, knots, is_hot, curves,
-                                  T_min_app)
+                                  shift)
         for n, Q_before, Q_after in changes:
             e = plan.exchangers[n]
             repaired.append(dict(side=e.side, hot=e.hot, cold=e.cold,
@@ -2133,7 +2907,19 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
             if Q_after < Qmin: del duties[n]
         ends = _walk(plan, duties, knots, is_hot)[0]
         min_approach = _exact_approach(plan, duties, ends, curves, knots,
-                                       T_min_app)[0]
+                                       shift)[0]
+    # the smallest approach less its pair's required approach: by default
+    # every pair's is T_min_app (rounding is monotone, so this is the
+    # smallest per-exchanger margin); else measured per pair, on fresh walk
+    # ends (`ends` is stale after a best plan was restored)
+    if not duties:
+        min_approach_margin = None
+    elif contributions is None:
+        min_approach_margin = min_approach - T_min_app
+    else:
+        min_approach_margin = _approach_margin(
+            plan, duties, _walk(plan, duties, knots, is_hot)[0], curves,
+            knots, shift)
     # Realize; a match that cannot be simulated is dropped (its duty goes to
     # the utilities: removing a match never reduces another's approach), and
     # a split whose splitters or mixer cannot be simulated becomes a trunk
@@ -2143,7 +2929,7 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
     while True:
         try:
             units, first, last = _realize(plan, duties, curves, knots,
-                                          streams_inlet, is_hot, T_min_app)
+                                          streams_inlet, is_hot, shift)
             splits, split_deviations = (
                 _realize_splits(plan, duties, units, curves, knots,
                                 streams_inlet, is_hot)
@@ -2229,6 +3015,8 @@ def synthesize_network(hus, T_min_app=5., Qmin=1e-3, force_ideal_thermo=False,
                               cut=plan_targets['cut']),
             refine_rounds=refine_round,
             min_approach=min_approach if duties else None,
+            min_approach_margin=min_approach_margin if duties else None,
+            approach_contributions=grid['contributions'].copy(),
             deviations=deviations,
             qmin_dropped=plan.info['qmin_dropped'],
             dropped=dropped, repaired=repaired,

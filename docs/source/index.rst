@@ -42,7 +42,11 @@ synthesizes a network of process exchangers that reaches the minimum energy
 requirement (MER) whenever it finds one without stream splits -- or, with
 ``stream_splitting=True``, splits streams where MER needs it -- and reports
 the utility savings and added capital cost as part of the system's
-techno-economic analysis.
+techno-economic analysis. Its targeting tools go beyond MER: they target
+several utilities, exchanger area, units, capital and total annualized cost
+before any network exists, find the minimum approach temperature of the
+least total annualized cost, and compare a synthesized network with its
+targets.
 Watch it run in the `Quickstart`_ demo below.
 
 Quickstart

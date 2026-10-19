@@ -208,5 +208,7 @@ Where to next
   the diagram, unit by unit.
 - :doc:`04_configuring` -- the constructor options of the facility, and
   applying it to a larger system.
+- :doc:`05_targeting` -- utility, area, units and cost targets, and the
+  ``T_min_app`` of the least total annualized cost.
 - :doc:`../concepts` -- the pinch concepts and terminology used throughout.
 - :doc:`../API/api` -- the full API reference.
